@@ -1,0 +1,10 @@
+{
+    "name": "com.tik-choco.mistlib",
+    "version": "0.1.0",
+    "displayName": "MistLib",
+    "description": "MistLib Rust Client for Unity",
+    "unity": "6000.0",
+    "author": {
+        "name": "fog"
+    }
+}

@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "mistlib-core",
+    "mistlib-native",
+    "mistlib-wasm",
+]
+resolver = "2"
