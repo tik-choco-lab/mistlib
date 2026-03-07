@@ -37,6 +37,28 @@ Rust のビルド環境がない場合は、原則として GitHub の **Release
   - `mistlib-native-linux`: Linux 用 (`.so`)。
   - `mistlib-native-macos`: macOS 用 (`.dylib`)。
 
+## Web/WASM の開発セットアップ
+
+現状の Web 向けラッパーは、npm 公開済みパッケージではなく、**このリポジトリを clone して開発する前提の repo-local wrapper** です。
+
+### 前提ツール
+
+- Rust stable
+- `wasm32-unknown-unknown` ターゲット
+- `wasm-pack`
+
+セットアップ例:
+
+1. 依存確認として `cargo test --workspace` を実行する。
+2. [mistlib-wasm](mistlib-wasm) で `wasm-pack build --target web` を実行する。
+3. 生成された [mistlib-wasm/pkg](mistlib-wasm/pkg) を使って、[wrappers/web/index.js](wrappers/web/index.js) から `MistNode` を読み込む。
+
+> `wrappers/web` は TypeScript 定義付きの ESM ラッパーですが、現時点では repo 内利用を前提にしています。
+
+### Release 資産をそのまま使う場合
+
+Releases から `mistlib-wasm-pkg` を取得した場合は、展開した `pkg` ディレクトリ内の `mistlib_wasm.js` を直接読み込めます。
+
 ## 機能詳細 (WASM/Web版)
 
 `MistNode` クラスを通じて以下の機能を提供します。
@@ -69,7 +91,7 @@ Rust のビルド環境がない場合は、原則として GitHub の **Release
 ## 利用例 (Web版)
 
 ```javascript
-import { MistNode } from './wrappers/web/index.js';
+import { MistNode } from '../wrappers/web/index.js';
 
 const node = new MistNode("user-123");
 await node.init();
@@ -83,6 +105,8 @@ node.onEvent((type, fromId, payload) => {
 
 node.sendMessage("target-id", "Hello P2P!");
 ```
+
+上記は、たとえば `examples/web` のような**同一リポジトリ内のサンプルやアプリ**から利用する想定です。
 
 ---
 
