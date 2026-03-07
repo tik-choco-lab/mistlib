@@ -59,8 +59,19 @@ jobs:
       - name: Package WASM Release Asset
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          cd mistlib-wasm
-          zip -r ../mistlib-wasm-pkg-${{ github.ref_name }}.zip pkg LICENSE README.md
+          rm -rf release
+          mkdir -p release/mistlib-wasm
+          mkdir -p release/wrappers/web
+          cp -r mistlib-wasm/pkg release/mistlib-wasm/pkg
+          cp mistlib-wasm/LICENSE release/mistlib-wasm/LICENSE
+          cp mistlib-wasm/README.md release/mistlib-wasm/README.md
+          cp wrappers/web/index.js release/wrappers/web/index.js
+          cp wrappers/web/index.d.ts release/wrappers/web/index.d.ts
+          cp wrappers/web/package.json release/wrappers/web/package.json
+          cp README.md release/README.md
+          cp LICENSE release/LICENSE
+          cd release
+          zip -r ../mistlib-wasm-pkg-${{ github.ref_name }}.zip .
 
       - name: Upload WASM Release Asset
         if: startsWith(github.ref, 'refs/tags/v')
@@ -127,19 +138,30 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') && matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
+          New-Item -ItemType Directory -Force -Path release/wrappers/python | Out-Null
+          New-Item -ItemType Directory -Force -Path release/wrappers/unity | Out-Null
           Copy-Item "${{ matrix.binary_path }}" "release/${{ matrix.binary_name }}"
           Copy-Item "README.md" "release/README.md"
           Copy-Item "LICENSE" "release/LICENSE"
+          Copy-Item "wrappers/python/README.md" "release/wrappers/python/README.md"
+          Copy-Item "wrappers/python/.env.example" "release/wrappers/python/.env.example"
+          Copy-Item "wrappers/python/mist" "release/wrappers/python/mist" -Recurse
+          Copy-Item "wrappers/unity/MistLib" "release/wrappers/unity/MistLib" -Recurse
           Compress-Archive -Path release/* -DestinationPath "${{ matrix.artifact_name }}-${{ github.ref_name }}.zip" -Force
 
       - name: Prepare Release Asset (Linux/macOS)
         if: startsWith(github.ref, 'refs/tags/v') && matrix.os != 'windows-latest'
         run: |
-          mkdir -p release
+          rm -rf release
+          mkdir -p release/wrappers/python
+          mkdir -p release/wrappers/unity
           cp "${{ matrix.binary_path }}" "release/${{ matrix.binary_name }}"
           cp README.md release/README.md
           cp LICENSE release/LICENSE
+          cp wrappers/python/README.md release/wrappers/python/README.md
+          cp wrappers/python/.env.example release/wrappers/python/.env.example
+          cp -r wrappers/python/mist release/wrappers/python/mist
+          cp -r wrappers/unity/MistLib release/wrappers/unity/MistLib
           cd release
           zip -r ../${{ matrix.artifact_name }}-${{ github.ref_name }}.zip .
 

@@ -37,6 +37,13 @@ Rust のビルド環境がない場合は、原則として GitHub の **Release
   - `mistlib-native-linux`: Linux 用 (`.so`)。
   - `mistlib-native-macos`: macOS 用 (`.dylib`)。
 
+各 Release 資産には、利用しやすいように対応する wrapper も同梱されます。
+
+- `mistlib-wasm-pkg`: `mistlib-wasm/pkg` と `wrappers/web` を同梱。
+- `mistlib-native-*`: ネイティブライブラリ本体に加えて `wrappers/python` と `wrappers/unity/MistLib` を同梱。
+
+また、`v*` 形式のタグを push すると、CI がそのまま Release 資産を生成し、GitHub Release を自動作成します。
+
 ## Web/WASM の開発セットアップ
 
 現状の Web 向けラッパーは、npm 公開済みパッケージではなく、**このリポジトリを clone して開発する前提の repo-local wrapper** です。
