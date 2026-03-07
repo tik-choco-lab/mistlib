@@ -6,6 +6,9 @@ license = "MPL-2.0"
 description = "WASM implementation for mistlib"
 repository = "https://github.com/tik-choco-lab/mistlib"
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 [dependencies]
