@@ -8,3 +8,4 @@ references/
 *.txt
 cargo-licenses.json
 memray_*
+test_wrapper.py

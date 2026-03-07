@@ -20,6 +20,23 @@
 - **mistlib-wasm**: WebAssembly環境向け実装。
 - **wrappers**: 各開発環境向けのインターフェース。
 
+## ビルド済みバイナリの利用
+
+Rust のビルド環境がない場合は、原則として GitHub の **Releases** から配布済みバイナリを利用してください。
+
+- **Releases**: 利用者向けの正式な配布物。
+- **Actions Artifacts**: CI の検証用に生成される一時的な成果物。
+
+### Releases から取得する
+
+1. GitHub リポジトリの **Releases** ページを開く。
+2. 対象バージョンの **Assets** から必要なファイルをダウンロードする。
+3. 利用環境に応じて以下を選択する。
+  - `mistlib-wasm-pkg`: Web/WASM 用。
+  - `mistlib-native-windows`: Windows 用 (`.dll`)。
+  - `mistlib-native-linux`: Linux 用 (`.so`)。
+  - `mistlib-native-macos`: macOS 用 (`.dylib`)。
+
 ## 機能詳細 (WASM/Web版)
 
 `MistNode` クラスを通じて以下の機能を提供します。
