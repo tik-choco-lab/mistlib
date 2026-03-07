@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -55,6 +56,19 @@ jobs:
           name: mistlib-wasm-pkg
           path: mistlib-wasm/pkg/
 
+      - name: Package WASM Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd mistlib-wasm
+          zip -r ../mistlib-wasm-pkg-${{ github.ref_name }}.zip pkg LICENSE README.md
+
+      - name: Upload WASM Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: mistlib-wasm-release
+          path: mistlib-wasm-pkg-${{ github.ref_name }}.zip
+
   build-native:
     name: Build Native (${{ matrix.os }})
     needs: test
@@ -62,7 +76,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: mistlib-native-linux
+            binary_path: target/release/libmistlib.so
+            binary_name: libmistlib.so
+          - os: windows-latest
+            artifact_name: mistlib-native-windows
+            binary_path: target/release/mistlib.dll
+            binary_name: mistlib.dll
+          - os: macos-latest
+            artifact_name: mistlib-native-macos
+            binary_path: target/release/libmistlib.dylib
+            binary_name: libmistlib.dylib
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
@@ -96,3 +122,53 @@ jobs:
         with:
           name: mistlib-native-macos
           path: target/release/libmistlib.dylib
+
+      - name: Prepare Release Asset (Windows)
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "${{ matrix.binary_path }}" "release/${{ matrix.binary_name }}"
+          Copy-Item "README.md" "release/README.md"
+          Copy-Item "LICENSE" "release/LICENSE"
+          Compress-Archive -Path release/* -DestinationPath "${{ matrix.artifact_name }}-${{ github.ref_name }}.zip" -Force
+
+      - name: Prepare Release Asset (Linux/macOS)
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.os != 'windows-latest'
+        run: |
+          mkdir -p release
+          cp "${{ matrix.binary_path }}" "release/${{ matrix.binary_name }}"
+          cp README.md release/README.md
+          cp LICENSE release/LICENSE
+          cd release
+          zip -r ../${{ matrix.artifact_name }}-${{ github.ref_name }}.zip .
+
+      - name: Upload Native Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-release
+          path: ${{ matrix.artifact_name }}-${{ github.ref_name }}.zip
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-wasm
+      - build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release"
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/**/*.zip
