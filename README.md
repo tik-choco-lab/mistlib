@@ -5,13 +5,19 @@
 
 ---
 
-## 主な機能
+## 機能
 
-- **マルチプラットフォーム**: Rust製の共通コアにより、デスクトップおよびブラウザ（WASM）に対応。
-- **言語ラッパー**: Unity (C#)、Python、JavaScript/TypeScript から利用可能。
-- **通信方式**: WebRTC (P2P) と WebSocket を併用し、環境に応じた接続を構築。
-- **空間同期 (AOI)**: 3次元座標に基づき、近接ノード間での通信を最適化。
-- **トポロジー制御**: 接続状況に応じてネットワーク構造を動的に更新。
+- **マルチプラットフォーム & マルチ言語**: Rust製の共通コアにより、デスクトップ(Native)およびブラウザ(WASM)の両方に対応。Unity (C#)、Python、JavaScript/TypeScript から利用可能です。
+- **通信・ネットワーク**:
+  - WebRTC (P2P) と WebSocket を併用し、環境に応じた最適な接続（NAT越え等）を構築。
+  - 接続状況に応じてネットワークトポロジーを動的に更新・最適化。
+  - ルームへの参加・退出およびノードの状態管理。
+- **空間同期 (AOI)**: 3次元座標に基づき、近接ノード間での通信を自動最適化。周囲（AOI内）のノード情報の取得が可能。
+- **メッセージング**: バイナリ・テキスト・JSONデータの送受信。
+  - ユニキャストおよびブロードキャスト（`toId` を空に指定）に対応。
+  - 配送品質（Reliable / UnreliableOrdered / Unreliable）を選択可能。
+- **メディア同期**: WebRTCによる音声・ビデオトラックのリアルタイム公開と受信。
+- **ストレージ**: OPFS (Origin Private File System) 等を利用したデータの永続化。
 
 ## プロジェクト構成
 
@@ -20,67 +26,28 @@
 - **mistlib-wasm**: WebAssembly環境向け実装。
 - **wrappers**: 各開発環境向けのインターフェース。
 
-## ビルド済みバイナリの利用
+## 始め方
 
-Rust のビルド環境がない場合は、原則として GitHub の **Releases** から配布済みバイナリを利用してください。
+GitHubの [Releases](https://github.com/tik-choco-lab/mistlib/releases/latest) から、環境に合ったZIPをダウンロードしてご利用ください。
 
-- **Releases**: 利用者向けの正式な配布物。
-- **Actions Artifacts**: CI の検証用に生成される一時的な成果物。
+| ターゲット | 配布ファイル名 | 同梱されているもの |
+| --- | --- | --- |
+| **Web / WASM** | `mistlib-wasm-pkg.zip` | WASM本体 (`pkg/`) + JSラッパー (`wrappers/web/`) |
+| **Windows** | `mistlib-native-windows.zip` | `.dll` + Python/Unity用ラッパー |
+| **Linux** | `mistlib-native-linux.zip` | `.so` + Python/Unity用ラッパー |
+| **macOS** | `mistlib-native-macos.zip` | `.dylib` + Python/Unity用ラッパー |
 
-### Releases から取得する
 
-1. GitHub リポジトリの **Releases** ページを開く。
-2. 対象バージョンの **Assets** から必要なファイルをダウンロードする。
-3. 利用環境に応じて以下を選択する。
-  - `mistlib-wasm-pkg`: Web/WASM 用。
-  - `mistlib-native-windows`: Windows 用 (`.dll`)。
-  - `mistlib-native-linux`: Linux 用 (`.so`)。
-  - `mistlib-native-macos`: macOS 用 (`.dylib`)。
+## AIエージェントを利用した開発
 
-各 Release 資産には、利用しやすいように対応する wrapper も同梱されます。
+各種AIエージェントがプロジェクト構造を把握しやすくするため、API定義や開発ルールをまとめたファイルを用意しています。
+最新のLLMの場合は不要かもしれませんが、小規模なLLMをご利用の際は、ご活用ください。
 
-- `mistlib-wasm-pkg`: `mistlib-wasm/pkg` と `wrappers/web` を同梱。
-- `mistlib-native-*`: ネイティブライブラリ本体に加えて `wrappers/python` と `wrappers/unity/MistLib` を同梱。
+- **[AI.md](AI.md)**
 
-また、`v*` 形式のタグを push すると、CI がそのまま Release 資産を生成し、GitHub Release を自動作成します。
+## 主要API
 
-## Web/WASM の開発セットアップ
-
-現状の Web 向けラッパーは、npm 公開済みパッケージではなく、**このリポジトリを clone して開発する前提の repo-local wrapper** です。
-
-### 前提ツール
-
-- Rust stable
-- `wasm32-unknown-unknown` ターゲット
-- `wasm-pack`
-
-セットアップ例:
-
-1. 依存確認として `cargo test --workspace` を実行する。
-2. [mistlib-wasm](mistlib-wasm) で `wasm-pack build --target web` を実行する。
-3. 生成された [mistlib-wasm/pkg](mistlib-wasm/pkg) を使って、[wrappers/web/index.js](wrappers/web/index.js) から `MistNode` を読み込む。
-
-> `wrappers/web` は TypeScript 定義付きの ESM ラッパーですが、現時点では repo 内利用を前提にしています。
-
-### Release 資産をそのまま使う場合
-
-Releases から `mistlib-wasm-pkg` を取得した場合は、展開した `pkg` ディレクトリ内の `mistlib_wasm.js` を直接読み込めます。
-
-## 機能詳細 (WASM/Web版)
-
-`MistNode` クラスを通じて以下の機能を提供します。
-
-- **ノード/ルーム管理**: 初期化、ルームへの参加・退出。
-- **座標同期**: 3次元位置の更新と、周囲（AOI内）のノード情報の取得。
-- **メッセージング**: バイナリ・テキスト・JSONデータの送受信。
-  - `toId` を空にすると全ノードへの放送（Broadcast）になります。
-  - `delivery`: 0(Reliable), 1(UnreliableOrdered), 2(Unreliable)。
-- **メディア同期**: WebRTCによる音声・ビデオトラックの公開と受信。
-- **ストレージ**: OPFS (Origin Private File System) を利用したデータの永続化。
-
-## 主要API (WASM/Web)
-
-`MistNode` クラスを通じて提供されます。
+`MistNode` クラス
 
 - `node.joinRoom(roomId)` / `node.leaveRoom()`: ルームへの参加と退出。
 - `node.updatePosition(x, y, z)`: 自身の座標を更新。
@@ -95,7 +62,7 @@ Releases から `mistlib-wasm-pkg` を取得した場合は、展開した `pkg`
   - 100: TRACK_ADDED, 101: TRACK_REMOVED
 - `storage_add(path, data)` / `storage_get(path)`: データ保存と取得。
 
-## 利用例 (Web版)
+## 利用例 (Web)
 
 ```javascript
 import { MistNode } from '../wrappers/web/index.js';
@@ -112,16 +79,6 @@ node.onEvent((type, fromId, payload) => {
 
 node.sendMessage("target-id", "Hello P2P!");
 ```
-
-上記は、たとえば `examples/web` のような**同一リポジトリ内のサンプルやアプリ**から利用する想定です。
-
----
-
-## AIエージェントを利用した開発
-
-各種AIエージェントがプロジェクト構造を把握しやすくするため、以下の構成を推奨します。
-
-- **[AI.md](AI.md)**: API定義や開発ルールをまとめたコンテキストファイル。
 
 ---
 
