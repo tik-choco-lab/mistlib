@@ -28,7 +28,7 @@
 
 ## 始め方
 
-GitHubの [Releases](https://github.com/tik-choco-lab/mistlib/releases/latest) から、環境に合ったZIPをダウンロードしてご利用ください。
+[Releases](https://github.com/tik-choco-lab/mistlib/releases/latest) から、環境に合ったZIPをダウンロードしてご利用ください。
 
 | ターゲット | 配布ファイル名 | 同梱されているもの |
 | --- | --- | --- |
