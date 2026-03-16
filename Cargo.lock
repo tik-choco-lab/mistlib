@@ -1175,6 +1175,7 @@ dependencies = [
  "js-sys",
  "lazy_static",
  "mistlib-core",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",

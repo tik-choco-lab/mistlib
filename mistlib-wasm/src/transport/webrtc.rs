@@ -17,6 +17,8 @@ use web_sys::{
     RtcPeerConnection, RtcRtpSender, RtcSdpType, RtcSessionDescriptionInit, RtcSignalingState,
 };
 
+const CONNECTION_TIMEOUT_MS: u32 = 6000;
+
 pub mod peer;
 pub use peer::Peer;
 
@@ -33,8 +35,10 @@ pub struct WasmWebRtcTransport {
     pub peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
     pub event_handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
     pub connection_states: Arc<RwLock<HashMap<NodeId, ConnectionState>>>,
+    pub connection_attempt_ids: Arc<RwLock<HashMap<NodeId, u32>>>,
     pub room_id: Arc<RwLock<String>>,
     pub max_connections: AtomicU32,
+    pub next_connection_attempt_id: AtomicU32,
     pub local_tracks: Arc<RwLock<HashMap<String, LocalTrack>>>,
     pub peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, RtcRtpSender>>>>,
 }
@@ -47,8 +51,10 @@ impl WasmWebRtcTransport {
             peers: Arc::new(RwLock::new(HashMap::new())),
             event_handler: Arc::new(Mutex::new(None)),
             connection_states: Arc::new(RwLock::new(HashMap::new())),
+            connection_attempt_ids: Arc::new(RwLock::new(HashMap::new())),
             room_id: Arc::new(RwLock::new("lobby".to_string())),
             max_connections: AtomicU32::new(30),
+            next_connection_attempt_id: AtomicU32::new(1),
             local_tracks: Arc::new(RwLock::new(HashMap::new())),
             peer_senders: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -107,11 +113,52 @@ impl WasmWebRtcTransport {
                 .clone(),
             self.connection_states.clone(),
             self.event_handler.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
         );
 
         let _ = self.attach_published_tracks_to_peer(&remote_id, &peer)?;
 
         Ok(peer)
+    }
+
+    fn cleanup_peer_connection(&self, node: &NodeId, close_pc: bool) {
+        tracing::info!(
+            "cleanup_peer_connection: node={}, close_pc={}",
+            node.0,
+            close_pc
+        );
+        let removed_peer = {
+            let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            peers.remove(node)
+        };
+
+        if close_pc {
+            if let Some(peer) = removed_peer {
+                peer.pc.close();
+            }
+        }
+
+        {
+            let mut senders = self.peer_senders.write().unwrap_or_else(|e| e.into_inner());
+            senders.remove(node);
+        }
+
+        {
+            let mut states = self
+                .connection_states
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states.insert(node.clone(), ConnectionState::Disconnected);
+        }
+
+        {
+            let mut attempts = self
+                .connection_attempt_ids
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            attempts.remove(node);
+        }
     }
 
     fn attach_published_tracks_to_peer(
@@ -403,17 +450,64 @@ impl Transport for WasmWebRtcTransport {
         data: Bytes,
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
-        let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(peer) = peers.get(node) {
-            let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(dc) = channels.get(&method) {
-                if dc.ready_state() == web_sys::RtcDataChannelState::Open {
-                    dc.send_with_u8_array(&data).map_err(|e| {
-                        mistlib_core::error::MistError::Internal(format!("{:?}", e))
-                    })?;
-                    STATS.add_send(data.len() as u64);
-                    return Ok(());
+        let node_state = self.get_connection_state(node);
+        if node_state != ConnectionState::Connected {
+            return Err(mistlib_core::error::MistError::Internal(
+                "Not connected".to_string(),
+            ));
+        }
+
+        let dc_opt = {
+            let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+            peers.get(node).cloned().and_then(|peer| {
+                let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
+                channels
+                    .get(&method)
+                    .cloned()
+                    .or_else(|| {
+                        if method == DeliveryMethod::UnreliableOrdered {
+                            channels.get(&DeliveryMethod::Unreliable).cloned()
+                        } else {
+                            None
+                        }
+                    })
+            })
+        };
+
+        if let Some(dc) = dc_opt {
+            let ready_state = dc.ready_state();
+            if ready_state == web_sys::RtcDataChannelState::Open {
+                dc.send_with_u8_array(&data).map_err(|e| {
+                    tracing::error!("DataChannel send failed for {}: {:?}", node.0, e);
+                    mistlib_core::error::MistError::Internal(format!("{:?}", e))
+                })?;
+                STATS.add_send(data.len() as u64);
+                return Ok(());
+            } else {
+                if ready_state == web_sys::RtcDataChannelState::Closed
+                    || ready_state == web_sys::RtcDataChannelState::Closing
+                {
+                    let mut states = self
+                        .connection_states
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    states.insert(node.clone(), ConnectionState::Connecting);
                 }
+                tracing::warn!("DataChannel for {} is not Open (state={:?})", node.0, ready_state);
+            }
+        } else {
+            let has_peer = {
+                let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+                peers.contains_key(node)
+            };
+            if has_peer {
+                tracing::warn!(
+                    "No DataChannel for {:?} for node {} (transient; peer kept)",
+                    method,
+                    node.0
+                );
+            } else if node_state != ConnectionState::Disconnected {
+                tracing::warn!("No Peer for node {}", node.0);
             }
         }
         Err(mistlib_core::error::MistError::Internal(
@@ -427,6 +521,7 @@ impl Transport for WasmWebRtcTransport {
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
         let nodes = self.get_connected_nodes();
+        tracing::debug!("WasmWebRtcTransport: Broadcasting to {} nodes", nodes.len());
         for node in nodes {
             let _ = self.send(&node, data.clone(), method).await;
         }
@@ -450,8 +545,10 @@ impl Transport for WasmWebRtcTransport {
                 .connection_states
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if states.contains_key(node) {
-                return Ok(());
+            if let Some(state) = states.get(node) {
+                if *state == ConnectionState::Connecting || *state == ConnectionState::Connected {
+                    return Ok(());
+                }
             }
 
             let max = self.max_connections.load(Ordering::Relaxed) as usize;
@@ -470,6 +567,18 @@ impl Transport for WasmWebRtcTransport {
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             states.insert(node.clone(), ConnectionState::Connecting);
+        }
+
+        let attempt_id = self
+            .next_connection_attempt_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        {
+            let mut attempts = self
+                .connection_attempt_ids
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            attempts.insert(node.clone(), attempt_id);
         }
 
         let peer = self
@@ -504,18 +613,71 @@ impl Transport for WasmWebRtcTransport {
             peers.insert(node.clone(), peer.clone());
         }
 
+        {
+            let node_id = node.clone();
+            let conn_states = self.connection_states.clone();
+            let attempt_ids = self.connection_attempt_ids.clone();
+            let peers = self.peers.clone();
+            let senders = self.peer_senders.clone();
+            let peer_for_timeout = peer.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(CONNECTION_TIMEOUT_MS).await;
+                let is_current_attempt = {
+                    let attempts = attempt_ids.read().unwrap_or_else(|e| e.into_inner());
+                    matches!(attempts.get(&node_id), Some(id) if *id == attempt_id)
+                };
+                let still_connecting = {
+                    let states = conn_states.read().unwrap_or_else(|e| e.into_inner());
+                    matches!(states.get(&node_id), Some(ConnectionState::Connecting))
+                };
+                let ice_alive = matches!(
+                    peer_for_timeout.pc.ice_connection_state(),
+                    web_sys::RtcIceConnectionState::Connected
+                        | web_sys::RtcIceConnectionState::Completed
+                        | web_sys::RtcIceConnectionState::Checking
+                );
+                let dc_alive = {
+                    let channels = peer_for_timeout
+                        .channels
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
+                    channels.values().any(|dc| dc.ready_state() == web_sys::RtcDataChannelState::Open)
+                };
+
+                if is_current_attempt && still_connecting && !ice_alive && !dc_alive {
+                    {
+                        let mut peers_lock = peers.write().unwrap_or_else(|e| e.into_inner());
+                        peers_lock.remove(&node_id);
+                    }
+                    {
+                        let mut senders_lock = senders.write().unwrap_or_else(|e| e.into_inner());
+                        senders_lock.remove(&node_id);
+                    }
+                    {
+                        let mut states = conn_states.write().unwrap_or_else(|e| e.into_inner());
+                        states.insert(node_id.clone(), ConnectionState::Disconnected);
+                    }
+                    {
+                        let mut attempts = attempt_ids.write().unwrap_or_else(|e| e.into_inner());
+                        attempts.remove(&node_id);
+                    }
+                    peer_for_timeout.pc.close();
+                    tracing::warn!(
+                        "Connection timeout to {}. Marked Disconnected for retry (attempt_id={}).",
+                        node_id.0,
+                        attempt_id
+                    );
+                }
+            });
+        }
+
         self.renegotiate_peer(node, &peer).await?;
 
         Ok(())
     }
 
     async fn disconnect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
-        let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(peer) = peers.remove(node) {
-            peer.pc.close();
-        }
-        let mut senders = self.peer_senders.write().unwrap_or_else(|e| e.into_inner());
-        senders.remove(node);
+        self.cleanup_peer_connection(node, true);
         Ok(())
     }
 
@@ -619,8 +781,11 @@ impl SignalingHandler for WasmWebRtcTransport {
             }
             SignalingType::Candidate => {
                 tracing::info!("Received Candidate from: {}", data.sender_id.0);
-                let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-                if let Some(peer) = peers.get(&data.sender_id) {
+                let peer = {
+                    let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+                    peers.get(&data.sender_id).cloned()
+                };
+                if let Some(peer) = peer {
                     if let Ok(cand_obj) = js_sys::JSON::parse(&data.data) {
                         let candidate_str =
                             Reflect::get(&cand_obj, &JsValue::from_str("candidate"))
@@ -650,8 +815,11 @@ impl SignalingHandler for WasmWebRtcTransport {
                 }
             }
             SignalingType::Candidates => {
-                let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-                if let Some(peer) = peers.get(&data.sender_id) {
+                let peer = {
+                    let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+                    peers.get(&data.sender_id).cloned()
+                };
+                if let Some(peer) = peer {
                     if let Ok(candidates) = serde_json::from_str::<Vec<String>>(&data.data) {
                         for cand in candidates {
                             if let Ok(cand_obj) = js_sys::JSON::parse(&cand) {
@@ -687,6 +855,27 @@ impl SignalingHandler for WasmWebRtcTransport {
             SignalingType::Request => {
                 tracing::info!("Received Request from: {}", data.sender_id.0);
                 if self.local_node_id != data.sender_id && self.local_node_id.0 < data.sender_id.0 {
+                    let has_existing_state = {
+                        let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+                        let states = self
+                            .connection_states
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner());
+                        peers.contains_key(&data.sender_id)
+                            || !matches!(
+                                states.get(&data.sender_id),
+                                None | Some(ConnectionState::Disconnected)
+                            )
+                    };
+
+                    if has_existing_state {
+                        tracing::info!(
+                            "Resetting stale peer state before reconnect: {}",
+                            data.sender_id.0
+                        );
+                        self.cleanup_peer_connection(&data.sender_id, true);
+                    }
+
                     tracing::info!("Initiating connect to: {}", data.sender_id.0);
                     let _ = self.connect(&data.sender_id).await;
                 }

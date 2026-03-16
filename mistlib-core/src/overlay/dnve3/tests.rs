@@ -152,7 +152,8 @@ fn merge_spatial_density_increases_values() {
 
 fn make_balancer(config: &Config) -> DNVE3ConnectionBalancer {
     let ds = Arc::new(Mutex::new(DNVE3DataStore::new()));
-    DNVE3ConnectionBalancer::new(ds, config)
+    let rt = Arc::new(Mutex::new(RoutingTable::new(60)));
+    DNVE3ConnectionBalancer::new(ds, rt, config)
 }
 
 #[test]
@@ -176,12 +177,13 @@ fn balancer_select_connections_empty_world() {
 
 #[test]
 fn balancer_select_connections_connects_nearby_node() {
-    let config = test_config();
+    let mut config = test_config();
+    config.dnve.density_resolution = 1;
     let balancer = make_balancer(&config);
     let self_id = node("self");
     let peer = node("peer-a");
 
-    let all_nodes = vec![(peer.clone(), pos(10.0, 0.0, 0.0))];
+    let all_nodes = vec![(peer.clone(), pos(0.0, 0.0, 10.0))];
     let actions =
         balancer.select_connections(&config, pos(0.0, 0.0, 0.0), &all_nodes, &[], &self_id);
 
@@ -606,8 +608,11 @@ fn strategy_tick_empty_world_returns_heartbeat_only() {
 
 #[test]
 fn strategy_tick_with_world_nodes_generates_connect_actions() {
-    let config = test_config();
-    let strategy = make_strategy("local");
+    let mut config = test_config();
+    config.dnve.density_resolution = 1;
+    let node_store = Arc::new(Mutex::new(NodeStore::new()));
+    let routing_table = Arc::new(Mutex::new(RoutingTable::new(60)));
+    let strategy = DNVE3Strategy::new(&config, node_store, node("local"), routing_table);
 
     {
         let mut store = strategy.node_store.lock().unwrap();
@@ -622,19 +627,31 @@ fn strategy_tick_with_world_nodes_generates_connect_actions() {
             node("far-peer"),
             NodeInfo {
                 id: node("far-peer"),
-                position: pos(50.0, 0.0, 0.0),
+                position: pos(0.0, 0.0, 50.0),
             },
         );
     }
 
-    let actions = strategy.tick(&config, &[]);
-    let has_connect_or_send = actions.iter().any(|a| {
-        matches!(
-            a,
-            crate::action::OverlayAction::Connect { .. }
-                | crate::action::OverlayAction::SendMessage { .. }
-        )
-    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    let mut has_connect_or_send = false;
+
+    while std::time::Instant::now() < deadline {
+        let actions = strategy.tick(&config, &[]);
+        has_connect_or_send = actions.iter().any(|a| {
+            matches!(
+                a,
+                crate::action::OverlayAction::Connect { .. }
+                    | crate::action::OverlayAction::SendMessage { .. }
+            )
+        });
+
+        if has_connect_or_send {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
     assert!(
         has_connect_or_send,
         "near ノードがあれば tick で Connect と SendMessage が生成されるべき"

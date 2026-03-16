@@ -205,7 +205,26 @@ impl MistEngine {
                         }
                     }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    
+                    
+                    use crate::storage::resolver;
+                    if let Some(cid) = resolver::parse_want_message(&event.data) {
+                        let from = from_origin.clone();
+                        self.runtime.handle().spawn(async move {
+                            crate::storage::handle_want(from, cid).await;
+                        });
+                    } else if let Some(cid) = resolver::parse_query_message(&event.data) {
+                        let from = from_origin.clone();
+                        self.runtime.handle().spawn(async move {
+                            crate::storage::handle_query(from, cid).await;
+                        });
+                    } else if let Some(cid) = resolver::parse_have_status_message(&event.data) {
+                        crate::storage::handle_have_status(from_origin, cid);
+                    } else if let Some((cid, data)) = resolver::parse_have_message(&event.data) {
+                        crate::storage::handle_have(cid, data);
+                    }
+                }
             }
         }
     }

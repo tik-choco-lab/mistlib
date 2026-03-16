@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use mistlib_core::signaling::{MessageContent, Signaler};
+use mistlib_core::types::ConnectionState;
 use mistlib_core::types::NodeId;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 pub struct SignalingRelay {
     pub websocket: Arc<Mutex<Option<Arc<dyn Signaler>>>>,
     pub overlay: Arc<Mutex<Option<Arc<dyn Signaler>>>>,
+    pub connection_states: Arc<Mutex<Option<Arc<RwLock<HashMap<NodeId, ConnectionState>>>>>>,
 }
 
 impl SignalingRelay {
@@ -13,6 +16,7 @@ impl SignalingRelay {
         Self {
             websocket: Arc::new(Mutex::new(None)),
             overlay: Arc::new(Mutex::new(None)),
+            connection_states: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -24,6 +28,31 @@ impl SignalingRelay {
     pub async fn set_overlay(&self, delegate: Arc<dyn Signaler>) {
         let mut lock = self.overlay.lock().unwrap_or_else(|e| e.into_inner());
         *lock = Some(delegate);
+    }
+
+    pub fn set_connection_states(
+        &self,
+        states: Arc<RwLock<HashMap<NodeId, ConnectionState>>>,
+    ) {
+        let mut lock = self
+            .connection_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *lock = Some(states);
+    }
+
+    fn target_state(&self, target: &NodeId) -> Option<ConnectionState> {
+        let states_opt = self
+            .connection_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(states) = states_opt {
+            let lock = states.read().unwrap_or_else(|e| e.into_inner());
+            lock.get(target).cloned()
+        } else {
+            None
+        }
     }
 }
 
@@ -53,26 +82,22 @@ impl Signaler for SignalingRelay {
                 return delegate.send_signaling(to, msg).await;
             }
         } else {
-            let mut sent = false;
-            let mut last_err = None;
+            let target_connected = self.target_state(to) == Some(ConnectionState::Connected);
 
-            if let Some(delegate) = ws_delegate {
-                match delegate.send_signaling(to, msg.clone()).await {
-                    Ok(_) => sent = true,
-                    Err(e) => last_err = Some(e),
+            if target_connected {
+                if let Some(delegate) = overlay_delegate {
+                    return delegate.send_signaling(to, msg).await;
                 }
-            }
-            if let Some(delegate) = overlay_delegate {
-                match delegate.send_signaling(to, msg).await {
-                    Ok(_) => sent = true,
-                    Err(e) => last_err = Some(e),
+                if let Some(delegate) = ws_delegate {
+                    return delegate.send_signaling(to, msg).await;
                 }
-            }
-
-            if sent {
-                return Ok(());
-            } else if let Some(e) = last_err {
-                return Err(e);
+            } else {
+                if let Some(delegate) = ws_delegate {
+                    return delegate.send_signaling(to, msg).await;
+                }
+                if let Some(delegate) = overlay_delegate {
+                    return delegate.send_signaling(to, msg).await;
+                }
             }
         }
 

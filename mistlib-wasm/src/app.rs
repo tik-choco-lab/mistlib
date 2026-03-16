@@ -37,6 +37,39 @@ pub const DELIVERY_UNRELIABLE: u32 = 2;
 pub(crate) struct WasmEngineEventHandler;
 impl EngineEventHandler for WasmEngineEventHandler {
     fn on_event(&self, event: EngineEvent) {
+        if let EngineEvent::RawMessage(from, data) = &event {
+            if !data.is_empty() {
+                let first = data[0];
+                if first == 0x01 {
+                    
+                    if let Ok(cid) = std::str::from_utf8(&data[1..]) {
+                        crate::storage::handle_want(from.clone(), cid.to_string());
+                    }
+                } else if first == 0x02 {
+                    
+                    if data.len() >= 2 {
+                        let cid_len = data[1] as usize;
+                        if data.len() >= 2 + cid_len {
+                            if let Ok(cid) = std::str::from_utf8(&data[2..2 + cid_len]) {
+                                let payload = data[2 + cid_len..].to_vec();
+                                crate::storage::handle_have(cid.to_string(), payload);
+                            }
+                        }
+                    }
+                } else if first == 0x03 {
+                    
+                    if let Ok(cid) = std::str::from_utf8(&data[1..]) {
+                        crate::storage::handle_query(from.clone(), cid.to_string());
+                    }
+                } else if first == 0x04 {
+                    
+                    if let Ok(cid) = std::str::from_utf8(&data[1..]) {
+                        crate::storage::handle_have_status(from.clone(), cid.to_string());
+                    }
+                }
+            }
+        }
+
         let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
         if let Some(f) = callback {
             let (event_type, from_id, payload_vec) = match event {
@@ -287,35 +320,47 @@ pub fn update_position(x: f32, y: f32, z: f32) {
 
 pub fn get_neighbors() -> String {
     let connected_nodes = ENGINE.with(|e| {
-        let state = e.state.lock().unwrap();
-        if let EngineState::Running(ctx) = &*state {
-            ctx.transport.get_connected_nodes()
+        if let Ok(state) = e.state.try_lock() {
+            if let EngineState::Running(ctx) = &*state {
+                ctx.transport.get_connected_nodes()
+            } else {
+                vec![]
+            }
         } else {
             vec![]
         }
     });
 
     ENGINE.with(|e| {
-        let store = e.node_store.lock().unwrap();
-        let connected_set: std::collections::HashSet<_> = connected_nodes.into_iter().collect();
-        store.get_connected_nodes_json(&connected_set)
+        if let Ok(store) = e.node_store.try_lock() {
+            let connected_set: std::collections::HashSet<_> = connected_nodes.into_iter().collect();
+            store.get_connected_nodes_json(&connected_set)
+        } else {
+            "[]".to_string()
+        }
     })
 }
 
 pub fn get_all_nodes() -> String {
     let connected_nodes = ENGINE.with(|e| {
-        let state = e.state.lock().unwrap();
-        if let EngineState::Running(ctx) = &*state {
-            ctx.transport.get_connected_nodes()
+        if let Ok(state) = e.state.try_lock() {
+            if let EngineState::Running(ctx) = &*state {
+                ctx.transport.get_connected_nodes()
+            } else {
+                vec![]
+            }
         } else {
             vec![]
         }
     });
 
     ENGINE.with(|e| {
-        let store = e.node_store.lock().unwrap();
-        let connected_set: std::collections::HashSet<_> = connected_nodes.into_iter().collect();
-        store.get_all_nodes_json(&connected_set)
+        if let Ok(store) = e.node_store.try_lock() {
+            let connected_set: std::collections::HashSet<_> = connected_nodes.into_iter().collect();
+            store.get_all_nodes_json(&connected_set)
+        } else {
+            "[]".to_string()
+        }
     })
 }
 
@@ -345,7 +390,6 @@ pub fn set_config(data: String) -> bool {
 pub fn send_message(target_id: String, data: &[u8], method: u32) {
     let payload = data.to_vec();
     let target = NodeId(target_id);
-    let from = ENGINE.with(|e| e.self_id.lock().unwrap().clone());
     let delivery = match method {
         DELIVERY_RELIABLE => DeliveryMethod::ReliableOrdered,
         DELIVERY_UNRELIABLE_ORDERED => DeliveryMethod::UnreliableOrdered,
@@ -363,20 +407,11 @@ pub fn send_message(target_id: String, data: &[u8], method: u32) {
         });
 
         if let Some(ctx) = ctx {
-            use mistlib_core::signaling::SignalingEnvelope;
-            let envelope = SignalingEnvelope {
-                from,
-                to: target.clone(),
-                hop_count: 1,
-                content: MessageContent::Raw(payload),
-            };
-            if let Ok(serialized) = bincode::serialize(&envelope) {
-                let bytes = Bytes::from(serialized);
-                if target.0.is_empty() {
-                    let _ = ctx.transport.broadcast(bytes, delivery).await;
-                } else {
-                    let _ = ctx.transport.send(&target, bytes, delivery).await;
-                }
+            let bytes = Bytes::from(payload);
+            if target.0.is_empty() {
+                let _ = ctx.transport.broadcast(bytes, delivery).await;
+            } else {
+                let _ = ctx.transport.send(&target, bytes, delivery).await;
             }
         }
     });

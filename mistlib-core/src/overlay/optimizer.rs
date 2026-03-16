@@ -79,6 +79,29 @@ impl OverlayOptimizer {
             }
         }
 
+        if is_broadcast && envelope.hop_count > 0 {
+            let mut forwarded = envelope.clone();
+            forwarded.hop_count -= 1;
+            if let Ok(data) = bincode::serialize(&forwarded) {
+                let neighbors: Vec<NodeId> = {
+                    let rt = self.routing_table.lock().unwrap();
+                    rt.connected_nodes
+                        .iter()
+                        .filter(|id| **id != from && **id != self.local_node_id)
+                        .cloned()
+                        .collect()
+                };
+
+                for neighbor in neighbors {
+                    actions.push(OverlayAction::SendMessage {
+                        to: neighbor,
+                        data: Bytes::from(data.clone()),
+                        method: DeliveryMethod::ReliableOrdered,
+                    });
+                }
+            }
+        }
+
         if !is_broadcast && envelope.to != self.local_node_id && envelope.hop_count > 0 {
             let mut forwarded = envelope.clone();
             forwarded.hop_count -= 1;

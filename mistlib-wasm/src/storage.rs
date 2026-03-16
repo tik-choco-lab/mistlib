@@ -86,6 +86,48 @@ pub fn handle_want(from: mistlib_core::types::NodeId, cid: String) {
     });
 }
 
+pub fn handle_query(from: mistlib_core::types::NodeId, cid: String) {
+    spawn_local(async move {
+        use mistlib_core::types::DeliveryMethod;
+
+        let block_exists = {
+            let store = WasmBlockStore;
+            mistlib_core::storage::BlockStore::load_block(&store, &cid)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        };
+
+        if block_exists {
+            let msg = resolver::build_have_status_message(&cid);
+            let ctx = crate::app::ENGINE.with(|e| {
+                let state = e.state.lock().unwrap();
+                if let mistlib_core::engine::EngineState::Running(ctx) = &*state {
+                    Some(ctx.clone())
+                } else {
+                    None
+                }
+            });
+
+            if let Some(ctx) = ctx {
+                let _ = ctx
+                    .transport
+                    .send(
+                        &from,
+                        bytes::Bytes::from(msg),
+                        DeliveryMethod::ReliableOrdered,
+                    )
+                    .await;
+            }
+        }
+    });
+}
+
+pub fn handle_have_status(from: mistlib_core::types::NodeId, cid: String) {
+    WANT_REGISTRY.with(|r| r.register_peer(&cid, from));
+}
+
 pub fn handle_have(cid: String, data: Vec<u8>) {
     WANT_REGISTRY.with(|r| r.fulfill(&cid, data));
 }

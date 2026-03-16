@@ -2,24 +2,34 @@ use crate::action::OverlayAction;
 use crate::config::Config;
 use crate::overlay::dnve3::data_store::DNVE3DataStore;
 use crate::overlay::dnve3::spatial_density::{SpatialDensityUtils, Vector3};
+use crate::overlay::routing_table::RoutingTable;
 use crate::types::{ConnectionState, NodeId};
 use std::sync::{Arc, Mutex};
 
 const SCORE_SELECTED: f32 = 10000.0;
+const SCORE_AOI_NODE_UNKNOWN_POS: f32 = 100.0;
 const MIN_DISTANCE_THRESHOLD: f32 = 0.001;
 const BASE_WEIGHT: f32 = 1.0;
 const PENALTY_NO_MESSAGE_HISTORY: f32 = 1000.0;
+const DIRECTION_THRESHOLD: f32 = 0.7;
+const RESERVED_CONNECTION_COUNT: u32 = 1;
 
 #[derive(Clone)]
 pub struct DNVE3ConnectionBalancer {
     dnve_data_store: Arc<Mutex<DNVE3DataStore>>,
+    routing_table: Arc<Mutex<RoutingTable>>,
     spatial_utils: SpatialDensityUtils,
 }
 
 impl DNVE3ConnectionBalancer {
-    pub fn new(dnve_data_store: Arc<Mutex<DNVE3DataStore>>, config: &Config) -> Self {
+    pub fn new(
+        dnve_data_store: Arc<Mutex<DNVE3DataStore>>,
+        routing_table: Arc<Mutex<RoutingTable>>,
+        config: &Config,
+    ) -> Self {
         Self {
             dnve_data_store,
+            routing_table,
             spatial_utils: SpatialDensityUtils::new(config.dnve.density_resolution as usize),
         }
     }
@@ -79,7 +89,7 @@ impl DNVE3ConnectionBalancer {
 
         let mut connected_nodes: Vec<NodeId> = connected_node_states
             .iter()
-            .filter(|(_, s)| *s == ConnectionState::Connected || *s == ConnectionState::Connecting)
+            .filter(|(_, s)| *s == ConnectionState::Connected)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -89,7 +99,7 @@ impl DNVE3ConnectionBalancer {
         let target_count = config
             .limits
             .max_connection_count
-            .saturating_sub(config.limits.reserved_connection_count)
+            .saturating_sub(RESERVED_CONNECTION_COUNT)
             as usize;
 
         if connected_nodes.len() > target_count {
@@ -170,12 +180,11 @@ impl DNVE3ConnectionBalancer {
 
     fn select_directional_nodes(
         &self,
-        config: &Config,
+        _config: &Config,
         self_pos: Vector3,
         all_nodes: &[(NodeId, Vector3)],
     ) -> Vec<NodeId> {
         let directions = &self.spatial_utils.directions;
-        let direction_threshold = config.dnve.direction_threshold;
         let mut selected = Vec::new();
 
         for dir in directions {
@@ -189,7 +198,7 @@ impl DNVE3ConnectionBalancer {
                     continue;
                 }
                 let dot = vec.normalized().dot(*dir);
-                if dot < direction_threshold {
+                if dot < DIRECTION_THRESHOLD {
                     continue;
                 }
                 if dist < min_dist {
@@ -222,10 +231,19 @@ impl DNVE3ConnectionBalancer {
             score += SCORE_SELECTED;
         }
 
-        if let Some((_, pos)) = all_nodes.iter().find(|(nid, _)| nid == id) {
-            let dist = self_pos.dist(*pos);
-            if dist <= config.dnve.aoi_range {
-                score += 0f32.max(config.dnve.aoi_range - dist);
+        let is_message_node = {
+            let rt = self.routing_table.lock().unwrap();
+            rt.message_nodes.contains(id)
+        };
+
+        if is_message_node {
+            if let Some((_, pos)) = all_nodes.iter().find(|(nid, _)| nid == id) {
+                let dist = self_pos.dist(*pos);
+                if dist <= config.dnve.aoi_range {
+                    score += 0f32.max(config.dnve.aoi_range - dist);
+                }
+            } else {
+                score += SCORE_AOI_NODE_UNKNOWN_POS;
             }
         }
 

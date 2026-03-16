@@ -20,6 +20,10 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         }
     }
 
+    pub async fn get_block(&self, cid: &str) -> Result<Option<Vec<u8>>> {
+        self.store.load_block(cid).await
+    }
+
     pub async fn add(&self, name: &str, data: &[u8]) -> Result<String> {
         debug!("StorageEngine::add: name={}, size={}", name, data.len());
         let mut chunk_cids = Vec::new();
@@ -53,15 +57,49 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
     }
 
     pub async fn get(&self, root_cid: &str) -> Result<Vec<u8>> {
-        debug!("StorageEngine::get: cid={}", root_cid);
+        info!("StorageEngine::get: cid={}", root_cid);
         let manifest_bytes = self.resolve_or_fetch(root_cid, MULTICODEC_DAG_CBOR).await?;
         let manifest: FileManifest = serde_cbor::from_slice(&manifest_bytes)
             .map_err(|e| MistError::Serialization(e.to_string()))?;
-        let mut result = Vec::with_capacity(manifest.size as usize);
-        for chunk_cid in &manifest.chunks {
-            let chunk_data = self.resolve_or_fetch(chunk_cid, MULTICODEC_RAW).await?;
-            result.extend_from_slice(&chunk_data);
+
+        info!(
+            "StorageEngine: downloading '{}' ({} bytes, {} chunks)",
+            manifest.name, manifest.size, manifest.chunks.len()
+        );
+
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let concurrency = 4;
+        let mut results = Vec::with_capacity(manifest.chunks.len());
+        let mut futures = FuturesUnordered::new();
+
+        for (i, cid) in manifest.chunks.iter().enumerate() {
+            let cid = cid.clone();
+            futures.push(async move {
+                let data = self.resolve_or_fetch(&cid, MULTICODEC_RAW).await?;
+                Ok::<(usize, Vec<u8>), MistError>((i, data))
+            });
+
+            if futures.len() >= concurrency {
+                if let Some(res) = futures.next().await {
+                    results.push(res?);
+                }
+            }
         }
+
+        while let Some(res) = futures.next().await {
+            results.push(res?);
+        }
+
+        
+        results.sort_by_key(|(i, _)| *i);
+
+        let mut result = Vec::with_capacity(manifest.size as usize);
+        for (_, data) in results {
+            result.extend_from_slice(&data);
+        }
+
+        info!("StorageEngine: successfully retrieved '{}'", manifest.name);
         Ok(result)
     }
 

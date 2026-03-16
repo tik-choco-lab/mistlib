@@ -14,6 +14,10 @@ impl<B: BlockStore, P: PeerResolver> P2PStorage<B, P> {
             engine: StorageEngine::new(store, resolver, max_capacity_bytes),
         }
     }
+
+    pub async fn get_block(&self, cid: &str) -> Result<Option<Vec<u8>>> {
+        self.engine.get_block(cid).await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

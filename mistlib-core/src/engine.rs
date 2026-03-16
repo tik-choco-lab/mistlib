@@ -68,9 +68,17 @@ impl ActionHandler for MistEngine {
                 match action {
                     OverlayAction::SendMessage { to, data, method } => {
                         if let Some(nt) = &ctx.network_transport {
-                            let _ = nt.send(&to, data, method).await;
+                            if to.0.is_empty() {
+                                let _ = nt.broadcast(data, method).await;
+                            } else {
+                                let _ = nt.send(&to, data, method).await;
+                            }
                         } else {
-                            let _ = ctx.transport.send(&to, data, method).await;
+                            if to.0.is_empty() {
+                                let _ = ctx.transport.broadcast(data, method).await;
+                            } else {
+                                let _ = ctx.transport.send(&to, data, method).await;
+                            }
                         }
                     }
                     OverlayAction::Connect { to } => {
@@ -189,23 +197,32 @@ impl MistEngine {
 
     async fn process_network_event(&self, event: NetworkEvent) {
         let from_origin = event.from.clone();
+        tracing::debug!("MistEngine: Received network event from {}, len={}", from_origin.0, event.data.len());
+        
         match bincode::deserialize::<SignalingEnvelope>(&event.data) {
             Ok(envelope) => {
-                let to_self =
-                    envelope.to == *self.self_id.lock().unwrap() || envelope.to.0.is_empty();
+                let (to_self, _self_id_val) = {
+                    let id_lock = self.self_id.lock().unwrap();
+                    (envelope.to == *id_lock || envelope.to.0.is_empty(), id_lock.clone())
+                };
+                
+                tracing::debug!("MistEngine: Deserialized envelope from={}, to={}, to_self={}", envelope.from.0, envelope.to.0, to_self);
+                
                 let content = envelope.content.clone();
 
-                let actions = {
+                let overlay_opt = {
                     let state = self.state.lock().unwrap();
-                    if let EngineState::Running(ctx) = &*state {
-                        if let Some(ov) = &ctx.overlay {
-                            ov.handle_envelope(envelope, from_origin.clone())
-                        } else {
-                            vec![]
-                        }
+                    if let EngineState::Running(c) = &*state {
+                        c.overlay.clone()
                     } else {
-                        vec![]
+                        None
                     }
+                };
+
+                let actions = if let Some(ov) = overlay_opt {
+                    ov.handle_envelope(envelope, from_origin.clone())
+                } else {
+                    vec![]
                 };
 
                 for action in actions {
@@ -215,10 +232,12 @@ impl MistEngine {
                 if to_self {
                     match content {
                         MessageContent::Raw(payload) => {
+                            tracing::debug!("MistEngine: Dispatching RawMessage to handler, payload_len={}", payload.len());
                             let handler = self.event_handler.lock().unwrap().clone();
                             handler.on_event(EngineEvent::RawMessage(from_origin, payload));
                         }
                         MessageContent::Overlay(msg) => {
+                            tracing::debug!("MistEngine: Dispatching OverlayMessage type={}", msg.message_type);
                             if msg.message_type == 100 {
                                 if let Ok(data) =
                                     serde_json::from_slice::<serde_json::Value>(&msg.payload)
@@ -229,6 +248,7 @@ impl MistEngine {
                                             data["position"]["y"].as_f64(),
                                             data["position"]["z"].as_f64(),
                                         ) {
+                                            tracing::debug!("MistEngine: Updating node {} position to ({}, {}, {})", from_origin.0, x, y, z);
                                             let mut store = self.node_store.lock().unwrap();
                                             store.update_node_position(
                                                 from_origin.clone(),
@@ -242,6 +262,7 @@ impl MistEngine {
                             handler.on_event(EngineEvent::OverlayMessage(from_origin, msg.payload));
                         }
                         MessageContent::Data(sig_data) => {
+                            tracing::debug!("MistEngine: Handling signaling Data from {} for {}", sig_data.sender_id.0, sig_data.receiver_id.0);
                             {
                                 let mut store = self.node_store.lock().unwrap();
                                 if !store.nodes.contains_key(&sig_data.sender_id)
@@ -273,7 +294,11 @@ impl MistEngine {
                     }
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!("MistEngine: Deserialization failed for event from {}: {:?}. Forwarding as raw data.", from_origin.0, e);
+                let handler = self.event_handler.lock().unwrap().clone();
+                handler.on_event(EngineEvent::RawMessage(from_origin, event.data.to_vec()));
+            }
         }
     }
 
@@ -282,9 +307,31 @@ impl MistEngine {
             let state = self.state.lock().unwrap();
             if let EngineState::Running(ctx) = &*state {
                 if let Some(ov) = &ctx.overlay {
-                    let rt = ov.routing_table.lock().unwrap();
-                    let conn = rt.connected_nodes.clone();
-                    let s = ctx.transport.get_active_connection_states();
+                    let s = if let Some(nt) = &ctx.network_transport {
+                        nt.get_active_connection_states()
+                    } else {
+                        ctx.transport.get_active_connection_states()
+                    };
+
+                    let conn: std::collections::HashSet<_> = s
+                        .iter()
+                        .filter(|(_, st)| *st == crate::types::ConnectionState::Connected)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+
+                    {
+                        let mut rt = ov.routing_table.lock().unwrap();
+                        let current_rt_connected = rt.connected_nodes.clone();
+                        for id in &conn {
+                            rt.on_connected(id.clone());
+                        }
+                        for id in current_rt_connected {
+                            if !conn.contains(&id) {
+                                rt.on_disconnected(&id);
+                            }
+                        }
+                    }
+
                     (conn, s)
                 } else {
                     (std::collections::HashSet::new(), vec![])

@@ -53,6 +53,7 @@ impl L0Engine for WasmL0 {
                 relay.clone() as Arc<dyn Signaler>,
                 local_id.clone(),
             ));
+            relay.set_connection_states(webrtc.connection_states.clone());
             webrtc.set_max_connections(config.limits.max_connection_count);
 
             let mut optimizer = OverlayOptimizer::new(

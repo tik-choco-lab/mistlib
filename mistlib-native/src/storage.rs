@@ -32,7 +32,58 @@ pub async fn init_storage(
 }
 
 pub async fn handle_want(from: mistlib_core::types::NodeId, cid: String) {
-    if let Some(_storage) = STORAGE.get() {
-        tracing::debug!("handle_want stub for {} from {}", cid, from.0);
+    if let Some(storage) = STORAGE.get() {
+        use mistlib_core::types::DeliveryMethod;
+
+        let block = storage.get_block(&cid).await.ok().flatten();
+
+        if let Some(data) = block {
+            let msg = resolver::build_have_message(&cid, &data);
+            if let Some(ctx) = crate::engine::ENGINE.get_context().await {
+                let _ = ctx
+                    .transport
+                    .send(
+                        &from,
+                        bytes::Bytes::from(msg),
+                        DeliveryMethod::ReliableOrdered,
+                    )
+                    .await;
+                tracing::debug!("Storage: served `have` for {} to {}", cid, from.0);
+            }
+        }
+    }
+}
+
+pub async fn handle_query(from: mistlib_core::types::NodeId, cid: String) {
+    if let Some(storage) = STORAGE.get() {
+        use mistlib_core::types::DeliveryMethod;
+
+        let block_exists = storage.get_block(&cid).await.ok().flatten().is_some();
+
+        if block_exists {
+            let msg = resolver::build_have_status_message(&cid);
+            if let Some(ctx) = crate::engine::ENGINE.get_context().await {
+                let _ = ctx
+                    .transport
+                    .send(
+                        &from,
+                        bytes::Bytes::from(msg),
+                        DeliveryMethod::ReliableOrdered,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+pub fn handle_have_status(from: mistlib_core::types::NodeId, cid: String) {
+    if let Some(registry) = WANT_REGISTRY.get() {
+        registry.register_peer(&cid, from);
+    }
+}
+
+pub fn handle_have(cid: String, data: Vec<u8>) {
+    if let Some(registry) = WANT_REGISTRY.get() {
+        registry.fulfill(&cid, data);
     }
 }

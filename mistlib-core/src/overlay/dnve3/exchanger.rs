@@ -1,5 +1,5 @@
 use crate::action::OverlayAction;
-use crate::config::{Config, DensityEncoding};
+use crate::config::Config;
 use crate::overlay::dnve3::data_store::DNVE3DataStore;
 use crate::overlay::dnve3::spatial_density::{
     SpatialDensityData, SpatialDensityDataByte, SpatialDensityUtils, Vector3,
@@ -39,11 +39,8 @@ impl DNVE3Exchanger {
         start.elapsed().as_millis() as u64
     }
 
-    fn encode_heartbeat_payload(data: &SpatialDensityData, config: &Config) -> Vec<u8> {
-        let payload = match config.dnve.density_encoding {
-            DensityEncoding::Float => HeartbeatDensityPayload::Float(data.clone()),
-            DensityEncoding::Byte => HeartbeatDensityPayload::Byte(data.to_byte_encoded()),
-        };
+    fn encode_heartbeat_payload(data: &SpatialDensityData, _config: &Config) -> Vec<u8> {
+        let payload = HeartbeatDensityPayload::Byte(data.to_byte_encoded());
         bincode::serialize(&payload).unwrap_or_default()
     }
 
@@ -138,10 +135,10 @@ impl DNVE3Exchanger {
             self_pos,
             &other_nodes,
             config.dnve.distance_layers as usize,
-            0.0,
+            config.dnve.density_max_range,
         );
 
-        {
+        let self_density_data = {
             let mut store = self.dnve_data_store.lock().unwrap();
             let mut merged_density = self_density.density_map.clone();
             for info in store.neighbors.values() {
@@ -154,9 +151,10 @@ impl DNVE3Exchanger {
             }
             store.self_density = Some(self_density.clone());
             store.merged_density_map = Some(merged_density);
-        }
+            self_density
+        };
 
-        let payload = Self::encode_heartbeat_payload(&self_density, config);
+        let payload = Self::encode_heartbeat_payload(&self_density_data, config);
         let mut actions = Vec::with_capacity(connected_nodes.len());
 
         for target in connected_nodes {

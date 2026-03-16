@@ -51,7 +51,8 @@ impl Transport for OverlayTransport {
     }
 
     fn get_connected_nodes(&self) -> Vec<NodeId> {
-        vec![]
+        let rt = self.optimizer.routing_table.lock().unwrap();
+        rt.connected_nodes.iter().cloned().collect()
     }
 }
 

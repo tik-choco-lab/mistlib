@@ -32,10 +32,14 @@ impl Peer {
         room_id: String,
         connection_states: Arc<RwLock<HashMap<NodeId, ConnectionState>>>,
         event_handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
+        peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
+        peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, web_sys::RtcRtpSender>>>>,
     ) {
         let conn_states = connection_states.clone();
         let remote_id_state = remote_id.clone();
         let peer_state = self.clone();
+        let peers_state = peers.clone();
+        let senders_state = peer_senders.clone();
         let onstatechange = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
             let state = peer_state.pc.ice_connection_state();
             tracing::info!(
@@ -49,10 +53,20 @@ impl Peer {
                 | web_sys::RtcIceConnectionState::Completed => {
                     states.insert(remote_id_state.clone(), ConnectionState::Connected);
                 }
-                web_sys::RtcIceConnectionState::Disconnected
-                | web_sys::RtcIceConnectionState::Failed
+                web_sys::RtcIceConnectionState::Disconnected => {
+                    states.insert(remote_id_state.clone(), ConnectionState::Connecting);
+                }
+                web_sys::RtcIceConnectionState::Failed
                 | web_sys::RtcIceConnectionState::Closed => {
                     states.insert(remote_id_state.clone(), ConnectionState::Disconnected);
+                    {
+                        let mut peers = peers_state.write().unwrap_or_else(|e| e.into_inner());
+                        peers.remove(&remote_id_state);
+                    }
+                    {
+                        let mut senders = senders_state.write().unwrap_or_else(|e| e.into_inner());
+                        senders.remove(&remote_id_state);
+                    }
                 }
                 web_sys::RtcIceConnectionState::Checking => {
                     states.insert(remote_id_state.clone(), ConnectionState::Connecting);
@@ -176,8 +190,11 @@ impl Peer {
                 let array = js_sys::Uint8Array::new(&ab);
                 let vec = array.to_vec();
                 STATS.add_receive(vec.len() as u64);
-                let lock = handler.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(h) = lock.as_ref() {
+                let maybe_h = {
+                    let lock = handler.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.as_ref().cloned()
+                };
+                if let Some(h) = maybe_h {
                     h.on_event(NetworkEvent {
                         from: from.clone(),
                         data: bytes::Bytes::from(vec),

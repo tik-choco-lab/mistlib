@@ -79,8 +79,11 @@ impl Signaler for WasmWebSocketSignaler {
         _to: &NodeId,
         msg: MessageContent,
     ) -> mistlib_core::error::Result<()> {
-        let lock = self.socket.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ws) = lock.as_ref() {
+        let ws_opt = {
+            let lock = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+            lock.as_ref().cloned()
+        };
+        if let Some(ws) = ws_opt {
             if ws.ready_state() == WebSocket::OPEN {
                 let json = match msg {
                     MessageContent::Data(data) => serde_json::to_string(&data)
