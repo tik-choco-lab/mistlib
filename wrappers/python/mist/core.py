@@ -29,14 +29,12 @@ elif sys.platform == "darwin":
 else:
     lib_name = "libmistlib.so"
 
-_search_paths = [
-    os.path.join(os.path.dirname(__file__), lib_name),
-    os.path.join(os.path.dirname(__file__), "..", lib_name),
-    os.path.join(os.path.dirname(__file__), "../../../target/release", lib_name),
-    os.path.join(os.path.dirname(__file__), "../../../target/debug", lib_name),
-]
-
-DLL_PATH = next((os.path.abspath(p) for p in _search_paths if os.path.exists(p)), os.path.abspath(_search_paths[0]))
+release_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../target/release", lib_name))
+debug_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../target/debug", lib_name))
+if os.path.exists(release_path):
+    DLL_PATH = release_path
+else:
+    DLL_PATH = debug_path
 
 DEFAULT_SIGNALING_URL = b"wss://rtc.tik-choco.com/signaling"
 SIGNALING_URL_ENV = os.getenv("MIST_SIGNALING_URL")

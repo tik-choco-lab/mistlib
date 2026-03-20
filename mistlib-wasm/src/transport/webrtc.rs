@@ -8,13 +8,14 @@ use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStream, MediaStreamTrack, RtcConfiguration, RtcDataChannelInit, RtcIceCandidateInit,
     RtcPeerConnection, RtcRtpSender, RtcSdpType, RtcSessionDescriptionInit, RtcSignalingState,
+    RtcIceConnectionState,
 };
 
 const CONNECTION_TIMEOUT_MS: u32 = 6000;
@@ -39,6 +40,7 @@ pub struct WasmWebRtcTransport {
     pub room_id: Arc<RwLock<String>>,
     pub max_connections: AtomicU32,
     pub next_connection_attempt_id: AtomicU32,
+    pub sweeper_started: AtomicBool,
     pub local_tracks: Arc<RwLock<HashMap<String, LocalTrack>>>,
     pub peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, RtcRtpSender>>>>,
 }
@@ -55,9 +57,90 @@ impl WasmWebRtcTransport {
             room_id: Arc::new(RwLock::new("lobby".to_string())),
             max_connections: AtomicU32::new(30),
             next_connection_attempt_id: AtomicU32::new(1),
+            sweeper_started: AtomicBool::new(false),
             local_tracks: Arc::new(RwLock::new(HashMap::new())),
             peer_senders: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn ensure_session_sweeper(&self) {
+        if self.sweeper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let peers = self.peers.clone();
+        let states = self.connection_states.clone();
+        let attempts = self.connection_attempt_ids.clone();
+        let senders = self.peer_senders.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(2000).await;
+
+                let nodes: Vec<NodeId> = {
+                    let lock = states.read().unwrap_or_else(|e| e.into_inner());
+                    lock.keys().cloned().collect()
+                };
+
+                for node in nodes {
+                    let peer_opt = {
+                        let lock = peers.read().unwrap_or_else(|e| e.into_inner());
+                        lock.get(&node).cloned()
+                    };
+
+                    let Some(peer) = peer_opt else {
+                        let mut lock = states.write().unwrap_or_else(|e| e.into_inner());
+                        lock.remove(&node);
+                        continue;
+                    };
+
+                    let state_snapshot = {
+                        let lock = states.read().unwrap_or_else(|e| e.into_inner());
+                        lock.get(&node).copied().unwrap_or(ConnectionState::Disconnected)
+                    };
+
+                    let ice_state = peer.pc.ice_connection_state();
+                    let has_open_channel = {
+                        let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
+                        channels.values().any(|dc| {
+                            matches!(
+                                dc.ready_state(),
+                                web_sys::RtcDataChannelState::Open
+                                    | web_sys::RtcDataChannelState::Connecting
+                            )
+                        })
+                    };
+
+                    let should_cleanup = matches!(
+                        ice_state,
+                        web_sys::RtcIceConnectionState::Failed
+                            | web_sys::RtcIceConnectionState::Closed
+                            | web_sys::RtcIceConnectionState::Disconnected
+                    ) || (state_snapshot == ConnectionState::Connected && !has_open_channel);
+
+                    if should_cleanup {
+                        {
+                            let mut lock = attempts.write().unwrap_or_else(|e| e.into_inner());
+                            lock.remove(&node);
+                        }
+                        {
+                            let mut lock = states.write().unwrap_or_else(|e| e.into_inner());
+                            lock.insert(node.clone(), ConnectionState::Disconnected);
+                        }
+                        {
+                            let mut lock = peers.write().unwrap_or_else(|e| e.into_inner());
+                            lock.remove(&node);
+                        }
+                        {
+                            let mut lock = senders.write().unwrap_or_else(|e| e.into_inner());
+                            lock.remove(&node);
+                        }
+                        peer.pc.close();
+                        tracing::warn!("[Sweeper] Force cleaned session for {}", node.0);
+                    }
+                }
+            }
+        });
     }
 
     pub fn set_room_id(&self, room_id: String) {
@@ -227,12 +310,43 @@ impl WasmWebRtcTransport {
         remote_id: &NodeId,
         peer: &Arc<Peer>,
     ) -> mistlib_core::error::Result<()> {
+        let state_ok = {
+            let lock = self.connection_states.read().unwrap_or_else(|e| e.into_inner());
+            matches!(
+                lock.get(remote_id),
+                Some(ConnectionState::Connecting) | Some(ConnectionState::Connected)
+            )
+        };
+        if !state_ok {
+            return Err(mistlib_core::error::MistError::Internal(format!(
+                "Offer precondition failed: invalid connection state for {}",
+                remote_id.0
+            )));
+        }
+
         if peer.pc.signaling_state() != RtcSignalingState::Stable {
             tracing::debug!(
                 "Skipping renegotiation with {} because signaling state is not stable",
                 remote_id.0
             );
-            return Ok(());
+            return Err(mistlib_core::error::MistError::Internal(format!(
+                "Offer precondition failed: signaling state is not stable for {}",
+                remote_id.0
+            )));
+        }
+
+        let ice_state = peer.pc.ice_connection_state();
+        if matches!(
+            ice_state,
+            RtcIceConnectionState::Failed
+                | RtcIceConnectionState::Closed
+                | RtcIceConnectionState::Disconnected
+        ) {
+            return Err(mistlib_core::error::MistError::Internal(format!(
+                "Offer precondition failed: unstable ice state {:?} for {}",
+                ice_state,
+                remote_id.0
+            )));
         }
 
         let offer = JsFuture::from(peer.pc.create_offer())
@@ -389,11 +503,28 @@ impl WasmWebRtcTransport {
         track_id: &str,
         enabled: bool,
     ) -> mistlib_core::error::Result<()> {
-        let lock = self.local_tracks.read().unwrap_or_else(|e| e.into_inner());
-        let entry = lock.get(track_id).ok_or_else(|| {
-            mistlib_core::error::MistError::Internal(format!("Unknown local track: {}", track_id))
-        })?;
-        entry.track.set_enabled(enabled);
+        let local_track = {
+            let lock = self.local_tracks.read().unwrap_or_else(|e| e.into_inner());
+            let entry = lock.get(track_id).ok_or_else(|| {
+                mistlib_core::error::MistError::Internal(format!("Unknown local track: {}", track_id))
+            })?;
+            entry.track.clone()
+        };
+        local_track.set_enabled(enabled);
+
+        let sender_tracks: Vec<MediaStreamTrack> = self
+            .peer_senders
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|senders| senders.get(track_id))
+            .filter_map(|sender| sender.track())
+            .collect();
+
+        for sender_track in sender_tracks {
+            sender_track.set_enabled(enabled);
+        }
+
         Ok(())
     }
 
@@ -425,6 +556,8 @@ impl Transport for WasmWebRtcTransport {
         &self,
         handler: Arc<dyn NetworkEventHandler>,
     ) -> mistlib_core::error::Result<()> {
+        self.ensure_session_sweeper();
+
         {
             let mut lock = self.event_handler.lock().unwrap_or_else(|e| e.into_inner());
             *lock = Some(handler);
@@ -594,8 +727,6 @@ impl Transport for WasmWebRtcTransport {
             let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
             channels.insert(DeliveryMethod::ReliableOrdered, reliable.clone());
         }
-        Peer::setup_dc_handlers(reliable, self.event_handler.clone(), node.clone());
-
         let unreliable_init = RtcDataChannelInit::new();
         unreliable_init.set_ordered(false);
         unreliable_init.set_max_retransmits(0);
@@ -606,7 +737,23 @@ impl Transport for WasmWebRtcTransport {
             let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
             channels.insert(DeliveryMethod::Unreliable, unreliable.clone());
         }
-        Peer::setup_dc_handlers(unreliable, self.event_handler.clone(), node.clone());
+        Peer::setup_dc_handlers(
+            reliable,
+            self.event_handler.clone(),
+            node.clone(),
+            self.connection_states.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
+        );
+
+        Peer::setup_dc_handlers(
+            unreliable,
+            self.event_handler.clone(),
+            node.clone(),
+            self.connection_states.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
+        );
 
         {
             let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
@@ -634,17 +781,22 @@ impl Transport for WasmWebRtcTransport {
                     peer_for_timeout.pc.ice_connection_state(),
                     web_sys::RtcIceConnectionState::Connected
                         | web_sys::RtcIceConnectionState::Completed
-                        | web_sys::RtcIceConnectionState::Checking
                 );
                 let dc_alive = {
                     let channels = peer_for_timeout
                         .channels
                         .read()
                         .unwrap_or_else(|e| e.into_inner());
-                    channels.values().any(|dc| dc.ready_state() == web_sys::RtcDataChannelState::Open)
+                    channels.values().any(|dc| {
+                        matches!(
+                            dc.ready_state(),
+                            web_sys::RtcDataChannelState::Open
+                                | web_sys::RtcDataChannelState::Connecting
+                        )
+                    })
                 };
 
-                if is_current_attempt && still_connecting && !ice_alive && !dc_alive {
+                if is_current_attempt && still_connecting && (!ice_alive || !dc_alive) {
                     {
                         let mut peers_lock = peers.write().unwrap_or_else(|e| e.into_inner());
                         peers_lock.remove(&node_id);
@@ -663,7 +815,7 @@ impl Transport for WasmWebRtcTransport {
                     }
                     peer_for_timeout.pc.close();
                     tracing::warn!(
-                        "Connection timeout to {}. Marked Disconnected for retry (attempt_id={}).",
+                        "Connection timeout to {}. fail-fast cleanup (attempt_id={}).",
                         node_id.0,
                         attempt_id
                     );
@@ -671,7 +823,10 @@ impl Transport for WasmWebRtcTransport {
             });
         }
 
-        self.renegotiate_peer(node, &peer).await?;
+        if let Err(e) = self.renegotiate_peer(node, &peer).await {
+            self.cleanup_peer_connection(node, true);
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -703,6 +858,20 @@ impl SignalingHandler for WasmWebRtcTransport {
             _ => return Ok(()),
         };
 
+        let current_room_id = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !data.room_id.is_empty() && data.room_id != current_room_id {
+            tracing::warn!(
+                "WasmWebRtcTransport: ignore signaling from different room_id {} (current={})",
+                data.room_id,
+                current_room_id
+            );
+            return Ok(());
+        }
+
         match data.signaling_type {
             SignalingType::Offer => {
                 tracing::info!("Received Offer from: {}", data.sender_id.0);
@@ -716,6 +885,14 @@ impl SignalingHandler for WasmWebRtcTransport {
                         .create_pc(data.sender_id.clone())
                         .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?,
                 };
+
+                if peer.pc.signaling_state() != RtcSignalingState::Stable {
+                    return Err(mistlib_core::error::MistError::Internal(format!(
+                        "Offer precondition failed: signaling is not stable for {}",
+                        data.sender_id.0
+                    )));
+                }
+
                 let sdp_init = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
                 sdp_init.set_sdp(&data.data);
                 JsFuture::from(peer.pc.set_remote_description(&sdp_init))
@@ -770,6 +947,13 @@ impl SignalingHandler for WasmWebRtcTransport {
                     peers.get(&data.sender_id).cloned()
                 };
                 if let Some(peer) = peer {
+                    if peer.pc.signaling_state() != RtcSignalingState::HaveLocalOffer {
+                        return Err(mistlib_core::error::MistError::Internal(format!(
+                            "Answer precondition failed: signaling state is not HaveLocalOffer for {}",
+                            data.sender_id.0
+                        )));
+                    }
+
                     let sdp_init = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
                     sdp_init.set_sdp(&data.data);
                     JsFuture::from(peer.pc.set_remote_description(&sdp_init))

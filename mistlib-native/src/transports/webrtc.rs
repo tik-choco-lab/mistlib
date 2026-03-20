@@ -5,8 +5,10 @@ use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEvent, NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::env;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
+use std::time::{Duration, Instant};
 
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
@@ -15,9 +17,13 @@ use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::stats::StatsReportType;
 
 const SERVER_ID: &str = "server";
+const CONNECTION_TIMEOUT_MS: u64 = 6000;
+const RECONNECT_COOLDOWN_MS: u64 = 3000;
 
 #[derive(Debug, Clone)]
 pub struct SctpPeerStats {
@@ -43,6 +49,10 @@ pub struct WebRtcTransport {
     pub room_id: Arc<StdRwLock<String>>,
     pub pending_candidates: Arc<tokio::sync::RwLock<HashMap<NodeId, Vec<String>>>>,
     pub max_connections: AtomicU32,
+    pub connection_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
+    pub last_disconnect_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+    pub next_connection_attempt_id: AtomicU32,
+    pub sweeper_started: AtomicBool,
 }
 
 impl WebRtcTransport {
@@ -60,6 +70,10 @@ impl WebRtcTransport {
             room_id: Arc::new(StdRwLock::new("lobby".to_string())),
             pending_candidates: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             max_connections: AtomicU32::new(30),
+            connection_attempt_ids: Arc::new(StdRwLock::new(HashMap::new())),
+            last_disconnect_at: Arc::new(StdRwLock::new(HashMap::new())),
+            next_connection_attempt_id: AtomicU32::new(1),
+            sweeper_started: AtomicBool::new(false),
         }
     }
 
@@ -123,13 +137,265 @@ impl WebRtcTransport {
             self.connection_states.clone(),
             self.peers.clone(),
             self.pending_candidates.clone(),
+            self.connection_attempt_ids.clone(),
+            self.last_disconnect_at.clone(),
         )
         .await?;
 
         Ok(peer)
     }
 
+    fn reserve_connection_attempt(&self, node: &NodeId) -> u32 {
+        let attempt_id = self
+            .next_connection_attempt_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let mut attempts = self.connection_attempt_ids.write().unwrap();
+        attempts.insert(node.clone(), attempt_id);
+        attempt_id
+    }
+
+    async fn cleanup_session(&self, node: &NodeId, force_failed: bool) {
+        {
+            let mut attempts = self.connection_attempt_ids.write().unwrap();
+            attempts.remove(node);
+        }
+
+        {
+            let mut last_disconnect = self.last_disconnect_at.write().unwrap();
+            last_disconnect.insert(node.clone(), Instant::now());
+        }
+
+        {
+            let mut states = self.connection_states.write().unwrap();
+            if force_failed {
+                states.insert(node.clone(), ConnectionState::Failed);
+            } else {
+                states.remove(node);
+            }
+        }
+
+        let peer = {
+            let mut peers = self.peers.write().await;
+            peers.remove(node)
+        };
+
+        {
+            let mut pc_lock = self.pending_candidates.write().await;
+            pc_lock.remove(node);
+        }
+
+        if let Some(peer) = peer {
+            peer.close_all().await;
+        }
+
+        crate::events::on_disconnected_internal(node.clone());
+    }
+
+    fn can_send_offer(
+        &self,
+        node: &NodeId,
+        pc_state: RTCPeerConnectionState,
+        signaling_state: RTCSignalingState,
+    ) -> bool {
+        let state_ok = {
+            let states = self.connection_states.read().unwrap();
+            matches!(
+                states.get(node),
+                Some(ConnectionState::Connecting) | Some(ConnectionState::Connected)
+            )
+        };
+
+        if !state_ok {
+            tracing::warn!(
+                "[Signaling] Reject Offer to {}: invalid connection state",
+                node
+            );
+            return false;
+        }
+
+        if signaling_state != RTCSignalingState::Stable {
+            tracing::warn!(
+                "[Signaling] Reject Offer to {}: signaling is not stable ({:?})",
+                node,
+                signaling_state
+            );
+            return false;
+        }
+
+        if matches!(
+            pc_state,
+            RTCPeerConnectionState::Failed
+                | RTCPeerConnectionState::Closed
+                | RTCPeerConnectionState::Disconnected
+        ) {
+            tracing::warn!(
+                "[Signaling] Reject Offer to {}: pc state is unstable ({:?})",
+                node,
+                pc_state
+            );
+            return false;
+        }
+
+        true
+    }
+
+    fn spawn_connection_watchdog(&self, node: NodeId, attempt_id: u32) {
+        let peers = self.peers.clone();
+        let states = self.connection_states.clone();
+        let pending = self.pending_candidates.clone();
+        let attempts = self.connection_attempt_ids.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(CONNECTION_TIMEOUT_MS)).await;
+
+            let is_current_attempt = {
+                let lock = attempts.read().unwrap();
+                matches!(lock.get(&node), Some(id) if *id == attempt_id)
+            };
+
+            if !is_current_attempt {
+                return;
+            }
+
+            let still_connecting = {
+                let lock = states.read().unwrap();
+                matches!(lock.get(&node), Some(ConnectionState::Connecting))
+            };
+
+            let has_open_channel = {
+                let peer_opt = {
+                    let lock = peers.read().await;
+                    lock.get(&node).cloned()
+                };
+                if let Some(peer) = peer_opt {
+                    let channels = peer.channels.read().await;
+                    channels
+                        .values()
+                        .any(|dc| dc.ready_state() == RTCDataChannelState::Open)
+                } else {
+                    false
+                }
+            };
+
+            if still_connecting && !has_open_channel {
+                {
+                    let mut lock = attempts.write().unwrap();
+                    lock.remove(&node);
+                }
+                {
+                    let mut lock = states.write().unwrap();
+                    lock.insert(node.clone(), ConnectionState::Failed);
+                }
+                let peer = {
+                    let mut lock = peers.write().await;
+                    lock.remove(&node)
+                };
+                {
+                    let mut lock = pending.write().await;
+                    lock.remove(&node);
+                }
+                if let Some(peer) = peer {
+                    peer.close_all().await;
+                }
+                crate::events::on_disconnected_internal(node.clone());
+                tracing::warn!(
+                    "[Watchdog] Session cleanup on timeout for {} (attempt={})",
+                    node,
+                    attempt_id
+                );
+            }
+        });
+    }
+
+    fn ensure_session_sweeper(&self) {
+        if self.sweeper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let peers = self.peers.clone();
+        let states = self.connection_states.clone();
+        let pending = self.pending_candidates.clone();
+        let attempts = self.connection_attempt_ids.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+                let nodes = {
+                    let lock = states.read().unwrap();
+                    lock.keys().cloned().collect::<Vec<_>>()
+                };
+
+                for node in nodes {
+                    let peer_opt = {
+                        let lock = peers.read().await;
+                        lock.get(&node).cloned()
+                    };
+
+                    let Some(peer) = peer_opt else {
+                        let mut lock = states.write().unwrap();
+                        lock.remove(&node);
+                        continue;
+                    };
+
+                    let pc_state = peer.pc.connection_state();
+                    let state_snapshot = {
+                        let lock = states.read().unwrap();
+                        lock.get(&node).copied().unwrap_or(ConnectionState::Disconnected)
+                    };
+                    let has_open_channel = {
+                        let channels = peer.channels.read().await;
+                        channels
+                            .values()
+                            .any(|dc| dc.ready_state() == RTCDataChannelState::Open)
+                    };
+
+                    let should_cleanup = matches!(
+                        pc_state,
+                        RTCPeerConnectionState::Failed
+                            | RTCPeerConnectionState::Closed
+                            | RTCPeerConnectionState::Disconnected
+                    ) || (state_snapshot == ConnectionState::Connected && !has_open_channel);
+
+                    if should_cleanup {
+                        {
+                            let mut lock = attempts.write().unwrap();
+                            lock.remove(&node);
+                        }
+                        {
+                            let mut lock = states.write().unwrap();
+                            lock.insert(node.clone(), ConnectionState::Failed);
+                        }
+                        {
+                            let mut lock = peers.write().await;
+                            lock.remove(&node);
+                        }
+                        {
+                            let mut lock = pending.write().await;
+                            lock.remove(&node);
+                        }
+                        peer.close_all().await;
+                        crate::events::on_disconnected_internal(node.clone());
+                        tracing::warn!("[Sweeper] Force cleaned session for {}", node);
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn get_sctp_stats(&self) -> HashMap<String, SctpPeerStats> {
+        
+        
+        
+        let enabled = match env::var("MISTLIB_ENABLE_SCTP_STATS") {
+            Ok(val) => matches!(val.as_str(), "1" | "true" | "True" | "TRUE"),
+            Err(_) => false,
+        };
+        if !enabled {
+            return HashMap::new();
+        }
+
         let peers_list = {
             let peers = self.peers.read().await;
             peers
@@ -217,6 +483,9 @@ impl WebRtcTransport {
             .await
             .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
 
+        let attempt_id = self.reserve_connection_attempt(node);
+        self.spawn_connection_watchdog(node.clone(), attempt_id);
+
         let methods = vec![
             (DeliveryMethod::ReliableOrdered, "reliable", None),
             (
@@ -271,11 +540,26 @@ impl WebRtcTransport {
                     Some(tx),
                     node.clone(),
                     peer.cancel_token.clone(),
+                    self.connection_states.clone(),
+                    self.peers.clone(),
+                    self.pending_candidates.clone(),
+                    self.connection_attempt_ids.clone(),
+                    self.last_disconnect_at.clone(),
                 )
                 .await;
             } else {
-                Peer::setup_dc_handlers(dc.clone(), None, node.clone(), peer.cancel_token.clone())
-                    .await;
+                Peer::setup_dc_handlers(
+                    dc.clone(),
+                    None,
+                    node.clone(),
+                    peer.cancel_token.clone(),
+                    self.connection_states.clone(),
+                    self.peers.clone(),
+                    self.pending_candidates.clone(),
+                    self.connection_attempt_ids.clone(),
+                    self.last_disconnect_at.clone(),
+                )
+                .await;
             }
 
             {
@@ -290,6 +574,14 @@ impl WebRtcTransport {
         }
 
         let result: mistlib_core::error::Result<()> = async {
+            let signaling_state = peer.pc.signaling_state();
+            let pc_state = peer.pc.connection_state();
+            if !self.can_send_offer(node, pc_state, signaling_state) {
+                return Err(mistlib_core::error::MistError::Internal(
+                    "Offer precondition failed".to_string(),
+                ));
+            }
+
             let offer = peer
                 .pc
                 .create_offer(None)
@@ -321,13 +613,7 @@ impl WebRtcTransport {
         .await;
 
         if result.is_err() {
-            let removed_peer = {
-                let mut peers = self.peers.write().await;
-                peers.remove(node)
-            };
-            if let Some(p) = removed_peer {
-                p.close_all().await;
-            }
+            self.cleanup_session(node, true).await;
         }
 
         result
@@ -340,6 +626,8 @@ impl Transport for WebRtcTransport {
         &self,
         handler: Arc<dyn NetworkEventHandler>,
     ) -> mistlib_core::error::Result<()> {
+        self.ensure_session_sweeper();
+
         {
             let mut h = self.event_handler.lock().unwrap();
             *h = Some(handler);
@@ -426,6 +714,27 @@ impl Transport for WebRtcTransport {
             }
         }
 
+        let wait_duration = {
+            let last_disconnect = self.last_disconnect_at.read().unwrap();
+            last_disconnect.get(node).copied().and_then(|at| {
+                let elapsed = at.elapsed();
+                if elapsed < Duration::from_millis(RECONNECT_COOLDOWN_MS) {
+                    Some(Duration::from_millis(RECONNECT_COOLDOWN_MS) - elapsed)
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(wait_duration) = wait_duration {
+            tracing::warn!(
+                "[Reconnect] waiting {:?} before retrying connection to {}",
+                wait_duration,
+                node
+            );
+            tokio::time::sleep(wait_duration).await;
+        }
+
         {
             let mut states = self.connection_states.write().unwrap();
             if states.contains_key(node) {
@@ -445,35 +754,14 @@ impl Transport for WebRtcTransport {
 
         let result = self.connect_inner(node).await;
         if result.is_err() {
-            let mut states = self.connection_states.write().unwrap();
-            states.remove(node);
-            tracing::error!("[CS] REMOVE connect_err: {} total={}", node, states.len());
+            let states = self.connection_states.read().unwrap();
+            tracing::error!("[CS] FAILED connect_err: {} total={}", node, states.len());
         }
         result
     }
 
     async fn disconnect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
-        {
-            let mut states = self.connection_states.write().unwrap();
-            states.remove(node);
-            tracing::error!("[CS] REMOVE disconnect: {} total={}", node, states.len());
-        }
-
-        let peer = {
-            let mut peers = self.peers.write().await;
-            peers.remove(node)
-        };
-
-        {
-            let mut pc_lock = self.pending_candidates.write().await;
-            pc_lock.remove(node);
-        }
-
-        if let Some(peer) = peer {
-            peer.close_all().await;
-        }
-
-        crate::events::on_disconnected_internal(node.clone());
+        self.cleanup_session(node, false).await;
         Ok(())
     }
 

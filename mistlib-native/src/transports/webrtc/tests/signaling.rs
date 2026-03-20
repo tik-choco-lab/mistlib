@@ -41,8 +41,26 @@ async fn handle_message_request_at_max_does_not_crash() {
 async fn handle_message_unknown_type_does_not_crash() {
     use mistlib_core::signaling::SignalingHandler;
     let t = make_transport();
-    let msg = MessageContent::Raw(b"garbage".to_vec());
+    let msg = MessageContent::Raw(b"garbage".to_vec().into());
     assert!(t.handle_message(msg).await.is_ok());
+}
+
+#[tokio::test]
+async fn handle_message_request_different_room_is_ignored() {
+    use mistlib_core::signaling::SignalingHandler;
+    let t = make_transport();
+    t.set_room_id("roomA".to_string());
+
+    let msg = MessageContent::Data(SignalingData {
+        sender_id: NodeId("remote".to_string()),
+        receiver_id: NodeId("local".to_string()),
+        room_id: "roomB".to_string(),
+        signaling_type: SignalingType::Request,
+        data: String::new(),
+    });
+
+    assert!(t.handle_message(msg).await.is_ok());
+    assert_eq!(t.get_active_connection_states().len(), 0);
 }
 
 #[tokio::test]

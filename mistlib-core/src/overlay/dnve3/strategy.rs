@@ -87,13 +87,13 @@ impl TopologyStrategy for DNVE3Strategy {
 
     fn handle_message(
         &self,
-        from: NodeId,
+        from: &NodeId,
         message_type: u32,
         payload: &[u8],
     ) -> Vec<OverlayAction> {
         {
             let mut store = self.data_store.lock().unwrap();
-            store.update_last_message_time(&from);
+            store.update_last_message_time(from);
         }
         if let Ok(mut rt) = self.routing_table.lock() {
             rt.add_message_node(from.clone());
@@ -101,17 +101,17 @@ impl TopologyStrategy for DNVE3Strategy {
 
         match message_type {
             OVERLAY_MSG_HEARTBEAT => {
-                self.exchanger.handle_heartbeat(from, payload);
+                self.exchanger.handle_heartbeat(from.clone(), payload);
                 vec![]
             }
-            OVERLAY_MSG_REQUEST_NODE_LIST => self.exchanger.handle_request_node_list(from),
+            OVERLAY_MSG_REQUEST_NODE_LIST => self.exchanger.handle_request_node_list(from.clone()),
             OVERLAY_MSG_NODE_LIST => {
-                self.exchanger.handle_node_list(from, payload);
+                self.exchanger.handle_node_list(from.clone(), payload);
                 vec![]
             }
-            OVERLAY_MSG_PING => self.exchanger.handle_ping(from, payload),
+            OVERLAY_MSG_PING => self.exchanger.handle_ping(from.clone(), payload),
             OVERLAY_MSG_PONG => {
-                self.exchanger.handle_pong(from, payload);
+                self.exchanger.handle_pong(from.clone(), payload);
                 vec![]
             }
             _ => vec![],
@@ -166,7 +166,7 @@ impl TopologyStrategy for DNVE3Strategy {
                                     .nodes
                                     .get(&self.local_node_id)
                                     .map(|n| n.position)
-                                    .unwrap_or_else(|| crate::overlay::dnve3::Vector3::zero());
+                                    .unwrap_or_else(crate::overlay::dnve3::Vector3::zero);
                                 let all_nodes: Vec<_> = store
                                     .nodes
                                     .iter()
@@ -207,6 +207,7 @@ impl TopologyStrategy for DNVE3Strategy {
                         self.exchanger
                             .update_and_send_heartbeat(config, &connected_nodes),
                     );
+                    actions.extend(self.exchanger.send_ping_all(&connected_nodes));
                     *due_lock = Some(now + Self::heartbeat_interval(config));
                 }
             }

@@ -1,4 +1,5 @@
 use crate::types::NodeId;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,7 +39,19 @@ pub struct OverlayMessage {
 pub enum MessageContent {
     Data(SignalingData),
     Overlay(OverlayMessage),
-    Raw(Vec<u8>),
+    Raw(Bytes),
+}
+
+impl From<Vec<u8>> for MessageContent {
+    fn from(data: Vec<u8>) -> Self {
+        MessageContent::Raw(Bytes::from(data))
+    }
+}
+
+impl From<Bytes> for MessageContent {
+    fn from(data: Bytes) -> Self {
+        MessageContent::Raw(data)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

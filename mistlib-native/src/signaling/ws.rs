@@ -108,4 +108,10 @@ impl Signaler for WebSocketSignaler {
             ))
         }
     }
+
+    async fn close(&self) -> mistlib_core::error::Result<()> {
+        let mut sender = self.sender.lock().await;
+        *sender = None;
+        Ok(())
+    }
 }

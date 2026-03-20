@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 
@@ -36,11 +37,13 @@ pub enum EngineState {
 }
 
 use mistlib_core::stats::{EngineStats, NodeStats, SctpStats};
+use std::fs;
 
 pub struct MistEngine {
     pub global_callback: StdMutex<Option<EventCallback>>,
     pub log_callback: StdMutex<Option<LogCallback>>,
     pub state: RwLock<EngineState>,
+    pub context_generation: AtomicU64,
     pub node_store: Arc<StdMutex<NodeStore>>,
     pub config: StdMutex<Config>,
     pub runtime: Runtime,
@@ -84,11 +87,31 @@ impl mistlib_core::overlay::ActionHandler for MistEngine {
 }
 
 impl MistEngine {
+    fn current_memory_mb() -> f32 {
+        let status = match fs::read_to_string("/proc/self/status") {
+            Ok(status) => status,
+            Err(_) => return 0.0,
+        };
+
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb = rest
+                    .split_whitespace()
+                    .find_map(|part| part.parse::<u64>().ok())
+                    .unwrap_or(0);
+                return kb as f32 / 1024.0;
+            }
+        }
+
+        0.0
+    }
+
     pub fn new() -> Self {
         Self {
             global_callback: StdMutex::new(None),
             log_callback: StdMutex::new(None),
             state: RwLock::new(EngineState::Idle),
+            context_generation: AtomicU64::new(0),
             node_store: Arc::new(StdMutex::new(NodeStore::new())),
             config: StdMutex::new(Config::new_default()),
             runtime: Runtime::new().expect("Failed to create Tokio runtime"),
@@ -366,8 +389,8 @@ impl MistEngine {
 
         let rtt_millis: std::collections::HashMap<String, f32> = snapshot
             .rtt_millis
-            .into_iter()
-            .map(|(k, v)| (k.0, v))
+            .iter()
+            .map(|(k, v)| (k.0.clone(), *v))
             .collect();
 
         let t_lock = std::time::Instant::now();
@@ -445,6 +468,7 @@ impl MistEngine {
             send_bits: snapshot.send_bits,
             receive_bits: snapshot.receive_bits,
             rtt_millis,
+            memory_mb: Self::current_memory_mb(),
             eval_send_bits: snapshot.eval_send_bits,
             eval_receive_bits: snapshot.eval_receive_bits,
             eval_message_count: snapshot.eval_message_count,
@@ -467,12 +491,13 @@ impl MistEngine {
                     .rtt_millis
                     .retain(|_, v| !v.is_nan() && !v.is_infinite());
                 let fallback = format!(
-                    r#"{{"diagPeers":{},"diagConnectionStates":{},"diagPendingCandidates":{},"diagSerdeError":"{}","diagNanCount":{}}}"#,
+                    r#"{{"diagPeers":{},"diagConnectionStates":{},"diagPendingCandidates":{},"diagSerdeError":"{}","diagNanCount":{},"memoryMb":{}}}"#,
                     fixed.diag_peers,
                     fixed.diag_connection_states,
                     fixed.diag_pending_candidates,
                     e,
-                    nan_count
+                    nan_count,
+                    fixed.memory_mb
                 );
                 fallback
             }

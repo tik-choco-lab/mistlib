@@ -70,8 +70,10 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         let concurrency = 4;
-        let mut results = Vec::with_capacity(manifest.chunks.len());
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; manifest.chunks.len()];
         let mut futures = FuturesUnordered::new();
+        let mut next_index = 0;
+        let mut result = Vec::with_capacity(manifest.size as usize);
 
         for (i, cid) in manifest.chunks.iter().enumerate() {
             let cid = cid.clone();
@@ -82,21 +84,31 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
 
             if futures.len() >= concurrency {
                 if let Some(res) = futures.next().await {
-                    results.push(res?);
+                    let (idx, data) = res?;
+                    results[idx] = Some(data);
+                    while next_index < results.len() {
+                        if let Some(chunk) = results[next_index].take() {
+                            result.extend_from_slice(&chunk);
+                            next_index += 1;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         while let Some(res) = futures.next().await {
-            results.push(res?);
-        }
-
-        
-        results.sort_by_key(|(i, _)| *i);
-
-        let mut result = Vec::with_capacity(manifest.size as usize);
-        for (_, data) in results {
-            result.extend_from_slice(&data);
+            let (idx, data) = res?;
+            results[idx] = Some(data);
+            while next_index < results.len() {
+                if let Some(chunk) = results[next_index].take() {
+                    result.extend_from_slice(&chunk);
+                    next_index += 1;
+                } else {
+                    break;
+                }
+            }
         }
 
         info!("StorageEngine: successfully retrieved '{}'", manifest.name);

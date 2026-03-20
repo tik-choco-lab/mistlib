@@ -185,6 +185,7 @@ impl L0Engine for WasmL0 {
             send_bits: 0,
             receive_bits: 0,
             rtt_millis: std::collections::HashMap::new(),
+            memory_mb: 0.0,
             eval_send_bits: 0,
             eval_receive_bits: 0,
             eval_message_count: 0,

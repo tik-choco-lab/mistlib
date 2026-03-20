@@ -56,7 +56,7 @@ impl OverlayOptimizer {
     ) -> Vec<OverlayAction> {
         let mut actions = Vec::new();
         for strategy in &self.strategies {
-            actions.extend(strategy.handle_message(from.clone(), message_type, payload));
+            actions.extend(strategy.handle_message(&from, message_type, payload));
         }
         actions
     }
@@ -82,7 +82,8 @@ impl OverlayOptimizer {
         if is_broadcast && envelope.hop_count > 0 {
             let mut forwarded = envelope.clone();
             forwarded.hop_count -= 1;
-            if let Ok(data) = bincode::serialize(&forwarded) {
+            if let Ok(serialized) = bincode::serialize(&forwarded) {
+                let data = Bytes::from(serialized);
                 let neighbors: Vec<NodeId> = {
                     let rt = self.routing_table.lock().unwrap();
                     rt.connected_nodes
@@ -95,7 +96,7 @@ impl OverlayOptimizer {
                 for neighbor in neighbors {
                     actions.push(OverlayAction::SendMessage {
                         to: neighbor,
-                        data: Bytes::from(data.clone()),
+                        data: data.clone(),
                         method: DeliveryMethod::ReliableOrdered,
                     });
                 }
@@ -105,10 +106,10 @@ impl OverlayOptimizer {
         if !is_broadcast && envelope.to != self.local_node_id && envelope.hop_count > 0 {
             let mut forwarded = envelope.clone();
             forwarded.hop_count -= 1;
-            if let Ok(data) = bincode::serialize(&forwarded) {
+            if let Ok(serialized) = bincode::serialize(&forwarded) {
                 actions.push(self.create_send_action(
                     &envelope.to,
-                    Bytes::from(data),
+                    Bytes::from(serialized),
                     DeliveryMethod::ReliableOrdered,
                 ));
             }
@@ -139,7 +140,7 @@ impl OverlayOptimizer {
             from: self.local_node_id.clone(),
             to: to.clone(),
             hop_count: self.hop_count,
-            content: MessageContent::Raw(data.to_vec()),
+            content: MessageContent::Raw(data.clone()),
         };
         let enveloped_data = bincode::serialize(&envelope).unwrap_or_default();
         self.create_send_action(to, Bytes::from(enveloped_data), method)

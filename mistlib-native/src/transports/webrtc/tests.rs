@@ -14,6 +14,10 @@ impl Signaler for MockSignaler {
     async fn send_signaling(&self, _to: &NodeId, _msg: MessageContent) -> MistResult<()> {
         Ok(())
     }
+
+    async fn close(&self) -> MistResult<()> {
+        Ok(())
+    }
 }
 
 pub fn make_transport() -> WebRtcTransport {

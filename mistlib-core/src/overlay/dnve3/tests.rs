@@ -197,6 +197,47 @@ fn balancer_select_connections_connects_nearby_node() {
 }
 
 #[test]
+fn balancer_respects_configured_direction_threshold() {
+    let self_id = node("self");
+    let peer = node("peer-a");
+    let all_nodes = vec![(peer.clone(), pos(1.0, 0.0, 1.0))];
+
+    let mut strict_config = test_config();
+    strict_config.dnve.density_resolution = 1;
+    strict_config.dnve.direction_threshold = 0.8;
+    let strict_balancer = make_balancer(&strict_config);
+    let strict_actions = strict_balancer.select_connections(
+        &strict_config,
+        pos(0.0, 0.0, 0.0),
+        &all_nodes,
+        &[],
+        &self_id,
+    );
+
+    let mut relaxed_config = test_config();
+    relaxed_config.dnve.density_resolution = 1;
+    relaxed_config.dnve.direction_threshold = 0.7;
+    let relaxed_balancer = make_balancer(&relaxed_config);
+    let relaxed_actions = relaxed_balancer.select_connections(
+        &relaxed_config,
+        pos(0.0, 0.0, 0.0),
+        &all_nodes,
+        &[],
+        &self_id,
+    );
+
+    let strict_has_connect = strict_actions
+        .iter()
+        .any(|a| matches!(a, crate::action::OverlayAction::Connect { to } if *to == peer));
+    let relaxed_has_connect = relaxed_actions
+        .iter()
+        .any(|a| matches!(a, crate::action::OverlayAction::Connect { to } if *to == peer));
+
+    assert!(!strict_has_connect, "閾値が高い場合は接続されないはず");
+    assert!(relaxed_has_connect, "閾値が低い場合は接続されるべき");
+}
+
+#[test]
 fn balancer_select_connections_skips_self() {
     let config = test_config();
     let balancer = make_balancer(&config);
@@ -530,7 +571,8 @@ fn strategy_handle_message_heartbeat_is_noop_actions() {
     let density = utils.create_spatial_density(pos(5.0, 0.0, 0.0), &[], 2, 0.0);
     let payload = bincode::serialize(&density).unwrap();
 
-    let actions = strategy.handle_message(node("peer-a"), OVERLAY_MSG_HEARTBEAT, &payload);
+    let peer_a = node("peer-a");
+    let actions = strategy.handle_message(&peer_a, OVERLAY_MSG_HEARTBEAT, &payload);
     assert!(
         actions.is_empty(),
         "HEARTBEAT の handle_message はアクションを返さないはず"
@@ -541,7 +583,8 @@ fn strategy_handle_message_heartbeat_is_noop_actions() {
 fn strategy_handle_message_ping_returns_pong() {
     let strategy = make_strategy("local");
     let payload: Vec<u8> = 9999u64.to_le_bytes().to_vec();
-    let actions = strategy.handle_message(node("peer"), OVERLAY_MSG_PING, &payload);
+    let peer = node("peer");
+    let actions = strategy.handle_message(&peer, OVERLAY_MSG_PING, &payload);
     assert!(!actions.is_empty(), "PING には PONG アクションが返るべき");
 }
 
@@ -549,7 +592,8 @@ fn strategy_handle_message_ping_returns_pong() {
 fn strategy_handle_message_pong_is_noop() {
     let strategy = make_strategy("local");
     let payload: Vec<u8> = 9999u64.to_le_bytes().to_vec();
-    let actions = strategy.handle_message(node("peer"), OVERLAY_MSG_PONG, &payload);
+    let peer = node("peer");
+    let actions = strategy.handle_message(&peer, OVERLAY_MSG_PONG, &payload);
     assert!(
         actions.is_empty(),
         "PONG の handle_message はアクションを返さないはず"
@@ -559,7 +603,8 @@ fn strategy_handle_message_pong_is_noop() {
 #[test]
 fn strategy_handle_message_unknown_type_is_noop() {
     let strategy = make_strategy("local");
-    let actions = strategy.handle_message(node("peer"), 9999, b"anything");
+    let peer = node("peer");
+    let actions = strategy.handle_message(&peer, 9999, b"anything");
     assert!(
         actions.is_empty(),
         "未知のメッセージタイプはアクション無しで return するべき"

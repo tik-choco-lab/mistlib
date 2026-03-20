@@ -8,16 +8,27 @@ pub const MSG_WANT: u8 = 0x01;
 pub const MSG_HAVE: u8 = 0x02;
 pub const MSG_QUERY: u8 = 0x03;
 pub const MSG_HAVE_STATUS: u8 = 0x04;
+pub const MSG_HAVE_CHUNK: u8 = 0x05;
+pub const HAVE_CHUNK_SIZE: usize = 16 * 1024;
 
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>>;
 type PeerCache = Arc<Mutex<HashMap<String, Vec<mistlib_core::types::NodeId>>>>;
 type PeerNotifiers = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>;
+type ChunkMap = Arc<Mutex<HashMap<String, ChunkAssembly>>>;
+
+#[derive(Debug, Clone)]
+struct ChunkAssembly {
+    total_chunks: u16,
+    received_chunks: u16,
+    chunks: Vec<Option<Vec<u8>>>,
+}
 
 #[derive(Clone)]
 pub struct WantRegistry {
     pending: PendingMap,
     peer_cache: PeerCache,
     peer_notifiers: PeerNotifiers,
+    chunk_assemblies: ChunkMap,
 }
 
 impl WantRegistry {
@@ -26,6 +37,7 @@ impl WantRegistry {
             pending: Arc::new(Mutex::new(HashMap::new())),
             peer_cache: Arc::new(Mutex::new(HashMap::new())),
             peer_notifiers: Arc::new(Mutex::new(HashMap::new())),
+            chunk_assemblies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -36,14 +48,64 @@ impl WantRegistry {
     }
 
     pub fn fulfill(&self, cid: &str, data: Vec<u8>) {
+        self.chunk_assemblies.lock().unwrap().remove(cid);
         if let Some(tx) = self.pending.lock().unwrap().remove(cid) {
             let _ = tx.send(data);
+        }
+    }
+
+    pub fn fulfill_chunk(&self, cid: &str, chunk_index: u16, chunk_total: u16, data: Vec<u8>) {
+        if chunk_total == 0 || chunk_index >= chunk_total {
+            return;
+        }
+
+        let mut assembled_payload: Option<Vec<u8>> = None;
+
+        {
+            let mut assemblies = self.chunk_assemblies.lock().unwrap();
+            let entry = assemblies
+                .entry(cid.to_string())
+                .or_insert_with(|| ChunkAssembly {
+                    total_chunks: chunk_total,
+                    received_chunks: 0,
+                    chunks: vec![None; chunk_total as usize],
+                });
+
+            if entry.total_chunks != chunk_total {
+                *entry = ChunkAssembly {
+                    total_chunks: chunk_total,
+                    received_chunks: 0,
+                    chunks: vec![None; chunk_total as usize],
+                };
+            }
+
+            let slot = &mut entry.chunks[chunk_index as usize];
+            if slot.is_none() {
+                *slot = Some(data);
+                entry.received_chunks += 1;
+            }
+
+            if entry.received_chunks == entry.total_chunks {
+                let mut full = Vec::new();
+                for chunk in &mut entry.chunks {
+                    if let Some(part) = chunk.take() {
+                        full.extend_from_slice(&part);
+                    }
+                }
+                assembled_payload = Some(full);
+                assemblies.remove(cid);
+            }
+        }
+
+        if let Some(full) = assembled_payload {
+            self.fulfill(cid, full);
         }
     }
 
     pub fn cancel(&self, cid: &str) {
         self.pending.lock().unwrap().remove(cid);
         self.peer_notifiers.lock().unwrap().remove(cid);
+        self.chunk_assemblies.lock().unwrap().remove(cid);
     }
 
     pub fn register_peer_notifier(&self, cid: &str) -> oneshot::Receiver<()> {
@@ -202,6 +264,45 @@ pub fn build_have_message(cid: &str, data: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(cb);
     msg.extend_from_slice(data);
     msg
+}
+
+pub fn build_have_chunk_message(
+    cid: &str,
+    chunk_index: u16,
+    chunk_total: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let cb = cid.as_bytes();
+    let mut msg = Vec::with_capacity(6 + cb.len() + data.len());
+    msg.push(MSG_HAVE_CHUNK);
+    msg.push(cb.len() as u8);
+    msg.extend_from_slice(&chunk_index.to_be_bytes());
+    msg.extend_from_slice(&chunk_total.to_be_bytes());
+    msg.extend_from_slice(cb);
+    msg.extend_from_slice(data);
+    msg
+}
+
+pub fn parse_have_chunk_message(raw: &[u8]) -> Option<(String, u16, u16, Vec<u8>)> {
+    if raw.len() < 6 || raw[0] != MSG_HAVE_CHUNK {
+        return None;
+    }
+
+    let cid_len = raw[1] as usize;
+    let header_end = 6 + cid_len;
+    if raw.len() < header_end {
+        return None;
+    }
+
+    let chunk_index = u16::from_be_bytes([raw[2], raw[3]]);
+    let chunk_total = u16::from_be_bytes([raw[4], raw[5]]);
+    if chunk_total == 0 || chunk_index >= chunk_total {
+        return None;
+    }
+
+    let cid = std::str::from_utf8(&raw[6..header_end]).ok()?.to_string();
+    let payload = raw[header_end..].to_vec();
+    Some((cid, chunk_index, chunk_total, payload))
 }
 
 pub fn parse_want_message(raw: &[u8]) -> Option<String> {

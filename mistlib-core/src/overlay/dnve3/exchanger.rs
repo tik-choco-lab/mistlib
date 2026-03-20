@@ -33,10 +33,10 @@ pub struct DNVE3Exchanger {
 }
 
 impl DNVE3Exchanger {
-    fn monotonic_millis() -> u64 {
+    fn monotonic_micros() -> u64 {
         static START: OnceLock<Instant> = OnceLock::new();
         let start = START.get_or_init(Instant::now);
-        start.elapsed().as_millis() as u64
+        start.elapsed().as_micros() as u64
     }
 
     fn encode_heartbeat_payload(data: &SpatialDensityData, _config: &Config) -> Vec<u8> {
@@ -100,10 +100,6 @@ impl DNVE3Exchanger {
         for id in to_remove_nodes {
             node_store.nodes.remove(&id);
             node_store.last_updated.remove(&id);
-            if let Ok(mut rt) = self.routing_table.lock() {
-                rt.remove_node_routes(&id);
-                rt.cleanup_routes();
-            }
         }
     }
 
@@ -121,7 +117,7 @@ impl DNVE3Exchanger {
                 .nodes
                 .get(&self_id)
                 .map(|n| n.position)
-                .unwrap_or_else(|| Vector3::zero());
+                .unwrap_or_else(Vector3::zero);
             let other_nodes: Vec<_> = store
                 .nodes
                 .values()
@@ -288,7 +284,7 @@ impl DNVE3Exchanger {
     }
 
     pub fn send_ping_all(&self, connected_nodes: &[NodeId]) -> Vec<OverlayAction> {
-        let now = Self::monotonic_millis();
+        let now = Self::monotonic_micros();
         let payload = now.to_le_bytes().to_vec();
 
         connected_nodes
@@ -341,8 +337,8 @@ impl DNVE3Exchanger {
             return;
         }
         let sent_time = u64::from_le_bytes(payload[..8].try_into().unwrap_or_default());
-        let now = Self::monotonic_millis();
-        let rtt_ms = now.saturating_sub(sent_time) as f32;
+        let now = Self::monotonic_micros();
+        let rtt_ms = now.saturating_sub(sent_time) as f32 / 1000.0;
         STATS.set_rtt(from, rtt_ms);
     }
 }
