@@ -1,15 +1,11 @@
 {
     "name": "@tik-choco/mistlib",
     "version": "0.1.0",
-    "description": "Repo-local ESM wrapper for mistlib WASM builds",
-    "private": true,
-    "type": "module",
+    "description": "Web wrapper for mistlib",
     "main": "index.js",
     "types": "index.d.ts",
-    "exports": {
-        ".": {
-            "import": "./index.js",
-            "types": "./index.d.ts"
-        }
+    "dependencies": {},
+    "publishConfig": {
+        "access": "public"
     }
 }

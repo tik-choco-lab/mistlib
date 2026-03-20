@@ -4,6 +4,7 @@ use mistlib_core::transport::NetworkEvent;
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -25,13 +26,10 @@ impl Peer {
             std::mem::take(&mut *dc_lock)
         };
 
-        let pc = self.pc.clone();
-        tokio::spawn(async move {
-            for (_, dc) in channels {
-                let _ = dc.close().await;
-            }
-            let _ = pc.close().await;
-        });
+        for (_, dc) in channels {
+            let _ = dc.close().await;
+        }
+        let _ = self.pc.close().await;
     }
 
     pub async fn setup_handlers(
@@ -44,6 +42,8 @@ impl Peer {
         connection_states: Arc<StdRwLock<HashMap<NodeId, ConnectionState>>>,
         peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
         pending_candidates: Arc<RwLock<HashMap<NodeId, Vec<String>>>>,
+        connection_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
+        last_disconnect_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
     ) -> crate::error::Result<()> {
         let remote_id_cand = remote_id.clone();
         let signaler_cand = signaler.clone();
@@ -87,12 +87,22 @@ impl Peer {
         let peer_weak = Arc::downgrade(self);
         let event_tx_dc = event_tx.clone();
         let remote_id_dc = remote_id.clone();
+        let connection_states_dc = connection_states.clone();
+        let peers_dc = peers.clone();
+        let pending_candidates_dc = pending_candidates.clone();
+        let attempts_dc = connection_attempt_ids.clone();
+        let last_disconnect_at_dc = last_disconnect_at.clone();
 
         self.pc
             .on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let peer_weak = peer_weak.clone();
                 let tx_opt = event_tx_dc.clone();
                 let remote_id = remote_id_dc.clone();
+                let connection_states = connection_states_dc.clone();
+                let peers = peers_dc.clone();
+                let pending_candidates = pending_candidates_dc.clone();
+                let attempts = attempts_dc.clone();
+                let last_disconnect_at = last_disconnect_at_dc.clone();
                 let label = dc.label().to_string();
                 Box::pin(async move {
                     let Some(peer) = peer_weak.upgrade() else {
@@ -108,7 +118,18 @@ impl Peer {
                         let mut dc_lock = peer.channels.write().await;
                         dc_lock.insert(method, dc.clone());
                     }
-                    Self::setup_dc_handlers(dc, tx_opt, remote_id, peer.cancel_token.clone()).await;
+                    Self::setup_dc_handlers(
+                        dc,
+                        tx_opt,
+                        remote_id,
+                        peer.cancel_token.clone(),
+                        connection_states,
+                        peers,
+                        pending_candidates,
+                        attempts,
+                        last_disconnect_at,
+                    )
+                    .await;
                 })
             }));
 
@@ -116,10 +137,12 @@ impl Peer {
         let remote_id_cb = remote_id.clone();
         let peers_cb_state_change = Arc::downgrade(&peers);
         let pending_candidates_cb = pending_candidates.clone();
+        let attempts_for_state_change = connection_attempt_ids.clone();
+        let last_disconnect_at_cb = last_disconnect_at.clone();
         self.pc
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 let state = match s {
-                    RTCPeerConnectionState::Connected => ConnectionState::Connected,
+                    RTCPeerConnectionState::Connected => ConnectionState::Connecting,
                     RTCPeerConnectionState::Connecting | RTCPeerConnectionState::New => {
                         ConnectionState::Connecting
                     }
@@ -137,6 +160,7 @@ impl Peer {
                 {
                     let mut states = connection_states_cb.write().unwrap();
                     if state == ConnectionState::Disconnected || state == ConnectionState::Failed {
+                        let had_state = states.contains_key(&remote_id_cb);
                         states.remove(&remote_id_cb);
                         tracing::error!(
                             "[CS] REMOVE state_change({:?}): {} total={}",
@@ -144,6 +168,15 @@ impl Peer {
                             remote_id_cb,
                             states.len()
                         );
+
+                        {
+                            let mut attempts = attempts_for_state_change.write().unwrap();
+                            attempts.remove(&remote_id_cb);
+                        }
+                        {
+                            let mut last_disconnect = last_disconnect_at_cb.write().unwrap();
+                            last_disconnect.insert(remote_id_cb.clone(), Instant::now());
+                        }
 
                         let peers_weak = peers_cb_state_change.clone();
                         let pc_cb = pending_candidates_cb.clone();
@@ -161,6 +194,10 @@ impl Peer {
                                 }
                             }
                         });
+
+                        if had_state {
+                            crate::events::on_disconnected_internal(remote_id_cb.clone());
+                        }
                     } else {
                         states.insert(remote_id_cb.clone(), state);
                         tracing::error!(
@@ -170,13 +207,6 @@ impl Peer {
                             states.len()
                         );
                     }
-                }
-
-                if state == ConnectionState::Connected {
-                    crate::events::on_connected_internal(remote_id_cb.clone());
-                } else if state == ConnectionState::Disconnected || state == ConnectionState::Failed
-                {
-                    crate::events::on_disconnected_internal(remote_id_cb.clone());
                 }
 
                 Box::pin(async move {})
@@ -190,7 +220,69 @@ impl Peer {
         event_tx: Option<mpsc::Sender<NetworkEvent>>,
         remote_id: NodeId,
         cancel_token: CancellationToken,
+        connection_states: Arc<StdRwLock<HashMap<NodeId, ConnectionState>>>,
+        peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
+        pending_candidates: Arc<RwLock<HashMap<NodeId, Vec<String>>>>,
+        connection_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
+        last_disconnect_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
     ) {
+        let remote_id_open = remote_id.clone();
+        let states_open = connection_states.clone();
+        dc.on_open(Box::new(move || {
+            let remote_id = remote_id_open.clone();
+            let states = states_open.clone();
+            Box::pin(async move {
+                let mut lock = states.write().unwrap();
+                lock.insert(remote_id.clone(), ConnectionState::Connected);
+                drop(lock);
+                crate::events::on_connected_internal(remote_id);
+            })
+        }));
+
+        let remote_id_close = remote_id.clone();
+        let states_close = connection_states.clone();
+        let peers_close = peers.clone();
+        let pending_close = pending_candidates.clone();
+        let attempts_close = connection_attempt_ids.clone();
+        let last_disconnect_close = last_disconnect_at.clone();
+        let dc_for_close = dc.clone();
+        dc.on_close(Box::new(move || {
+            let remote_id = remote_id_close.clone();
+            let states = states_close.clone();
+            let peers = peers_close.clone();
+            let pending = pending_close.clone();
+            let attempts = attempts_close.clone();
+            let last_disconnect = last_disconnect_close.clone();
+            let dc = dc_for_close.clone();
+            Box::pin(async move {
+                tracing::warn!("[RUST] [{}] data channel closed: {}", remote_id, dc.label());
+                {
+                    let mut lock = attempts.write().unwrap();
+                    lock.remove(&remote_id);
+                }
+                {
+                    let mut lock = last_disconnect.write().unwrap();
+                    lock.insert(remote_id.clone(), Instant::now());
+                }
+                {
+                    let mut lock = states.write().unwrap();
+                    lock.insert(remote_id.clone(), ConnectionState::Failed);
+                }
+                let peer = {
+                    let mut lock = peers.write().await;
+                    lock.remove(&remote_id)
+                };
+                {
+                    let mut lock = pending.write().await;
+                    lock.remove(&remote_id);
+                }
+                if let Some(peer) = peer {
+                    peer.close_all().await;
+                }
+                crate::events::on_disconnected_internal(remote_id);
+            })
+        }));
+
         let remote_id_msg = remote_id.clone();
         let tx_msg = event_tx;
         dc.on_message(Box::new(

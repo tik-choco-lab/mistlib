@@ -2,7 +2,7 @@ use crate::types::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -11,6 +11,7 @@ pub struct EngineStats {
     pub send_bits: u64,
     pub receive_bits: u64,
     pub rtt_millis: HashMap<String, f32>,
+    pub memory_mb: f32,
     pub eval_send_bits: u64,
     pub eval_receive_bits: u64,
     pub eval_message_count: u64,
@@ -46,7 +47,7 @@ pub struct MistStats {
     pub total_eval_send_bytes: AtomicU64,
     pub total_eval_receive_bytes: AtomicU64,
     pub total_eval_message_count: AtomicU64,
-    pub rtt_millis: Mutex<HashMap<NodeId, f32>>,
+    pub rtt_millis: Mutex<Arc<HashMap<NodeId, f32>>>,
 }
 
 #[derive(Clone)]
@@ -54,7 +55,7 @@ pub struct StatsSnapshot {
     pub message_count: u64,
     pub send_bits: u64,
     pub receive_bits: u64,
-    pub rtt_millis: HashMap<NodeId, f32>,
+    pub rtt_millis: Arc<HashMap<NodeId, f32>>,
     pub eval_send_bits: u64,
     pub eval_receive_bits: u64,
     pub eval_message_count: u64,
@@ -69,7 +70,7 @@ impl MistStats {
             total_eval_send_bytes: AtomicU64::new(0),
             total_eval_receive_bytes: AtomicU64::new(0),
             total_eval_message_count: AtomicU64::new(0),
-            rtt_millis: Mutex::new(HashMap::new()),
+            rtt_millis: Mutex::new(Arc::new(HashMap::new())),
         }
     }
 
@@ -95,13 +96,22 @@ impl MistStats {
     }
 
     pub fn set_rtt(&self, node_id: NodeId, rtt_ms: f32) {
-        if let Ok(mut map) = self.rtt_millis.lock() {
+        if let Ok(mut arc) = self.rtt_millis.lock() {
+            let map = Arc::make_mut(&mut arc);
             map.insert(node_id, rtt_ms);
         }
     }
 
     pub fn remove_rtt(&self, node_id: &NodeId) {
-        if let Ok(mut map) = self.rtt_millis.lock() {
+        if let Ok(mut arc) = self.rtt_millis.lock() {
+            let map = Arc::make_mut(&mut arc);
+            map.remove(node_id);
+        }
+    }
+
+    pub fn remove_node(&self, node_id: &NodeId) {
+        if let Ok(mut arc) = self.rtt_millis.lock() {
+            let map = Arc::make_mut(&mut arc);
             map.remove(node_id);
         }
     }
@@ -115,8 +125,8 @@ impl MistStats {
         let eval_message_count = self.total_eval_message_count.swap(0, Ordering::Relaxed);
 
         let rtt = {
-            let map = self.rtt_millis.lock().unwrap();
-            map.clone()
+            let arc = self.rtt_millis.lock().unwrap();
+            Arc::clone(&arc)
         };
 
         StatsSnapshot {

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DensityEncoding {
     Float,
+    #[default]
     Byte,
 }
 
@@ -21,12 +22,6 @@ impl DensityEncoding {
             "byte" => Some(Self::Byte),
             _ => None,
         }
-    }
-}
-
-impl Default for DensityEncoding {
-    fn default() -> Self {
-        Self::Byte
     }
 }
 

@@ -81,4 +81,8 @@ impl Signaler for OverlayTransport {
             });
         Ok(())
     }
+
+    async fn close(&self) -> crate::error::Result<()> {
+        Ok(())
+    }
 }

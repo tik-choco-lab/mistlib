@@ -103,4 +103,12 @@ impl Signaler for WasmWebSocketSignaler {
             "WS not open".to_string(),
         ))
     }
+
+    async fn close(&self) -> mistlib_core::error::Result<()> {
+        let mut lock = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ws) = lock.take() {
+            let _ = ws.close();
+        }
+        Ok(())
+    }
 }

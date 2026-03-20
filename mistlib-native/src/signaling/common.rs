@@ -70,4 +70,14 @@ impl Signaler for SignalingRelay {
             "SignalingRelay: no delegate set".to_string(),
         ))
     }
+
+    async fn close(&self) -> mistlib_core::error::Result<()> {
+        if let Some(delegate) = self.websocket.read().await.clone() {
+            let _ = delegate.close().await;
+        }
+        if let Some(delegate) = self.overlay.read().await.clone() {
+            let _ = delegate.close().await;
+        }
+        Ok(())
+    }
 }

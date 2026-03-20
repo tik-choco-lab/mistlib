@@ -262,8 +262,8 @@ impl SpatialDensityUtils {
         let other_projected = self.project_spatial_density(other_data, self_data.position);
 
         let mut merged_map = self_data.density_map.clone();
-        for i in 0..merged_map.len() {
-            merged_map[i] += other_projected.density_map[i];
+        for (i, v) in merged_map.iter_mut().enumerate() {
+            *v += other_projected.density_map[i];
         }
 
         SpatialDensityData {
@@ -272,5 +272,39 @@ impl SpatialDensityUtils {
             dir_count: self_data.dir_count,
             layer_count: self_data.layer_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_merge_spatial_density_perf() {
+        let gps = SpatialDensityUtils::new(26);
+
+        let self_data = SpatialDensityData {
+            density_map: vec![1.0; 26 * 4],
+            position: Vector3::new(0.0, 0.0, 0.0),
+            dir_count: 26,
+            layer_count: 4,
+        };
+        let other_data = SpatialDensityData {
+            density_map: vec![0.5; 26 * 4],
+            position: Vector3::new(1.0, 1.0, 1.0),
+            dir_count: 26,
+            layer_count: 4,
+        };
+
+        let iters = 1_000;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = gps.merge_spatial_density(&self_data, &other_data);
+        }
+        let duration = start.elapsed();
+        let avg_us = duration.as_secs_f64() * 1_000_000.0 / (iters as f64);
+        println!("merge_spatial_density x{} => total {:?}, avg {:.3}us", iters, duration, avg_us);
+
+        assert!(avg_us < 200.0, "merge_spatial_density too slow: avg {:.3}us", avg_us);
     }
 }

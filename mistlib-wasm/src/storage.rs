@@ -61,7 +61,6 @@ pub fn handle_want(from: mistlib_core::types::NodeId, cid: String) {
         };
 
         if let Some(data) = block {
-            let msg = resolver::build_have_message(&cid, &data);
             let ctx = crate::app::ENGINE.with(|e| {
                 let state = e.state.lock().unwrap();
                 if let mistlib_core::engine::EngineState::Running(ctx) = &*state {
@@ -72,15 +71,52 @@ pub fn handle_want(from: mistlib_core::types::NodeId, cid: String) {
             });
 
             if let Some(ctx) = ctx {
-                let _ = ctx
-                    .transport
-                    .send(
-                        &from,
-                        bytes::Bytes::from(msg),
-                        DeliveryMethod::ReliableOrdered,
-                    )
-                    .await;
-                tracing::debug!("Storage: served `have` for {} to {}", cid, from.0);
+                let chunk_size = resolver::HAVE_CHUNK_SIZE;
+                let total_chunks = ((data.len() + chunk_size - 1) / chunk_size) as u16;
+
+                if total_chunks <= 1 {
+                    let msg = resolver::build_have_message(&cid, &data);
+                    let _ = ctx
+                        .transport
+                        .send(
+                            &from,
+                            bytes::Bytes::from(msg),
+                            DeliveryMethod::ReliableOrdered,
+                        )
+                        .await;
+                } else {
+                    for chunk_index in 0..total_chunks {
+                        let start = (chunk_index as usize) * chunk_size;
+                        let end = ((chunk_index as usize + 1) * chunk_size).min(data.len());
+                        let msg = resolver::build_have_chunk_message(
+                            &cid,
+                            chunk_index,
+                            total_chunks,
+                            &data[start..end],
+                        );
+
+                        let _ = ctx
+                            .transport
+                            .send(
+                                &from,
+                                bytes::Bytes::from(msg),
+                                DeliveryMethod::ReliableOrdered,
+                            )
+                            .await;
+
+                        if chunk_index % 8 == 0 {
+                            gloo_timers::future::TimeoutFuture::new(0).await;
+                        }
+                    }
+                }
+
+                tracing::debug!(
+                    "Storage: served `have` for {} to {} ({} bytes, {} chunks)",
+                    cid,
+                    from.0,
+                    data.len(),
+                    total_chunks.max(1)
+                );
             }
         }
     });

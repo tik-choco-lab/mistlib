@@ -11,7 +11,6 @@ const SCORE_AOI_NODE_UNKNOWN_POS: f32 = 100.0;
 const MIN_DISTANCE_THRESHOLD: f32 = 0.001;
 const BASE_WEIGHT: f32 = 1.0;
 const PENALTY_NO_MESSAGE_HISTORY: f32 = 1000.0;
-const DIRECTION_THRESHOLD: f32 = 0.7;
 const RESERVED_CONNECTION_COUNT: u32 = 1;
 
 #[derive(Clone)]
@@ -142,6 +141,15 @@ impl DNVE3ConnectionBalancer {
                 continue;
             }
 
+            if self
+                .routing_table
+                .lock()
+                .map(|rt| rt.is_reconnect_blocked(id))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             match connected_map.get(id) {
                 Some(s)
                     if *s == ConnectionState::Connecting || *s == ConnectionState::Connected =>
@@ -180,11 +188,12 @@ impl DNVE3ConnectionBalancer {
 
     fn select_directional_nodes(
         &self,
-        _config: &Config,
+        config: &Config,
         self_pos: Vector3,
         all_nodes: &[(NodeId, Vector3)],
     ) -> Vec<NodeId> {
         let directions = &self.spatial_utils.directions;
+        let direction_threshold = config.dnve.direction_threshold;
         let mut selected = Vec::new();
 
         for dir in directions {
@@ -198,7 +207,7 @@ impl DNVE3ConnectionBalancer {
                     continue;
                 }
                 let dot = vec.normalized().dot(*dir);
-                if dot < DIRECTION_THRESHOLD {
+                if dot < direction_threshold {
                     continue;
                 }
                 if dist < min_dist {

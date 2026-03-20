@@ -4,9 +4,11 @@ use crate::overlay::node_store::NodeStore;
 use crate::overlay::ActionHandler;
 use crate::overlay::{dnve3::Vector3, OverlayOptimizer};
 use crate::runtime::AsyncRuntime;
+use bytes::Bytes;
 use crate::signaling::{MessageContent, Signaler, SignalingEnvelope, SignalingHandler};
 use crate::transport::{NetworkEvent, NetworkEventHandler, Transport};
 use crate::types::NodeId;
+use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -25,7 +27,7 @@ pub enum EngineState {
 }
 
 pub enum EngineEvent {
-    RawMessage(NodeId, Vec<u8>),
+    RawMessage(NodeId, Bytes),
     OverlayMessage(NodeId, Vec<u8>),
     NeighborsUpdated(Vec<u8>),
     AoiEntered(NodeId),
@@ -34,6 +36,50 @@ pub enum EngineEvent {
 
 pub trait EngineEventHandler: Send + Sync {
     fn on_event(&self, event: EngineEvent);
+}
+
+pub fn select_visible_aoi_nodes(
+    store: &NodeStore,
+    self_id: &NodeId,
+    aoi_range: f32,
+    visible_count: usize,
+) -> std::collections::HashSet<NodeId> {
+    if visible_count == 0 {
+        return std::collections::HashSet::new();
+    }
+
+    let Some(self_pos) = store.nodes.get(self_id).map(|n| n.position) else {
+        return std::collections::HashSet::new();
+    };
+
+    let mut candidates: Vec<(NodeId, f32)> = store
+        .nodes
+        .values()
+        .filter(|n| &n.id != self_id)
+        .filter_map(|n| {
+            let dx = n.position.x - self_pos.x;
+            let dy = n.position.y - self_pos.y;
+            let dz = n.position.z - self_pos.z;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            if dist <= aoi_range {
+                Some((n.id.clone(), dist))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.0.cmp(&b.0.0))
+    });
+
+    candidates
+        .into_iter()
+        .take(visible_count)
+        .map(|(id, _)| id)
+        .collect()
 }
 
 struct DummyEngineEventHandler;
@@ -124,12 +170,60 @@ impl MistEngine {
         *lock = handler;
     }
 
-    pub fn leave_room(&self) {
+    pub fn leave_room(&self) {        
+        let (transport_opt, network_transport_opt, websocket_signaler_opt, connected_nodes, network_connected_nodes) = {
+            let state = self.state.lock().unwrap();
+            let mut connected = Vec::new();
+            let mut network_connected = Vec::new();
+            let mut ws_signaler = None;
+            if let EngineState::Running(ctx) = &*state {
+                connected = ctx.transport.get_connected_nodes();
+                if let Some(nt) = &ctx.network_transport {
+                    network_connected = nt.get_connected_nodes();
+                }
+                if let Some(ws) = &ctx.websocket_signaler {
+                    ws_signaler = Some(ws.clone());
+                }
+                (
+                    Some(ctx.transport.clone()),
+                    ctx.network_transport.clone(),
+                    ws_signaler,
+                    connected,
+                    network_connected,
+                )
+            } else {
+                (None, None, None, connected, network_connected)
+            }
+        };
+
+        if let Some(transport) = transport_opt {
+            let network_transport = network_transport_opt;
+            let websocket_signaler = websocket_signaler_opt;
+            let mut to_disconnect: std::collections::HashSet<_> = connected_nodes.into_iter().collect();
+            to_disconnect.extend(network_connected_nodes.into_iter());
+
+            self.runtime.spawn(Box::pin(async move {
+                if let Some(ws) = websocket_signaler {
+                    let _ = ws.close().await;
+                }
+
+                for node in to_disconnect.into_iter() {
+                    let _ = transport.disconnect(&node).await;
+                    if let Some(nt) = &network_transport {
+                        let _ = nt.disconnect(&node).await;
+                    }
+                }
+            }));
+        }
+
         let mut state = self.state.lock().unwrap();
         *state = EngineState::Idle;
+
         let mut store = self.node_store.lock().unwrap();
         store.nodes.clear();
         store.last_updated.clear();
+        let mut aoi_nodes = self.aoi_nodes.lock().unwrap();
+        aoi_nodes.clear();
     }
 
     pub async fn run(
@@ -234,7 +328,7 @@ impl MistEngine {
                         MessageContent::Raw(payload) => {
                             tracing::debug!("MistEngine: Dispatching RawMessage to handler, payload_len={}", payload.len());
                             let handler = self.event_handler.lock().unwrap().clone();
-                            handler.on_event(EngineEvent::RawMessage(from_origin, payload));
+                            handler.on_event(EngineEvent::RawMessage(from_origin, payload.clone()));
                         }
                         MessageContent::Overlay(msg) => {
                             tracing::debug!("MistEngine: Dispatching OverlayMessage type={}", msg.message_type);
@@ -297,7 +391,7 @@ impl MistEngine {
             Err(e) => {
                 tracing::debug!("MistEngine: Deserialization failed for event from {}: {:?}. Forwarding as raw data.", from_origin.0, e);
                 let handler = self.event_handler.lock().unwrap().clone();
-                handler.on_event(EngineEvent::RawMessage(from_origin, event.data.to_vec()));
+                handler.on_event(EngineEvent::RawMessage(from_origin, Bytes::from(event.data)));
             }
         }
     }
@@ -408,5 +502,33 @@ impl MistEngine {
         for action in actions {
             self.handle_action(action);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_visible_aoi_nodes, NodeStore};
+    use crate::overlay::dnve3::Vector3;
+    use crate::types::NodeId;
+
+    fn node(id: &str) -> NodeId {
+        NodeId(id.to_string())
+    }
+
+    #[test]
+    fn select_visible_aoi_nodes_limits_to_nearest_nodes() {
+        let mut store = NodeStore::new();
+        let self_id = node("self");
+        store.update_node_position(self_id.clone(), Vector3::new(0.0, 0.0, 0.0));
+        store.update_node_position(node("near-1"), Vector3::new(1.0, 0.0, 0.0));
+        store.update_node_position(node("near-2"), Vector3::new(2.0, 0.0, 0.0));
+        store.update_node_position(node("far"), Vector3::new(10.0, 0.0, 0.0));
+
+        let selected = select_visible_aoi_nodes(&store, &self_id, 5.0, 2);
+
+        assert!(selected.contains(&node("near-1")));
+        assert!(selected.contains(&node("near-2")));
+        assert!(!selected.contains(&node("far")));
+        assert_eq!(selected.len(), 2);
     }
 }

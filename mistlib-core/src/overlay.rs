@@ -36,7 +36,7 @@ pub trait TopologyStrategy {
         action_handler: Arc<dyn ActionHandler>,
     );
 
-    fn handle_message(&self, from: NodeId, message_type: u32, payload: &[u8])
+    fn handle_message(&self, from: &NodeId, message_type: u32, payload: &[u8])
         -> Vec<OverlayAction>;
 
     fn tick(
@@ -56,7 +56,7 @@ pub trait TopologyStrategy: Send + Sync {
         action_handler: Arc<dyn ActionHandler>,
     );
 
-    fn handle_message(&self, from: NodeId, message_type: u32, payload: &[u8])
+    fn handle_message(&self, from: &NodeId, message_type: u32, payload: &[u8])
         -> Vec<OverlayAction>;
 
     fn tick(

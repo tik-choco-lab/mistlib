@@ -66,6 +66,14 @@ impl EngineEventHandler for WasmEngineEventHandler {
                     if let Ok(cid) = std::str::from_utf8(&data[1..]) {
                         crate::storage::handle_have_status(from.clone(), cid.to_string());
                     }
+                } else if first == 0x05 {
+                    if let Some((cid, chunk_index, chunk_total, payload)) =
+                        crate::storage::resolver::parse_have_chunk_message(data)
+                    {
+                        crate::storage::WANT_REGISTRY.with(|r| {
+                            r.fulfill_chunk(&cid, chunk_index, chunk_total, payload);
+                        });
+                    }
                 }
             }
         }
@@ -73,7 +81,7 @@ impl EngineEventHandler for WasmEngineEventHandler {
         let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
         if let Some(f) = callback {
             let (event_type, from_id, payload_vec) = match event {
-                EngineEvent::RawMessage(id, data) => (EVENT_RAW, id.0, data),
+                EngineEvent::RawMessage(id, data) => (EVENT_RAW, id.0, data.to_vec()),
                 EngineEvent::OverlayMessage(id, data) => (EVENT_OVERLAY, id.0, data),
                 EngineEvent::NeighborsUpdated(data) => (EVENT_NEIGHBORS, "rust".to_string(), data),
                 EngineEvent::AoiEntered(id) => (EVENT_AOI_ENTERED, id.0, vec![]),
@@ -428,8 +436,8 @@ pub fn get_stats() -> String {
     let snapshot = mistlib_core::stats::STATS.snapshot_and_reset();
     let rtt_millis: std::collections::HashMap<String, f32> = snapshot
         .rtt_millis
-        .into_iter()
-        .map(|(k, v)| (k.0, v))
+        .iter()
+        .map(|(k, v)| (k.0.clone(), *v))
         .collect();
 
     let stats = serde_json::json!({

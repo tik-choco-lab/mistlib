@@ -11,6 +11,7 @@ use mistlib_core::signaling::Signaler;
 use mistlib_core::stats::EngineStats;
 use mistlib_core::types::NodeId;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub struct NativeL0;
 
@@ -32,6 +33,8 @@ impl L0Engine for NativeL0 {
             let mut config = ENGINE.config.lock().unwrap();
             config.signaling_url = signaling_url;
         }
+
+        ENGINE.context_generation.fetch_add(1, Ordering::Relaxed);
 
         ENGINE.runtime.block_on(async {
             let config = ENGINE.config.lock().unwrap().clone();
@@ -139,6 +142,8 @@ impl L0Engine for NativeL0 {
             let mut state_lock = ENGINE.state.write().await;
             *state_lock = EngineState::Idle;
         });
+
+        ENGINE.context_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn set_config(&self, config: Config) {
@@ -157,6 +162,7 @@ impl L0Engine for NativeL0 {
             send_bits: 0,
             receive_bits: 0,
             rtt_millis: std::collections::HashMap::new(),
+            memory_mb: 0.0,
             eval_send_bits: 0,
             eval_receive_bits: 0,
             eval_message_count: 0,

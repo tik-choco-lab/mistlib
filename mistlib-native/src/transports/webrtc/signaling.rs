@@ -5,6 +5,7 @@ use mistlib_core::transport::Transport;
 use mistlib_core::types::{ConnectionState, NodeId};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
 impl WebRtcTransport {
     pub(crate) async fn handle_offer(
@@ -60,7 +61,16 @@ impl WebRtcTransport {
             peers.insert(remote_id.clone(), peer.clone());
         }
 
+        let attempt_id = self.reserve_connection_attempt(&remote_id);
+        self.spawn_connection_watchdog(remote_id.clone(), attempt_id);
+
         let result: crate::error::Result<()> = async {
+            if peer.pc.signaling_state() != RTCSignalingState::Stable {
+                return Err(crate::error::MistError::Internal(
+                    "Offer precondition failed: signaling is not stable".to_string(),
+                ));
+            }
+
             let offer = serde_json::from_str::<RTCSessionDescription>(&sdp)?;
             peer.pc.set_remote_description(offer).await?;
 
@@ -101,27 +111,7 @@ impl WebRtcTransport {
         .await;
 
         if result.is_err() {
-            
-            {
-                let mut states = self.connection_states.write().unwrap();
-                states.remove(&remote_id);
-                tracing::warn!(
-                    "[CS] REMOVE handle_offer_fail: {} total={}",
-                    remote_id,
-                    states.len()
-                );
-            }
-            let removed_peer = {
-                let mut peers = self.peers.write().await;
-                peers.remove(&remote_id)
-            };
-            if let Some(peer) = removed_peer {
-                peer.close_all().await;
-            }
-            {
-                let mut pc_lock = self.pending_candidates.write().await;
-                pc_lock.remove(&remote_id);
-            }
+            self.cleanup_session(&remote_id, true).await;
         }
 
         result
@@ -138,6 +128,14 @@ impl WebRtcTransport {
         };
 
         if let Some(peer) = peer {
+            let signaling_state = peer.pc.signaling_state();
+            if signaling_state != RTCSignalingState::HaveLocalOffer {
+                return Err(crate::error::MistError::Internal(format!(
+                    "Answer precondition failed: signaling_state={:?}",
+                    signaling_state
+                )));
+            }
+
             let answer = serde_json::from_str::<RTCSessionDescription>(&sdp)?;
             peer.pc.set_remote_description(answer).await?;
 
@@ -188,6 +186,16 @@ impl SignalingHandler for WebRtcTransport {
             MessageContent::Data(d) => d,
             _ => return Ok(()),
         };
+
+        let current_room_id = self.get_room_id();
+        if !data.room_id.is_empty() && data.room_id != current_room_id {
+            tracing::warn!(
+                "WebRtcTransport: ignore signaling from different room_id {} (current={})",
+                data.room_id,
+                current_room_id
+            );
+            return Ok(());
+        }
 
         match data.signaling_type {
             SignalingType::Offer => self
