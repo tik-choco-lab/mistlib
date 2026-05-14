@@ -64,7 +64,9 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
 
         info!(
             "StorageEngine: downloading '{}' ({} bytes, {} chunks)",
-            manifest.name, manifest.size, manifest.chunks.len()
+            manifest.name,
+            manifest.size,
+            manifest.chunks.len()
         );
 
         use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -236,7 +238,7 @@ mod tests {
             let root = engine.add("zeros.bin", &data).await.unwrap();
             let retrieved = engine.get(&root).await.unwrap();
             assert_eq!(data, retrieved);
-            
+
             assert_eq!(engine.manager.lock().unwrap().block_count(), 2);
         });
     }

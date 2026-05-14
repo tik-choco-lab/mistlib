@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::{LazyLock, Mutex};
-use tracing_subscriber::{prelude::*, EnvFilter};
 use tokio::sync::mpsc;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 use crate::engine::*;
 use mistlib_core::layers::L0Engine;
@@ -56,7 +56,7 @@ pub fn register_event_callback(cb: EventCallback) {
 }
 
 pub fn init(id: String, signaling_url: String) {
-    let _ = *INIT_LOG;
+    *INIT_LOG;
     tracing::info!("mistlib::init called");
 
     let local_id = NodeId(id);
@@ -162,7 +162,9 @@ async fn send_worker(mut rx: mpsc::Receiver<SendRequest>) {
     let mut cached_ctx: Option<std::sync::Arc<RunningContext>> = None;
 
     while let Some(req) = rx.recv().await {
-        let current_generation = ENGINE.context_generation.load(std::sync::atomic::Ordering::Relaxed);
+        let current_generation = ENGINE
+            .context_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         if cached_ctx.is_none() || cached_generation != current_generation {
             cached_ctx = ENGINE.get_context().await;
             cached_generation = current_generation;
@@ -173,7 +175,9 @@ async fn send_worker(mut rx: mpsc::Receiver<SendRequest>) {
                 if req.target_node.0.is_empty() {
                     let _ = l1.broadcast(req.bytes, req.delivery).await;
                 } else {
-                    let _ = l1.send_message(&req.target_node, req.bytes, req.delivery).await;
+                    let _ = l1
+                        .send_message(&req.target_node, req.bytes, req.delivery)
+                        .await;
                 }
             }
         }
@@ -181,7 +185,7 @@ async fn send_worker(mut rx: mpsc::Receiver<SendRequest>) {
 }
 
 async fn stats_worker() {
-    
+    // Prime the cache immediately so the first caller doesn't see stale data.
     update_stats_cache().await;
 
     let mut interval = tokio::time::interval(web_time::Duration::from_secs(1));
@@ -208,7 +212,9 @@ async fn position_worker() {
             continue;
         };
 
-        let current_generation = ENGINE.context_generation.load(std::sync::atomic::Ordering::Relaxed);
+        let current_generation = ENGINE
+            .context_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         if cached_ctx.is_none() || cached_generation != current_generation {
             cached_ctx = ENGINE.get_context().await;
             cached_generation = current_generation;

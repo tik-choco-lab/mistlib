@@ -1,6 +1,7 @@
 use crate::action::OverlayAction;
-use crate::overlay::{ActionHandler, OverlayOptimizer};
-use crate::signaling::{MessageContent, Signaler, SignalingEnvelope};
+use crate::overlay::OverlayEnvelope;
+use crate::overlay::{ActionHandler, OverlayRouter};
+use crate::signaling::{MessageContent, Signaler};
 use crate::transport::{NetworkEventHandler, Transport};
 use crate::types::{ConnectionState, DeliveryMethod, NodeId};
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 pub struct OverlayTransport {
-    pub optimizer: Arc<OverlayOptimizer>,
+    pub router: Arc<OverlayRouter>,
     pub action_handler: Arc<dyn ActionHandler>,
 }
 
@@ -25,15 +26,13 @@ impl Transport for OverlayTransport {
         data: Bytes,
         method: DeliveryMethod,
     ) -> crate::error::Result<()> {
-        let action = self.optimizer.wrap_data(to, data, method);
+        let action = self.router.wrap_data(to, data, method);
         self.action_handler.handle_action(action);
         Ok(())
     }
 
     async fn broadcast(&self, data: Bytes, method: DeliveryMethod) -> crate::error::Result<()> {
-        let action = self
-            .optimizer
-            .wrap_data(&NodeId("".to_string()), data, method);
+        let action = self.router.wrap_data(&NodeId::broadcast(), data, method);
         self.action_handler.handle_action(action);
         Ok(())
     }
@@ -51,7 +50,7 @@ impl Transport for OverlayTransport {
     }
 
     fn get_connected_nodes(&self) -> Vec<NodeId> {
-        let rt = self.optimizer.routing_table.lock().unwrap();
+        let rt = self.router.routing_table.lock().unwrap();
         rt.connected_nodes.iter().cloned().collect()
     }
 }
@@ -60,18 +59,20 @@ impl Transport for OverlayTransport {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signaler for OverlayTransport {
     async fn send_signaling(&self, to: &NodeId, msg: MessageContent) -> crate::error::Result<()> {
-        let envelope = SignalingEnvelope {
-            from: self.optimizer.local_node_id.clone(),
+        let envelope = OverlayEnvelope {
+            from: self.router.local_node_id.clone(),
             to: to.clone(),
-            hop_count: self.optimizer.hop_count,
+            hop_count: self.router.hop_count,
             content: msg,
         };
         let data = bincode::serialize(&envelope)
             .map_err(|e| crate::error::MistError::Internal(e.to_string()))?;
         let next_hop = {
-            let rt = self.optimizer.routing_table.lock().unwrap();
-            rt.get_next_hop(to).unwrap_or_else(|| to.clone())
+            let rt = self.router.routing_table.lock().unwrap();
+            rt.get_next_hop(to)
         };
+        let next_hop =
+            next_hop.ok_or_else(|| crate::error::MistError::RouteNotFound(to.clone()))?;
 
         self.action_handler
             .handle_action(OverlayAction::SendMessage {
@@ -84,5 +85,16 @@ impl Signaler for OverlayTransport {
 
     async fn close(&self) -> crate::error::Result<()> {
         Ok(())
+    }
+}
+
+impl OverlayTransport {
+    pub fn has_signaling_route(&self, to: &NodeId) -> bool {
+        if to.is_server() || to.is_broadcast() {
+            return false;
+        }
+
+        let rt = self.router.routing_table.lock().unwrap();
+        rt.get_next_hop(to).is_some()
     }
 }

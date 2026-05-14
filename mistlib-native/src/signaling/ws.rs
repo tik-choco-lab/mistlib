@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingData};
+use mistlib_core::stats::STATS;
 use mistlib_core::types::NodeId;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 pub struct WebSocketSignaler {
@@ -24,52 +24,58 @@ impl WebSocketSignaler {
         &self,
         incoming_tx: mpsc::Sender<MessageContent>,
     ) -> crate::error::Result<()> {
-        tracing::info!("WebSocketSignaler: Connecting to {}", self.url);
-        let (ws_stream, _) = connect_async(&self.url).await.map_err(|e| {
-            tracing::error!(
-                "WebSocketSignaler: Failed to connect to {}: {}",
-                self.url,
-                e
-            );
-            crate::error::MistError::Network(e.to_string())
-        })?;
-        tracing::info!("WebSocketSignaler: Connected to {}", self.url);
+        tracing::info!("WebSocketSignaler: connecting to {}", self.url);
+        let (ws_stream, _) = connect_async(&self.url)
+            .await
+            .map_err(|e| crate::error::MistError::Network(e.to_string()))?;
         let (mut write, mut read) = ws_stream.split();
         let (tx, mut rx) = mpsc::channel::<String>(1024);
-        {
-            let mut sender = self.sender.lock().await;
-            *sender = Some(tx);
-        }
+        *self.sender.lock().await = Some(tx);
+        let sender_handle = self.sender.clone();
 
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
+                let bytes = msg.len() as u64;
                 if let Err(e) = write.send(Message::Text(msg.into())).await {
-                    tracing::error!("{}", e);
+                    tracing::error!("WebSocketSignaler: send failed: {}", e);
                     break;
                 }
+                STATS.add_send(bytes);
             }
         });
 
         tokio::spawn(async move {
-            while let Some(msg) = read.next().await {
-                match msg {
+            loop {
+                let Some(msg) = read.next().await else { break };
+                let parse_result = match msg {
                     Ok(Message::Text(text)) => {
-                        if let Ok(data) = serde_json::from_str::<SignalingData>(&text) {
-                            let _ = incoming_tx.try_send(MessageContent::Data(data));
-                        }
+                        STATS.add_receive(text.len() as u64);
+                        serde_json::from_slice::<SignalingData>(text.as_bytes())
                     }
                     Ok(Message::Binary(bin)) => {
-                        if let Ok(data) = serde_json::from_slice::<SignalingData>(&bin) {
-                            let _ = incoming_tx.try_send(MessageContent::Data(data));
-                        }
+                        STATS.add_receive(bin.len() as u64);
+                        serde_json::from_slice::<SignalingData>(&bin)
                     }
-                    Err(e) => {
-                        tracing::error!("WebSocket error: {}", e);
+                    Ok(Message::Close(frame)) => {
+                        tracing::info!("WebSocketSignaler: closed: {:?}", frame);
                         break;
                     }
-                    _ => {}
+                    Err(e) => {
+                        tracing::error!("WebSocketSignaler: error: {}", e);
+                        break;
+                    }
+                    _ => continue,
+                };
+                match parse_result {
+                    Ok(data) => {
+                        if incoming_tx.send(MessageContent::Data(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!("WebSocketSignaler: decode failed: {}", e),
                 }
             }
+            *sender_handle.lock().await = None;
         });
 
         Ok(())
@@ -83,35 +89,31 @@ impl Signaler for WebSocketSignaler {
         _to: &NodeId,
         msg: MessageContent,
     ) -> mistlib_core::error::Result<()> {
-        let sender = self.sender.lock().await;
-        if let Some(tx) = sender.as_ref() {
-            let data_str = match msg {
-                MessageContent::Data(data) => serde_json::to_string(&data)
-                    .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?,
-                _ => {
-                    return Err(mistlib_core::error::MistError::Internal(
-                        "Unsupported message type".to_string(),
-                    ))
-                }
-            };
+        let MessageContent::Data(data) = msg else {
+            return Err(mistlib_core::error::MistError::Signaling(
+                "WebSocketSignaler: unsupported message type".to_string(),
+            ));
+        };
+        let data_str = serde_json::to_string(&data)
+            .map_err(|e| mistlib_core::error::MistError::Serialization(e.to_string()))?;
 
-            tx.try_send(data_str)
-                .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
-            Ok(())
-        } else {
-            tracing::error!(
-                "WebSocketSignaler: Cannot send signaling, not connected to {}",
+        let sender = self.sender.lock().await;
+        let tx = sender.as_ref().ok_or_else(|| {
+            mistlib_core::error::MistError::Signaling(format!(
+                "WebSocketSignaler: not connected to {}",
                 self.url
-            );
-            Err(mistlib_core::error::MistError::Internal(
-                "Not connected".to_string(),
             ))
-        }
+        })?;
+        tx.send(data_str).await.map_err(|e| {
+            mistlib_core::error::MistError::Signaling(format!(
+                "WebSocketSignaler: channel closed: {}",
+                e
+            ))
+        })
     }
 
     async fn close(&self) -> mistlib_core::error::Result<()> {
-        let mut sender = self.sender.lock().await;
-        *sender = None;
+        *self.sender.lock().await = None;
         Ok(())
     }
 }

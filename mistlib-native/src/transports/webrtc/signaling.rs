@@ -16,6 +16,20 @@ impl WebRtcTransport {
         let mut newly_reserved = false;
 
         {
+            // Glare resolution: if we already have a peer for this remote and we're
+            // the impolite side (lower ID = initiator), ignore their offer so our own
+            // offer can proceed.
+            let peers = self.peers.read().await;
+            if peers.contains_key(&remote_id) && self.local_node_id.0 < remote_id.0 {
+                tracing::debug!(
+                    "[Glare] ignoring offer from {} (we are impolite side)",
+                    remote_id
+                );
+                return Ok(());
+            }
+        }
+
+        {
             let mut states = self.connection_states.write().unwrap();
             if !states.contains_key(&remote_id) {
                 let max = self
@@ -56,10 +70,15 @@ impl WebRtcTransport {
             }
         };
 
-        {
+        let old_peer = {
             let mut peers = self.peers.write().await;
-            peers.insert(remote_id.clone(), peer.clone());
+            peers.insert(remote_id.clone(), peer.clone())
+        };
+        if let Some(old_peer) = old_peer {
+            old_peer.close_all().await;
+            crate::mem::record_peer_cleaned();
         }
+        crate::mem::record_peer_inserted();
 
         let attempt_id = self.reserve_connection_attempt(&remote_id);
         self.spawn_connection_watchdog(remote_id.clone(), attempt_id);
@@ -104,7 +123,7 @@ impl WebRtcTransport {
                         }),
                     )
                     .await
-                    .map_err(|e| crate::error::MistError::Core(e))?;
+                    .map_err(crate::error::MistError::Core)?;
             }
             Ok(())
         }
@@ -169,6 +188,15 @@ impl WebRtcTransport {
             if peer.pc.remote_description().await.is_some() {
                 let candidate = serde_json::from_str::<RTCIceCandidateInit>(&cand_json)?;
                 peer.pc.add_ice_candidate(candidate).await?;
+                return Ok(());
+            }
+        }
+
+        // Only buffer candidates for nodes with an active connection state.
+        // Late candidates for already-disconnected nodes would accumulate unboundedly otherwise.
+        {
+            let states = self.connection_states.read().unwrap();
+            if !states.contains_key(&remote_id) {
                 return Ok(());
             }
         }

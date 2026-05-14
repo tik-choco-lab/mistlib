@@ -14,8 +14,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStream, MediaStreamTrack, RtcConfiguration, RtcDataChannelInit, RtcIceCandidateInit,
-    RtcPeerConnection, RtcRtpSender, RtcSdpType, RtcSessionDescriptionInit, RtcSignalingState,
-    RtcIceConnectionState,
+    RtcIceConnectionState, RtcPeerConnection, RtcRtpSender, RtcSdpType, RtcSessionDescriptionInit,
+    RtcSignalingState,
 };
 
 const CONNECTION_TIMEOUT_MS: u32 = 6000;
@@ -41,6 +41,7 @@ pub struct WasmWebRtcTransport {
     pub max_connections: AtomicU32,
     pub next_connection_attempt_id: AtomicU32,
     pub sweeper_started: AtomicBool,
+    pub sweeper_generation: Arc<AtomicU32>,
     pub local_tracks: Arc<RwLock<HashMap<String, LocalTrack>>>,
     pub peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, RtcRtpSender>>>>,
 }
@@ -58,6 +59,7 @@ impl WasmWebRtcTransport {
             max_connections: AtomicU32::new(30),
             next_connection_attempt_id: AtomicU32::new(1),
             sweeper_started: AtomicBool::new(false),
+            sweeper_generation: Arc::new(AtomicU32::new(0)),
             local_tracks: Arc::new(RwLock::new(HashMap::new())),
             peer_senders: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -68,14 +70,22 @@ impl WasmWebRtcTransport {
             return;
         }
 
+        let generation = self
+            .sweeper_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let peers = self.peers.clone();
         let states = self.connection_states.clone();
         let attempts = self.connection_attempt_ids.clone();
         let senders = self.peer_senders.clone();
+        let sweeper_generation = self.sweeper_generation.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             loop {
                 gloo_timers::future::TimeoutFuture::new(2000).await;
+                if sweeper_generation.load(Ordering::Relaxed) != generation {
+                    break;
+                }
 
                 let nodes: Vec<NodeId> = {
                     let lock = states.read().unwrap_or_else(|e| e.into_inner());
@@ -96,7 +106,9 @@ impl WasmWebRtcTransport {
 
                     let state_snapshot = {
                         let lock = states.read().unwrap_or_else(|e| e.into_inner());
-                        lock.get(&node).copied().unwrap_or(ConnectionState::Disconnected)
+                        lock.get(&node)
+                            .copied()
+                            .unwrap_or(ConnectionState::Disconnected)
                     };
 
                     let ice_state = peer.pc.ice_connection_state();
@@ -116,7 +128,8 @@ impl WasmWebRtcTransport {
                         web_sys::RtcIceConnectionState::Failed
                             | web_sys::RtcIceConnectionState::Closed
                             | web_sys::RtcIceConnectionState::Disconnected
-                    ) || (state_snapshot == ConnectionState::Connected && !has_open_channel);
+                    ) || (state_snapshot == ConnectionState::Connected
+                        && !has_open_channel);
 
                     if should_cleanup {
                         {
@@ -135,12 +148,17 @@ impl WasmWebRtcTransport {
                             let mut lock = senders.write().unwrap_or_else(|e| e.into_inner());
                             lock.remove(&node);
                         }
-                        peer.pc.close();
+                        peer.close_all();
                         tracing::warn!("[Sweeper] Force cleaned session for {}", node.0);
                     }
                 }
             }
         });
+    }
+
+    pub fn stop_session_sweeper(&self) {
+        self.sweeper_started.store(false, Ordering::SeqCst);
+        self.sweeper_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_room_id(&self, room_id: String) {
@@ -218,7 +236,7 @@ impl WasmWebRtcTransport {
 
         if close_pc {
             if let Some(peer) = removed_peer {
-                peer.pc.close();
+                peer.close_all();
             }
         }
 
@@ -242,6 +260,32 @@ impl WasmWebRtcTransport {
                 .unwrap_or_else(|e| e.into_inner());
             attempts.remove(node);
         }
+    }
+
+    pub fn close_all_peer_connections(&self) {
+        self.stop_session_sweeper();
+
+        let peers = {
+            let mut lock = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *lock)
+        };
+
+        for (_, peer) in peers {
+            peer.close_all();
+        }
+
+        self.peer_senders
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.connection_states
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.connection_attempt_ids
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn attach_published_tracks_to_peer(
@@ -311,7 +355,10 @@ impl WasmWebRtcTransport {
         peer: &Arc<Peer>,
     ) -> mistlib_core::error::Result<()> {
         let state_ok = {
-            let lock = self.connection_states.read().unwrap_or_else(|e| e.into_inner());
+            let lock = self
+                .connection_states
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             matches!(
                 lock.get(remote_id),
                 Some(ConnectionState::Connecting) | Some(ConnectionState::Connected)
@@ -344,8 +391,7 @@ impl WasmWebRtcTransport {
         ) {
             return Err(mistlib_core::error::MistError::Internal(format!(
                 "Offer precondition failed: unstable ice state {:?} for {}",
-                ice_state,
-                remote_id.0
+                ice_state, remote_id.0
             )));
         }
 
@@ -394,7 +440,10 @@ impl WasmWebRtcTransport {
         let kind = track.kind();
         let published = {
             let mut lock = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
-            let published = lock.get(&track_id).map(|entry| entry.published).unwrap_or(false);
+            let published = lock
+                .get(&track_id)
+                .map(|entry| entry.published)
+                .unwrap_or(false);
             lock.insert(
                 track_id.clone(),
                 LocalTrack {
@@ -413,10 +462,7 @@ impl WasmWebRtcTransport {
         Ok(())
     }
 
-    pub async fn publish_local_track(
-        &self,
-        track_id: &str,
-    ) -> mistlib_core::error::Result<()> {
+    pub async fn publish_local_track(&self, track_id: &str) -> mistlib_core::error::Result<()> {
         {
             let mut lock = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
             let entry = lock.get_mut(track_id).ok_or_else(|| {
@@ -448,10 +494,7 @@ impl WasmWebRtcTransport {
         Ok(())
     }
 
-    pub async fn unpublish_local_track(
-        &self,
-        track_id: &str,
-    ) -> mistlib_core::error::Result<()> {
+    pub async fn unpublish_local_track(&self, track_id: &str) -> mistlib_core::error::Result<()> {
         {
             let mut lock = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
             let entry = lock.get_mut(track_id).ok_or_else(|| {
@@ -488,10 +531,7 @@ impl WasmWebRtcTransport {
         Ok(())
     }
 
-    pub async fn remove_local_track(
-        &self,
-        track_id: &str,
-    ) -> mistlib_core::error::Result<()> {
+    pub async fn remove_local_track(&self, track_id: &str) -> mistlib_core::error::Result<()> {
         let _ = self.unpublish_local_track(track_id).await;
         let mut lock = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
         lock.remove(track_id);
@@ -506,7 +546,10 @@ impl WasmWebRtcTransport {
         let local_track = {
             let lock = self.local_tracks.read().unwrap_or_else(|e| e.into_inner());
             let entry = lock.get(track_id).ok_or_else(|| {
-                mistlib_core::error::MistError::Internal(format!("Unknown local track: {}", track_id))
+                mistlib_core::error::MistError::Internal(format!(
+                    "Unknown local track: {}",
+                    track_id
+                ))
             })?;
             entry.track.clone()
         };
@@ -594,16 +637,13 @@ impl Transport for WasmWebRtcTransport {
             let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
             peers.get(node).cloned().and_then(|peer| {
                 let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-                channels
-                    .get(&method)
-                    .cloned()
-                    .or_else(|| {
-                        if method == DeliveryMethod::UnreliableOrdered {
-                            channels.get(&DeliveryMethod::Unreliable).cloned()
-                        } else {
-                            None
-                        }
-                    })
+                channels.get(&method).cloned().or_else(|| {
+                    if method == DeliveryMethod::UnreliableOrdered {
+                        channels.get(&DeliveryMethod::Unreliable).cloned()
+                    } else {
+                        None
+                    }
+                })
             })
         };
 
@@ -615,6 +655,7 @@ impl Transport for WasmWebRtcTransport {
                     mistlib_core::error::MistError::Internal(format!("{:?}", e))
                 })?;
                 STATS.add_send(data.len() as u64);
+                STATS.add_world_send_frame(&data);
                 return Ok(());
             } else {
                 if ready_state == web_sys::RtcDataChannelState::Closed
@@ -626,7 +667,11 @@ impl Transport for WasmWebRtcTransport {
                         .unwrap_or_else(|e| e.into_inner());
                     states.insert(node.clone(), ConnectionState::Connecting);
                 }
-                tracing::warn!("DataChannel for {} is not Open (state={:?})", node.0, ready_state);
+                tracing::warn!(
+                    "DataChannel for {} is not Open (state={:?})",
+                    node.0,
+                    ready_state
+                );
             }
         } else {
             let has_peer = {
@@ -664,7 +709,7 @@ impl Transport for WasmWebRtcTransport {
     fn get_connection_state(&self, node: &NodeId) -> ConnectionState {
         self.connection_states
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(node)
             .cloned()
             .unwrap_or(ConnectionState::Disconnected)
@@ -727,6 +772,21 @@ impl Transport for WasmWebRtcTransport {
             let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
             channels.insert(DeliveryMethod::ReliableOrdered, reliable.clone());
         }
+        let unreliable_ordered_init = RtcDataChannelInit::new();
+        unreliable_ordered_init.set_ordered(true);
+        unreliable_ordered_init.set_max_retransmits(0);
+        let unreliable_ordered = peer.pc.create_data_channel_with_data_channel_dict(
+            "unreliable-ordered",
+            &unreliable_ordered_init,
+        );
+        {
+            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
+            channels.insert(
+                DeliveryMethod::UnreliableOrdered,
+                unreliable_ordered.clone(),
+            );
+        }
+
         let unreliable_init = RtcDataChannelInit::new();
         unreliable_init.set_ordered(false);
         unreliable_init.set_max_retransmits(0);
@@ -739,6 +799,15 @@ impl Transport for WasmWebRtcTransport {
         }
         Peer::setup_dc_handlers(
             reliable,
+            self.event_handler.clone(),
+            node.clone(),
+            self.connection_states.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
+        );
+
+        Peer::setup_dc_handlers(
+            unreliable_ordered,
             self.event_handler.clone(),
             node.clone(),
             self.connection_states.clone(),
@@ -813,7 +882,7 @@ impl Transport for WasmWebRtcTransport {
                         let mut attempts = attempt_ids.write().unwrap_or_else(|e| e.into_inner());
                         attempts.remove(&node_id);
                     }
-                    peer_for_timeout.pc.close();
+                    peer_for_timeout.close_all();
                     tracing::warn!(
                         "Connection timeout to {}. fail-fast cleanup (attempt_id={}).",
                         node_id.0,
@@ -881,9 +950,9 @@ impl SignalingHandler for WasmWebRtcTransport {
                 };
                 let peer = match peer {
                     Some(peer) => peer,
-                    None => self
-                        .create_pc(data.sender_id.clone())
-                        .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?,
+                    None => self.create_pc(data.sender_id.clone()).map_err(|e| {
+                        mistlib_core::error::MistError::Internal(format!("{:?}", e))
+                    })?,
                 };
 
                 if peer.pc.signaling_state() != RtcSignalingState::Stable {

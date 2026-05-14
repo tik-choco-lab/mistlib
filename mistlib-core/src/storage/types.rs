@@ -174,9 +174,17 @@ mod tests {
         }
         let duration = start.elapsed();
         let avg_ms = duration.as_secs_f64() * 1000.0 / (iters as f64);
-        println!("LRU eviction candidates: {}iters => total {:?}, avg {:.3}ms", iters, duration, avg_ms);
+        println!(
+            "LRU eviction candidates: {}iters => total {:?}, avg {:.3}ms",
+            iters, duration, avg_ms
+        );
 
-        assert!(avg_ms < 200.0, "eviction_candidates too slow: avg {:.3}ms", avg_ms);
+        // Note: this is a lightweight regression threshold to catch big regressions on CI.
+        // Real-world perf expected < 100ms in most environments and might vary under load.
+        assert!(
+            avg_ms < 200.0,
+            "eviction_candidates too slow: avg {:.3}ms",
+            avg_ms
+        );
     }
 }
-

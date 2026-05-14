@@ -6,6 +6,7 @@ pub mod events;
 pub mod ffi;
 pub mod layers;
 pub mod logging;
+pub mod mem;
 pub mod runtime;
 pub mod signaling;
 pub mod stats;

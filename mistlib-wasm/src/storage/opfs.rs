@@ -111,7 +111,7 @@ impl BlockStore for WasmBlockStore {
         let dir = get_block_dir().await?;
         let fh = match get_file_handle(&dir, cid, false).await {
             Ok(fh) => fh,
-            Err(_) => return Ok(None), 
+            Err(_) => return Ok(None),
         };
 
         let fh_val: &JsValue = fh.as_ref();
@@ -129,7 +129,7 @@ impl BlockStore for WasmBlockStore {
     async fn delete_block(&self, cid: &str) -> Result<()> {
         let dir = get_block_dir().await?;
         let dir_val: &JsValue = dir.as_ref();
-        
+
         let _ = call_async_method(dir_val, "removeEntry", &[JsValue::from_str(cid)]).await;
         Ok(())
     }

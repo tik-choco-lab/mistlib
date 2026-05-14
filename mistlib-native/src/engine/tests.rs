@@ -6,7 +6,8 @@ use mistlib_core::types::NodeId;
 async fn test_engine_get_stats_json_structure() {
     STATS.add_send(100);
     STATS.add_receive(50);
-    STATS.add_eval_send(200);
+    STATS.add_world_send(200);
+    STATS.add_relay_send(25);
     STATS.set_rtt(NodeId("peer-1".to_string()), 15.5);
 
     let stats_json = ENGINE.get_stats_json().await;
@@ -14,7 +15,8 @@ async fn test_engine_get_stats_json_structure() {
 
     assert_eq!(stats["sendBits"], 100 * 8);
     assert_eq!(stats["receiveBits"], 50 * 8);
-    assert_eq!(stats["evalSendBits"], 200 * 8);
+    assert_eq!(stats["worldSendBits"], 200 * 8);
+    assert_eq!(stats["relaySendBits"], 25 * 8);
     assert_eq!(stats["rttMillis"]["peer-1"], 15.5);
     assert!(stats["nodes"].is_array());
 

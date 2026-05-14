@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
+use crate::config::SpatialPartitionType;
+
 const EPSILON: f32 = 0.00001;
 const DEFAULT_MAX_RANGE: f32 = 1.0;
 const EXPANSION_FACTOR: f32 = 0.5;
@@ -151,11 +153,23 @@ pub struct SpatialDensityUtils {
 
 impl SpatialDensityUtils {
     pub fn new(count: usize) -> Self {
-        let directions = Self::generate_uniform_directions(count);
+        let directions = Self::generate_fibonacci_directions(count);
         Self { directions }
     }
 
-    fn generate_uniform_directions(count: usize) -> Vec<Vector3> {
+    pub fn new_with_partition(count: usize, partition_type: SpatialPartitionType) -> Self {
+        let directions = match partition_type {
+            SpatialPartitionType::Fibonacci => Self::generate_fibonacci_directions(count),
+            SpatialPartitionType::Tetrahedron => Self::generate_tetrahedron_face_normals(),
+            SpatialPartitionType::Cube => Self::generate_cube_face_normals(),
+            SpatialPartitionType::Octahedron => Self::generate_octahedron_face_normals(),
+            SpatialPartitionType::Dodecahedron => Self::generate_dodecahedron_face_normals(),
+            SpatialPartitionType::Icosahedron => Self::generate_icosahedron_face_normals(),
+        };
+        Self { directions }
+    }
+
+    fn generate_fibonacci_directions(count: usize) -> Vec<Vector3> {
         let mut directions = Vec::with_capacity(count);
         if count == 1 {
             directions.push(Vector3::new(0.0, 0.0, 1.0));
@@ -175,6 +189,92 @@ impl SpatialDensityUtils {
             directions.push(Vector3::new(x, y, z));
         }
         directions
+    }
+
+    fn generate_tetrahedron_face_normals() -> Vec<Vector3> {
+        Self::normalized_vectors(&[
+            Vector3::new(1.0, 1.0, 1.0),
+            Vector3::new(1.0, -1.0, -1.0),
+            Vector3::new(-1.0, 1.0, -1.0),
+            Vector3::new(-1.0, -1.0, 1.0),
+        ])
+    }
+
+    fn generate_cube_face_normals() -> Vec<Vector3> {
+        vec![
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(0.0, 0.0, -1.0),
+        ]
+    }
+
+    fn generate_octahedron_face_normals() -> Vec<Vector3> {
+        let mut directions = Vec::with_capacity(8);
+        for &x in &[-1.0, 1.0] {
+            for &y in &[-1.0, 1.0] {
+                for &z in &[-1.0, 1.0] {
+                    directions.push(Vector3::new(x, y, z).normalized());
+                }
+            }
+        }
+        directions
+    }
+
+    fn generate_dodecahedron_face_normals() -> Vec<Vector3> {
+        let phi = (1.0 + 5.0f32.sqrt()) / 2.0;
+        Self::normalized_vectors(&[
+            Vector3::new(0.0, 1.0, phi),
+            Vector3::new(0.0, 1.0, -phi),
+            Vector3::new(0.0, -1.0, phi),
+            Vector3::new(0.0, -1.0, -phi),
+            Vector3::new(1.0, phi, 0.0),
+            Vector3::new(1.0, -phi, 0.0),
+            Vector3::new(-1.0, phi, 0.0),
+            Vector3::new(-1.0, -phi, 0.0),
+            Vector3::new(phi, 0.0, 1.0),
+            Vector3::new(phi, 0.0, -1.0),
+            Vector3::new(-phi, 0.0, 1.0),
+            Vector3::new(-phi, 0.0, -1.0),
+        ])
+    }
+
+    fn generate_icosahedron_face_normals() -> Vec<Vector3> {
+        let phi = (1.0 + 5.0f32.sqrt()) / 2.0;
+        let inv_phi = 1.0 / phi;
+        let mut directions = Vec::with_capacity(20);
+
+        for &x in &[-1.0, 1.0] {
+            for &y in &[-1.0, 1.0] {
+                for &z in &[-1.0, 1.0] {
+                    directions.push(Vector3::new(x, y, z).normalized());
+                }
+            }
+        }
+
+        for &y in &[-inv_phi, inv_phi] {
+            for &z in &[-phi, phi] {
+                directions.push(Vector3::new(0.0, y, z).normalized());
+            }
+        }
+        for &x in &[-inv_phi, inv_phi] {
+            for &y in &[-phi, phi] {
+                directions.push(Vector3::new(x, y, 0.0).normalized());
+            }
+        }
+        for &x in &[-phi, phi] {
+            for &z in &[-inv_phi, inv_phi] {
+                directions.push(Vector3::new(x, 0.0, z).normalized());
+            }
+        }
+
+        directions
+    }
+
+    fn normalized_vectors(vectors: &[Vector3]) -> Vec<Vector3> {
+        vectors.iter().map(|v| v.normalized()).collect()
     }
 
     pub fn create_spatial_density(
@@ -303,8 +403,15 @@ mod test {
         }
         let duration = start.elapsed();
         let avg_us = duration.as_secs_f64() * 1_000_000.0 / (iters as f64);
-        println!("merge_spatial_density x{} => total {:?}, avg {:.3}us", iters, duration, avg_us);
+        println!(
+            "merge_spatial_density x{} => total {:?}, avg {:.3}us",
+            iters, duration, avg_us
+        );
 
-        assert!(avg_us < 200.0, "merge_spatial_density too slow: avg {:.3}us", avg_us);
+        assert!(
+            avg_us < 200.0,
+            "merge_spatial_density too slow: avg {:.3}us",
+            avg_us
+        );
     }
 }

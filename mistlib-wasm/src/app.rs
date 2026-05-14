@@ -28,6 +28,9 @@ pub const EVENT_OVERLAY: u32 = 1;
 pub const EVENT_NEIGHBORS: u32 = 2;
 pub const EVENT_AOI_ENTERED: u32 = 3;
 pub const EVENT_AOI_LEFT: u32 = 4;
+pub const EVENT_PEER_CONNECTED: u32 = 5;
+pub const EVENT_PEER_DISCONNECTED: u32 = 6;
+pub const EVENT_AOI_NODES: u32 = 7;
 pub const MEDIA_EVENT_TRACK_ADDED: u32 = 100;
 pub const MEDIA_EVENT_TRACK_REMOVED: u32 = 101;
 pub const DELIVERY_RELIABLE: u32 = 0;
@@ -41,12 +44,10 @@ impl EngineEventHandler for WasmEngineEventHandler {
             if !data.is_empty() {
                 let first = data[0];
                 if first == 0x01 {
-                    
                     if let Ok(cid) = std::str::from_utf8(&data[1..]) {
                         crate::storage::handle_want(from.clone(), cid.to_string());
                     }
                 } else if first == 0x02 {
-                    
                     if data.len() >= 2 {
                         let cid_len = data[1] as usize;
                         if data.len() >= 2 + cid_len {
@@ -57,12 +58,10 @@ impl EngineEventHandler for WasmEngineEventHandler {
                         }
                     }
                 } else if first == 0x03 {
-                    
                     if let Ok(cid) = std::str::from_utf8(&data[1..]) {
                         crate::storage::handle_query(from.clone(), cid.to_string());
                     }
                 } else if first == 0x04 {
-                    
                     if let Ok(cid) = std::str::from_utf8(&data[1..]) {
                         crate::storage::handle_have_status(from.clone(), cid.to_string());
                     }
@@ -86,6 +85,7 @@ impl EngineEventHandler for WasmEngineEventHandler {
                 EngineEvent::NeighborsUpdated(data) => (EVENT_NEIGHBORS, "rust".to_string(), data),
                 EngineEvent::AoiEntered(id) => (EVENT_AOI_ENTERED, id.0, vec![]),
                 EngineEvent::AoiLeft(id) => (EVENT_AOI_LEFT, id.0, vec![]),
+                EngineEvent::AoiNodesUpdated(data) => (EVENT_AOI_NODES, "rust".to_string(), data),
             };
             wasm_bindgen_futures::spawn_local(async move {
                 let ev_type = JsValue::from_f64(event_type as f64);
@@ -94,6 +94,30 @@ impl EngineEventHandler for WasmEngineEventHandler {
                 let _ = f.call3(&JsValue::NULL, &ev_type, &from_js, &bytes);
             });
         }
+    }
+}
+
+pub fn emit_peer_connected(node_id: NodeId) {
+    let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
+    if let Some(f) = callback {
+        wasm_bindgen_futures::spawn_local(async move {
+            let ev_type = JsValue::from_f64(EVENT_PEER_CONNECTED as f64);
+            let from_js = JsValue::from_str(&node_id.0);
+            let empty: JsValue = js_sys::Uint8Array::new_with_length(0).into();
+            let _ = f.call3(&JsValue::NULL, &ev_type, &from_js, &empty);
+        });
+    }
+}
+
+pub fn emit_peer_disconnected(node_id: NodeId) {
+    let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
+    if let Some(f) = callback {
+        wasm_bindgen_futures::spawn_local(async move {
+            let ev_type = JsValue::from_f64(EVENT_PEER_DISCONNECTED as f64);
+            let from_js = JsValue::from_str(&node_id.0);
+            let empty: JsValue = js_sys::Uint8Array::new_with_length(0).into();
+            let _ = f.call3(&JsValue::NULL, &ev_type, &from_js, &empty);
+        });
     }
 }
 
@@ -282,14 +306,10 @@ pub fn update_position(x: f32, y: f32, z: f32) {
         };
 
         if let Some(ctx) = ctx {
-            if let Some(ov) = &ctx.overlay {
-                {
-                    let mut rt = ov.routing_table.lock().unwrap();
-                    rt.add_routing(self_id.clone(), self_id.clone(), &self_id);
-                }
-
+            if ctx.overlay.is_some() {
                 let connected_nodes = ctx.transport.get_connected_nodes();
                 if !connected_nodes.is_empty() {
+                    let hop_count = e.config.lock().unwrap().limits.hop_count;
                     let payload = serde_json::json!({
                         "type": "sync_pos",
                         "position": {"x": x, "y": y, "z": z},
@@ -297,13 +317,12 @@ pub fn update_position(x: f32, y: f32, z: f32) {
                     })
                     .to_string();
 
-                    use mistlib_core::signaling::{
-                        MessageContent, OverlayMessage, SignalingEnvelope,
-                    };
-                    let envelope = SignalingEnvelope {
+                    use mistlib_core::overlay::{OverlayEnvelope, OverlayMessage};
+                    use mistlib_core::signaling::MessageContent;
+                    let envelope = OverlayEnvelope {
                         from: self_id.clone(),
                         to: NodeId("".to_string()),
-                        hop_count: 1,
+                        hop_count,
                         content: MessageContent::Overlay(OverlayMessage {
                             message_type: 100,
                             payload: payload.into_bytes(),
@@ -386,7 +405,6 @@ pub fn set_config(data: String) -> bool {
             l0.set_config(config);
             true
         } else {
-            
             ENGINE.with(|e| {
                 let mut lock = e.config.lock().unwrap();
                 lock.update_from_json(&data)
@@ -445,9 +463,12 @@ pub fn get_stats() -> String {
         "sendBits": snapshot.send_bits,
         "receiveBits": snapshot.receive_bits,
         "rttMillis": rtt_millis,
-        "evalSendBits": snapshot.eval_send_bits,
-        "evalReceiveBits": snapshot.eval_receive_bits,
-        "evalMessageCount": snapshot.eval_message_count,
+        "worldSendBits": snapshot.world_send_bits,
+        "worldReceiveBits": snapshot.world_receive_bits,
+        "worldMessageCount": snapshot.world_message_count,
+        "relaySendBits": snapshot.relay_send_bits,
+        "relayReceiveBits": snapshot.relay_receive_bits,
+        "relayMessageCount": snapshot.relay_message_count,
         "nodes": []
     });
     serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())

@@ -1,6 +1,5 @@
 use crate::app::{WasmEngineEventHandler, ENGINE, L1_TRANSPORT, PENDING_START, WEBRTC_TRANSPORT};
 use crate::layers::wasm_l1::WasmL1Transport;
-use crate::signaling::relay::SignalingRelay;
 use crate::signaling::ws::WasmWebSocketSignaler;
 use crate::transport::webrtc::WasmWebRtcTransport;
 use async_trait::async_trait;
@@ -8,8 +7,11 @@ use mistlib_core::config::Config;
 use mistlib_core::engine::RunningContext;
 use mistlib_core::layers::L0Engine;
 use mistlib_core::overlay::dnve3::strategy::DNVE3Strategy;
-use mistlib_core::overlay::OverlayOptimizer;
-use mistlib_core::signaling::{MessageContent, Signaler};
+use mistlib_core::overlay::OverlayRouter;
+use mistlib_core::signaling::{
+    MessageContent, RoutedSignaler, RoutedSignalingHandler, Signaler, SignalingHandler,
+    SignalingRoute,
+};
 use mistlib_core::stats::EngineStats;
 use mistlib_core::types::NodeId;
 use std::sync::Arc;
@@ -44,30 +46,20 @@ impl L0Engine for WasmL0 {
 
         spawn_local(async move {
             let signaler = Arc::new(WasmWebSocketSignaler::new(&signaling_url));
-            let relay = Arc::new(SignalingRelay::new());
-            relay
-                .set_delegate(signaler.clone() as Arc<dyn Signaler>)
-                .await;
+            let config = Arc::new(config);
 
-            let webrtc = Arc::new(WasmWebRtcTransport::new(
-                relay.clone() as Arc<dyn Signaler>,
-                local_id.clone(),
-            ));
-            relay.set_connection_states(webrtc.connection_states.clone());
-            webrtc.set_max_connections(config.limits.max_connection_count);
-
-            let mut optimizer = OverlayOptimizer::new(
+            let mut router = OverlayRouter::new(
                 &config,
                 ENGINE.with(|e| e.node_store.clone()),
                 local_id.clone(),
             );
-            optimizer.add_strategy(Arc::new(DNVE3Strategy::new(
+            router.add_strategy(Arc::new(DNVE3Strategy::new(
                 &config,
                 ENGINE.with(|e| e.node_store.clone()),
                 local_id.clone(),
-                optimizer.routing_table.clone(),
+                router.routing_table.clone(),
             )));
-            let optimizer_arc = Arc::new(optimizer);
+            let router_arc = Arc::new(router);
 
             struct EngineActionHandler(Arc<mistlib_core::engine::MistEngine>);
             impl mistlib_core::overlay::ActionHandler for EngineActionHandler {
@@ -77,22 +69,38 @@ impl L0Engine for WasmL0 {
             }
             let action_handler = Arc::new(EngineActionHandler(ENGINE.with(|e| e.clone())));
 
-            optimizer_arc
+            router_arc
                 .start(
                     Arc::new(crate::runtime::WasmRuntime),
-                    Arc::new(config),
+                    config.clone(),
                     action_handler.clone(),
                 )
                 .await;
 
             let overlay_transport = Arc::new(mistlib_core::overlay::OverlayTransport {
-                optimizer: optimizer_arc.clone(),
+                router: router_arc.clone(),
                 action_handler: action_handler.clone(),
             });
 
-            relay
-                .set_overlay(overlay_transport.clone() as Arc<dyn Signaler>)
-                .await;
+            let routed_signaler = Arc::new(RoutedSignaler::new(
+                signaler.clone() as Arc<dyn Signaler>,
+                overlay_transport.clone(),
+            ));
+            let webrtc = Arc::new(WasmWebRtcTransport::new(
+                routed_signaler.clone() as Arc<dyn Signaler>,
+                local_id.clone(),
+            ));
+            webrtc.set_max_connections(config.limits.max_connection_count);
+            let ws_signaling_handler = Arc::new(RoutedSignalingHandler::new(
+                routed_signaler.clone(),
+                webrtc.clone() as Arc<dyn SignalingHandler>,
+                SignalingRoute::WebSocket,
+            ));
+            let p2p_signaling_handler = Arc::new(RoutedSignalingHandler::new(
+                routed_signaler.clone(),
+                webrtc.clone() as Arc<dyn SignalingHandler>,
+                SignalingRoute::Overlay,
+            ));
 
             let l1 = Arc::new(WasmL1Transport::new(
                 overlay_transport.clone() as Arc<dyn mistlib_core::transport::Transport>,
@@ -107,9 +115,11 @@ impl L0Engine for WasmL0 {
                 network_transport: Some(
                     webrtc.clone() as Arc<dyn mistlib_core::transport::Transport>
                 ),
-                signaling_handler: webrtc.clone(),
+                signaling_handler: ws_signaling_handler,
+                p2p_signaling_handler: Some(p2p_signaling_handler),
+                signaling_dispatch: Some(overlay_transport.clone() as Arc<dyn Signaler>),
                 websocket_signaler: Some(signaler.clone()),
-                overlay: Some(optimizer_arc),
+                overlay: Some(router_arc),
             };
 
             crate::storage::init_storage(
@@ -118,7 +128,10 @@ impl L0Engine for WasmL0 {
             );
 
             let (sig_tx, sig_rx) = mpsc::unbounded_channel::<MessageContent>();
-            let _ = signaler.connect(sig_tx).await;
+            if let Err(err) = signaler.connect(sig_tx).await {
+                tracing::error!("WASM signaling connection failed: {:?}", err);
+                return;
+            }
 
             WEBRTC_TRANSPORT.with(|t| *t.borrow_mut() = Some(webrtc.clone()));
             PENDING_START.with(|p| *p.borrow_mut() = Some((ctx, sig_rx)));
@@ -164,6 +177,11 @@ impl L0Engine for WasmL0 {
     }
 
     fn leave_room(&self) {
+        WEBRTC_TRANSPORT.with(|t| {
+            if let Some(webrtc) = t.borrow().as_ref() {
+                webrtc.close_all_peer_connections();
+            }
+        });
         ENGINE.with(|e| e.leave_room());
     }
 
@@ -186,9 +204,12 @@ impl L0Engine for WasmL0 {
             receive_bits: 0,
             rtt_millis: std::collections::HashMap::new(),
             memory_mb: 0.0,
-            eval_send_bits: 0,
-            eval_receive_bits: 0,
-            eval_message_count: 0,
+            world_send_bits: 0,
+            world_receive_bits: 0,
+            world_message_count: 0,
+            relay_send_bits: 0,
+            relay_receive_bits: 0,
+            relay_message_count: 0,
             nodes: vec![],
             diag_peers: 0,
             diag_connection_states: 0,

@@ -50,9 +50,7 @@ impl L1Transport for WasmL1Transport {
 }
 
 impl L1Notifier for WasmL1Transport {
-    fn notify_connected(&self, _node_id: &NodeId) {
-        
-    }
+    fn notify_connected(&self, _node_id: &NodeId) {}
 
     fn notify_disconnected(&self, _node_id: &NodeId) {}
 

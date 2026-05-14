@@ -7,9 +7,12 @@ pub struct MistStats {
     pub total_send_bytes: AtomicU64,
     pub total_receive_bytes: AtomicU64,
     pub total_message_count: AtomicU64,
-    pub total_eval_send_bytes: AtomicU64,
-    pub total_eval_receive_bytes: AtomicU64,
-    pub total_eval_message_count: AtomicU64,
+    pub total_world_send_bytes: AtomicU64,
+    pub total_world_receive_bytes: AtomicU64,
+    pub total_world_message_count: AtomicU64,
+    pub total_relay_send_bytes: AtomicU64,
+    pub total_relay_receive_bytes: AtomicU64,
+    pub total_relay_message_count: AtomicU64,
     pub rtt_millis: Mutex<HashMap<NodeId, f32>>,
 }
 
@@ -19,9 +22,18 @@ pub struct StatsSnapshot {
     pub send_bits: u64,
     pub receive_bits: u64,
     pub rtt_millis: HashMap<NodeId, f32>,
-    pub eval_send_bits: u64,
-    pub eval_receive_bits: u64,
-    pub eval_message_count: u64,
+    pub world_send_bits: u64,
+    pub world_receive_bits: u64,
+    pub world_message_count: u64,
+    pub relay_send_bits: u64,
+    pub relay_receive_bits: u64,
+    pub relay_message_count: u64,
+}
+
+impl Default for MistStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MistStats {
@@ -30,9 +42,12 @@ impl MistStats {
             total_send_bytes: AtomicU64::new(0),
             total_receive_bytes: AtomicU64::new(0),
             total_message_count: AtomicU64::new(0),
-            total_eval_send_bytes: AtomicU64::new(0),
-            total_eval_receive_bytes: AtomicU64::new(0),
-            total_eval_message_count: AtomicU64::new(0),
+            total_world_send_bytes: AtomicU64::new(0),
+            total_world_receive_bytes: AtomicU64::new(0),
+            total_world_message_count: AtomicU64::new(0),
+            total_relay_send_bytes: AtomicU64::new(0),
+            total_relay_receive_bytes: AtomicU64::new(0),
+            total_relay_message_count: AtomicU64::new(0),
             rtt_millis: Mutex::new(HashMap::new()),
         }
     }
@@ -46,15 +61,27 @@ impl MistStats {
         self.total_receive_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn add_eval_send(&self, bytes: u64) {
-        self.total_eval_send_bytes
+    pub fn add_world_send(&self, bytes: u64) {
+        self.total_world_send_bytes
             .fetch_add(bytes, Ordering::Relaxed);
-        self.total_eval_message_count
+        self.total_world_message_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn add_eval_receive(&self, bytes: u64) {
-        self.total_eval_receive_bytes
+    pub fn add_world_receive(&self, bytes: u64) {
+        self.total_world_receive_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn add_relay_send(&self, bytes: u64) {
+        self.total_relay_send_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.total_relay_message_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_relay_receive(&self, bytes: u64) {
+        self.total_relay_receive_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -74,9 +101,12 @@ impl MistStats {
         let send_bytes = self.total_send_bytes.swap(0, Ordering::Relaxed);
         let receive_bytes = self.total_receive_bytes.swap(0, Ordering::Relaxed);
         let message_count = self.total_message_count.swap(0, Ordering::Relaxed);
-        let eval_send_bytes = self.total_eval_send_bytes.swap(0, Ordering::Relaxed);
-        let eval_receive_bytes = self.total_eval_receive_bytes.swap(0, Ordering::Relaxed);
-        let eval_message_count = self.total_eval_message_count.swap(0, Ordering::Relaxed);
+        let world_send_bytes = self.total_world_send_bytes.swap(0, Ordering::Relaxed);
+        let world_receive_bytes = self.total_world_receive_bytes.swap(0, Ordering::Relaxed);
+        let world_message_count = self.total_world_message_count.swap(0, Ordering::Relaxed);
+        let relay_send_bytes = self.total_relay_send_bytes.swap(0, Ordering::Relaxed);
+        let relay_receive_bytes = self.total_relay_receive_bytes.swap(0, Ordering::Relaxed);
+        let relay_message_count = self.total_relay_message_count.swap(0, Ordering::Relaxed);
 
         let rtt = self
             .rtt_millis
@@ -89,13 +119,14 @@ impl MistStats {
             send_bits: send_bytes * 8,
             receive_bits: receive_bytes * 8,
             rtt_millis: rtt,
-            eval_send_bits: eval_send_bytes * 8,
-            eval_receive_bits: eval_receive_bytes * 8,
-            eval_message_count,
+            world_send_bits: world_send_bytes * 8,
+            world_receive_bits: world_receive_bytes * 8,
+            world_message_count,
+            relay_send_bits: relay_send_bytes * 8,
+            relay_receive_bits: relay_receive_bytes * 8,
+            relay_message_count,
         }
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref STATS: MistStats = MistStats::new();
-}
+pub static STATS: std::sync::LazyLock<MistStats> = std::sync::LazyLock::new(MistStats::new);

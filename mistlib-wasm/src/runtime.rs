@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use mistlib_core::runtime::AsyncRuntime;
-use web_time::Duration;
 use wasm_bindgen_futures::spawn_local;
+use web_time::Duration;
 
 pub struct WasmRuntime;
 

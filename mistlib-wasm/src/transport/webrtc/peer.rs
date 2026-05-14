@@ -24,6 +24,35 @@ impl Peer {
         }
     }
 
+    pub fn close_all(&self) {
+        self.detach_peer_handlers();
+
+        let channels = {
+            let mut lock = self.channels.write().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *lock)
+        };
+
+        for (_, dc) in channels {
+            Self::detach_data_channel_handlers(&dc);
+            dc.close();
+        }
+
+        self.pc.close();
+    }
+
+    fn detach_peer_handlers(&self) {
+        self.pc.set_oniceconnectionstatechange(None);
+        self.pc.set_onicecandidate(None);
+        self.pc.set_ondatachannel(None);
+        self.pc.set_ontrack(None);
+    }
+
+    fn detach_data_channel_handlers(dc: &RtcDataChannel) {
+        dc.set_onopen(None);
+        dc.set_onclose(None);
+        dc.set_onmessage(None);
+    }
+
     pub fn setup_handlers(
         self: &Arc<Self>,
         remote_id: NodeId,
@@ -60,8 +89,7 @@ impl Peer {
                         remote_id_state.0
                     );
                 }
-                web_sys::RtcIceConnectionState::Failed
-                | web_sys::RtcIceConnectionState::Closed => {
+                web_sys::RtcIceConnectionState::Failed | web_sys::RtcIceConnectionState::Closed => {
                     states.insert(remote_id_state.clone(), ConnectionState::Disconnected);
                     {
                         let mut peers = peers_state.write().unwrap_or_else(|e| e.into_inner());
@@ -200,7 +228,12 @@ impl Peer {
         let onopen = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
             tracing::info!("DataChannel {} to {} opened", label, from_msg.0);
             let mut lock = states_open.write().unwrap_or_else(|e| e.into_inner());
-            lock.insert(from_msg.clone(), ConnectionState::Connected);
+            let prev = lock.insert(from_msg.clone(), ConnectionState::Connected);
+
+            if prev != Some(ConnectionState::Connected) {
+                drop(lock);
+                crate::app::emit_peer_connected(from_msg.clone());
+            }
         }) as Box<dyn FnMut(web_sys::Event)>);
         dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -211,64 +244,29 @@ impl Peer {
         let peers_close = peers.clone();
         let senders_close = peer_senders.clone();
         let onclose = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
-            tracing::warn!("DataChannel to {} closed. evaluating health.", from_close.0);
-
-            let peer_opt = {
-                let peers_lock = peers_close.read().unwrap_or_else(|e| e.into_inner());
-                peers_lock.get(&from_close).cloned()
-            };
-
-            let Some(peer) = peer_opt else {
-                let mut lock = states_close.write().unwrap_or_else(|e| e.into_inner());
-                lock.insert(from_close.clone(), ConnectionState::Disconnected);
-                return;
-            };
-
-            let ice_state = peer.pc.ice_connection_state();
-            let has_active_channel = {
-                let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-                channels.values().any(|ch| {
-                    matches!(
-                        ch.ready_state(),
-                        web_sys::RtcDataChannelState::Open | web_sys::RtcDataChannelState::Connecting
-                    )
-                })
-            };
-
-            let hard_failure = matches!(
-                ice_state,
-                web_sys::RtcIceConnectionState::Failed | web_sys::RtcIceConnectionState::Closed
-            );
-
-            if !hard_failure && has_active_channel {
-                let mut lock = states_close.write().unwrap_or_else(|e| e.into_inner());
-                lock.insert(from_close.clone(), ConnectionState::Connecting);
-                tracing::warn!(
-                    "Transient DataChannel close for {}. peer kept alive.",
-                    from_close.0
-                );
-                return;
-            }
-
             tracing::warn!(
-                "DataChannel close for {} escalated to cleanup (ice={:?}, has_active_channel={}).",
-                from_close.0,
-                ice_state,
-                has_active_channel
+                "DataChannel to {} closed, triggering immediate disconnect.",
+                from_close.0
             );
+
+            let peer = {
+                let mut lock = peers_close.write().unwrap_or_else(|e| e.into_inner());
+                lock.remove(&from_close_for_cleanup)
+            };
+
+            let Some(peer) = peer else { return };
+
             {
                 let mut lock = states_close.write().unwrap_or_else(|e| e.into_inner());
-                lock.insert(from_close.clone(), ConnectionState::Disconnected);
-            }
-            {
-                let mut lock = peers_close.write().unwrap_or_else(|e| e.into_inner());
-                lock.remove(&from_close_for_cleanup);
+                lock.remove(&from_close);
             }
             {
                 let mut lock = senders_close.write().unwrap_or_else(|e| e.into_inner());
                 lock.remove(&from_close_for_cleanup);
             }
-            peer.pc.close();
+            peer.close_all();
+            // peerが確実に1回だけ取り出せた場合のみ切断通知を送る（重複防止済み）
+            crate::app::emit_peer_disconnected(from_close.clone());
         }) as Box<dyn FnMut(web_sys::Event)>);
         dc.set_onclose(Some(onclose.as_ref().unchecked_ref()));
         onclose.forget();
@@ -278,7 +276,13 @@ impl Peer {
                 let array = js_sys::Uint8Array::new(&ab);
                 let vec = array.to_vec();
                 STATS.add_receive(vec.len() as u64);
-                
+                STATS.add_world_receive_frame(&vec);
+                // Clone the Arc out of the mutex in a short-lived scope so the
+                // lock is released before on_event is called.  Calling on_event
+                // while still holding the lock can trigger re-entrant callbacks
+                // that try to acquire the same mutex, causing the WASM
+                // no_threads mutex to panic with "cannot recursively acquire
+                // mutex".
                 let maybe_h = {
                     let lock = handler.lock().unwrap_or_else(|e| e.into_inner());
                     lock.as_ref().cloned()

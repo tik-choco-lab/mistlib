@@ -134,8 +134,8 @@ async fn connect_sequential_respects_max_limit() {
 
 #[tokio::test]
 async fn connect_stress_limit_with_wait() {
-    use web_time::Duration;
     use tokio::time::sleep;
+    use web_time::Duration;
 
     let t = make_transport();
     const MAX: u32 = 30;
@@ -159,8 +159,8 @@ async fn connect_stress_limit_with_wait() {
 
 #[tokio::test]
 async fn disconnect_cleans_up_peers_and_states() {
-    use web_time::Duration;
     use tokio::time::sleep;
+    use web_time::Duration;
 
     let t = make_transport();
     let node = NodeId("peer_to_kill".to_string());

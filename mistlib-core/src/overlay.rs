@@ -1,12 +1,16 @@
 pub mod dnve3;
+pub mod message;
 pub mod node_store;
-pub mod optimizer;
+pub mod router;
 pub mod routing_table;
 pub mod transport;
 
+pub use message::{
+    OverlayEnvelope, OverlayMessage, OVERLAY_MSG_HEARTBEAT, OVERLAY_MSG_NODE_LIST,
+    OVERLAY_MSG_PING, OVERLAY_MSG_PONG, OVERLAY_MSG_POSITION, OVERLAY_MSG_REQUEST_NODE_LIST,
+};
 pub use node_store::{NodeInfo, NodeStore};
-pub use optimizer::OverlayOptimizer;
-pub use routing_table::RoutingTable;
+pub use router::OverlayRouter;
 pub use transport::OverlayTransport;
 
 use crate::action::OverlayAction;
@@ -36,8 +40,12 @@ pub trait TopologyStrategy {
         action_handler: Arc<dyn ActionHandler>,
     );
 
-    fn handle_message(&self, from: &NodeId, message_type: u32, payload: &[u8])
-        -> Vec<OverlayAction>;
+    fn handle_message(
+        &self,
+        from: &NodeId,
+        message_type: u32,
+        payload: &[u8],
+    ) -> Vec<OverlayAction>;
 
     fn tick(
         &self,
@@ -56,8 +64,12 @@ pub trait TopologyStrategy: Send + Sync {
         action_handler: Arc<dyn ActionHandler>,
     );
 
-    fn handle_message(&self, from: &NodeId, message_type: u32, payload: &[u8])
-        -> Vec<OverlayAction>;
+    fn handle_message(
+        &self,
+        from: &NodeId,
+        message_type: u32,
+        payload: &[u8],
+    ) -> Vec<OverlayAction>;
 
     fn tick(
         &self,

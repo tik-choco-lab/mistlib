@@ -11,6 +11,7 @@ pub const LOG_DEBUG: u32 = 0;
 pub fn dispatch_log(level: u32, message: &str) {
     if let Ok(callback_lock) = ENGINE.log_callback.try_lock() {
         if let Some(cb) = *callback_lock {
+            // SAFETY: cb is a valid function pointer registered by the caller; message is alive for the call duration.
             unsafe {
                 cb(level, message.as_ptr(), message.len());
             }

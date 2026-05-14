@@ -22,6 +22,12 @@ pub struct WantRegistry {
     peer_notifiers: PeerNotifiers,
 }
 
+impl Default for WantRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WantRegistry {
     pub fn new() -> Self {
         Self {
@@ -67,7 +73,7 @@ impl WantRegistry {
                 peers.push(peer_id);
             }
         }
-        
+
         if let Some(notifiers) = self.peer_notifiers.lock().unwrap().remove(cid) {
             for tx in notifiers {
                 let _ = tx.send(());
@@ -106,12 +112,11 @@ impl PeerResolver for NativePeerResolver {
     async fn resolve_block(&self, cid: &str) -> Option<Vec<u8>> {
         let rx_data = self.registry.register(cid);
 
-        
         let mut known_peers = self.registry.get_peers(cid);
         if known_peers.is_empty() {
             tracing::debug!("PeerResolver: Discovery phase for {}", cid);
             let rx_peer = self.registry.register_peer_notifier(cid);
-            
+
             let query_msg = build_query_message(cid);
             let _ = self
                 .transport
@@ -121,12 +126,10 @@ impl PeerResolver for NativePeerResolver {
                 )
                 .await;
 
-            
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx_peer).await;
             known_peers = self.registry.get_peers(cid);
         }
 
-        
         if !known_peers.is_empty() {
             use rand::seq::SliceRandom;
             let target = {
@@ -148,7 +151,10 @@ impl PeerResolver for NativePeerResolver {
                     .await;
             }
         } else {
-            tracing::debug!("PeerResolver: no peers discovered, broadcasting WANT for {}", cid);
+            tracing::debug!(
+                "PeerResolver: no peers discovered, broadcasting WANT for {}",
+                cid
+            );
             let mut want_msg = vec![MSG_WANT];
             want_msg.extend_from_slice(cid.as_bytes());
             let _ = self
@@ -160,8 +166,8 @@ impl PeerResolver for NativePeerResolver {
                 .await;
         }
 
-        
-        match tokio::time::timeout(std::time::Duration::from_millis(self.timeout_ms), rx_data).await {
+        match tokio::time::timeout(std::time::Duration::from_millis(self.timeout_ms), rx_data).await
+        {
             Ok(Ok(data)) => Some(data),
             _ => {
                 self.registry.cancel(cid);

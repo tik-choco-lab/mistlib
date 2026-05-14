@@ -4,6 +4,11 @@ use web_sys::MediaStreamTrack;
 pub const EVENT_RAW: u32 = crate::app::EVENT_RAW;
 pub const EVENT_OVERLAY: u32 = crate::app::EVENT_OVERLAY;
 pub const EVENT_NEIGHBORS: u32 = crate::app::EVENT_NEIGHBORS;
+pub const EVENT_AOI_ENTERED: u32 = crate::app::EVENT_AOI_ENTERED;
+pub const EVENT_AOI_LEFT: u32 = crate::app::EVENT_AOI_LEFT;
+pub const EVENT_PEER_CONNECTED: u32 = crate::app::EVENT_PEER_CONNECTED;
+pub const EVENT_PEER_DISCONNECTED: u32 = crate::app::EVENT_PEER_DISCONNECTED;
+pub const EVENT_AOI_NODES: u32 = crate::app::EVENT_AOI_NODES;
 pub const MEDIA_EVENT_TRACK_ADDED: u32 = crate::app::MEDIA_EVENT_TRACK_ADDED;
 pub const MEDIA_EVENT_TRACK_REMOVED: u32 = crate::app::MEDIA_EVENT_TRACK_REMOVED;
 

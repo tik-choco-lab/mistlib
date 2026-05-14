@@ -2,6 +2,7 @@ pub mod opfs;
 pub mod resolver;
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use js_sys::Uint8Array;
@@ -20,7 +21,7 @@ const DEFAULT_PEER_TIMEOUT_MS: u32 = 5_000;
 type StorageInstance = P2PStorage<WasmBlockStore, WasmPeerResolver>;
 
 thread_local! {
-    static STORAGE: RefCell<Option<StorageInstance>> = RefCell::new(None);
+    static STORAGE: RefCell<Option<Rc<StorageInstance>>> = RefCell::new(None);
     pub(crate) static WANT_REGISTRY: WantRegistry = WantRegistry::new();
 }
 
@@ -36,7 +37,7 @@ pub fn init_storage(
     let storage = P2PStorage::new(WasmBlockStore, resolver, capacity);
 
     STORAGE.with(|s| {
-        *s.borrow_mut() = Some(storage);
+        *s.borrow_mut() = Some(Rc::new(storage));
     });
 
     tracing::info!("Storage: initialized with capacity {} bytes", capacity);
@@ -170,31 +171,16 @@ pub fn handle_have(cid: String, data: Vec<u8>) {
 
 #[wasm_bindgen]
 pub async fn storage_add(name: String, data: &[u8]) -> Result<String, JsValue> {
-    let result = STORAGE.with(|s| {
-        if s.borrow().is_none() {
-            Err(JsValue::from_str("Storage not initialized"))
-        } else {
-            Ok(())
-        }
+    let storage = STORAGE.with(|s| -> Result<Rc<StorageInstance>, JsValue> {
+        s.borrow()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| JsValue::from_str("Storage not initialized"))
     })?;
-    let _ = result;
+    let data = data.to_vec();
 
-    let root_cid = STORAGE
-        .with(|s| -> Result<_, JsValue> {
-            let borrow = s.borrow();
-            let storage = borrow
-                .as_ref()
-                .ok_or_else(|| JsValue::from_str("Storage not initialized"))?;
-
-            Ok(storage as *const StorageInstance as usize)
-        })
-        .and_then(|ptr| {
-            let future = unsafe {
-                let storage = &*(ptr as *const StorageInstance);
-                storage.add(&name, data)
-            };
-            Ok(future)
-        })?
+    let root_cid = storage
+        .add(&name, &data)
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
@@ -203,20 +189,17 @@ pub async fn storage_add(name: String, data: &[u8]) -> Result<String, JsValue> {
 
 #[wasm_bindgen]
 pub async fn storage_get(root_cid: String) -> Result<Uint8Array, JsValue> {
-    let ptr = STORAGE.with(|s| -> Result<usize, JsValue> {
-        let borrow = s.borrow();
-        let storage = borrow
+    let storage = STORAGE.with(|s| -> Result<Rc<StorageInstance>, JsValue> {
+        s.borrow()
             .as_ref()
-            .ok_or_else(|| JsValue::from_str("Storage not initialized"))?;
-        Ok(storage as *const StorageInstance as usize)
+            .cloned()
+            .ok_or_else(|| JsValue::from_str("Storage not initialized"))
     })?;
 
-    let data = unsafe {
-        let storage = &*(ptr as *const StorageInstance);
-        storage.get(&root_cid)
-    }
-    .await
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let data = storage
+        .get(&root_cid)
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     Ok(Uint8Array::from(data.as_slice()))
 }

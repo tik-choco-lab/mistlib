@@ -11,10 +11,13 @@ pub const EVENT_NEIGHBORS: u32 = 4;
 pub const EVENT_AOI_ENTERED: u32 = 5;
 pub const EVENT_AOI_LEFT: u32 = 6;
 pub const EVENT_NODE_POSITION_UPDATED: u32 = 7;
+pub const EVENT_AOI_NODES: u32 = 8;
+pub const EVENT_ALL_CONNECTIONS_LOST: u32 = 9;
 
 pub fn dispatch_event(message_type: u32, from: &NodeId, data: &[u8]) {
     if let Ok(callback_lock) = ENGINE.global_callback.try_lock() {
         if let Some(cb) = *callback_lock {
+            // SAFETY: cb is a valid function pointer registered by the caller; from and data are alive for the call duration.
             unsafe {
                 cb(
                     message_type,
@@ -30,6 +33,7 @@ pub fn dispatch_event(message_type: u32, from: &NodeId, data: &[u8]) {
 
 pub fn on_connected_internal(node_id: NodeId) {
     ENGINE.runtime.spawn(async move {
+        ENGINE.ensure_node_registered(&node_id);
         let state_lock = ENGINE.state.read().await;
         if let EngineState::Running(ctx) = &*state_lock {
             if let Some(overlay) = ctx.overlay.as_ref() {
@@ -43,11 +47,6 @@ pub fn on_connected_internal(node_id: NodeId) {
 
 pub fn on_disconnected_internal(node_id: NodeId) {
     ENGINE.runtime.spawn(async move {
-        {
-            let mut store = ENGINE.node_store.lock().unwrap();
-            store.nodes.remove(&node_id);
-            store.last_updated.remove(&node_id);
-        }
         let state_lock = ENGINE.state.read().await;
         if let EngineState::Running(ctx) = &*state_lock {
             if let Some(overlay) = ctx.overlay.as_ref() {

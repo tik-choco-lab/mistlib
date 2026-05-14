@@ -15,6 +15,32 @@ pub struct NodeStore {
     pub last_updated: HashMap<NodeId, Instant>,
 }
 
+impl Default for NodeStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_node_refreshes_known_node_only() {
+        let mut store = NodeStore::new();
+        let known = NodeId("known".to_string());
+        let unknown = NodeId("unknown".to_string());
+
+        store.update_node_position(known.clone(), Vector3::zero());
+        assert!(store.touch_node(&known));
+        assert!(store.last_updated.contains_key(&known));
+
+        assert!(!store.touch_node(&unknown));
+        assert!(!store.nodes.contains_key(&unknown));
+        assert!(!store.last_updated.contains_key(&unknown));
+    }
+}
+
 impl NodeStore {
     pub fn new() -> Self {
         Self {
@@ -24,14 +50,22 @@ impl NodeStore {
     }
 
     pub fn update_node_position(&mut self, id: NodeId, position: Vector3) {
-        self.nodes.insert(
-            id.clone(),
-            NodeInfo {
+        self.nodes
+            .entry(id.clone())
+            .and_modify(|n| n.position = position)
+            .or_insert_with(|| NodeInfo {
                 id: id.clone(),
                 position,
-            },
-        );
+            });
         self.last_updated.insert(id, Instant::now());
+    }
+
+    pub fn touch_node(&mut self, id: &NodeId) -> bool {
+        if !self.nodes.contains_key(id) {
+            return false;
+        }
+        self.last_updated.insert(id.clone(), Instant::now());
+        true
     }
 
     pub fn get_connected_nodes_json(
@@ -79,6 +113,21 @@ impl NodeStore {
         let list: Vec<serde_json::Value> = nodes_map.into_values().collect();
         serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
     }
+    pub fn get_nodes_json(&self, ids: &std::collections::HashSet<NodeId>) -> String {
+        let result: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                let (x, y, z) = self
+                    .nodes
+                    .get(id)
+                    .map(|n| (n.position.x, n.position.y, n.position.z))
+                    .unwrap_or((0.0, 0.0, 0.0));
+                serde_json::json!({ "id": id.0, "x": x, "y": y, "z": z })
+            })
+            .collect();
+        serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string())
+    }
+
     pub fn retain_recent(&mut self, duration: web_time::Duration) {
         let now = Instant::now();
         self.nodes.retain(|id, _| {

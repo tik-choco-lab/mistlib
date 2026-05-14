@@ -172,7 +172,6 @@ impl PeerResolver for WasmPeerResolver {
 
         let rx_data = self.registry.register(cid);
 
-        
         let mut known_peers = self.registry.get_peers(cid);
         if known_peers.is_empty() {
             tracing::debug!("PeerResolver: Discovery phase for {}", cid);
@@ -197,7 +196,6 @@ impl PeerResolver for WasmPeerResolver {
             known_peers = self.registry.get_peers(cid);
         }
 
-        
         if !known_peers.is_empty() {
             use rand::seq::SliceRandom;
             let target = {
@@ -219,7 +217,10 @@ impl PeerResolver for WasmPeerResolver {
                     .await;
             }
         } else {
-            tracing::debug!("PeerResolver: no peers discovered, broadcasting WANT for {}", cid);
+            tracing::debug!(
+                "PeerResolver: no peers discovered, broadcasting WANT for {}",
+                cid
+            );
             let mut want_msg = vec![MSG_WANT];
             want_msg.extend_from_slice(cid.as_bytes());
             let _ = self
@@ -231,7 +232,6 @@ impl PeerResolver for WasmPeerResolver {
                 .await;
         }
 
-        
         let timeout = gloo_timers::future::TimeoutFuture::new(self.timeout_ms);
         futures::select! {
             result = futures::FutureExt::fuse(rx_data) => result.ok(),

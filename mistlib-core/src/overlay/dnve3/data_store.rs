@@ -1,32 +1,30 @@
 use super::spatial_density::SpatialDensityData;
 use crate::types::NodeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use web_time::Instant;
 
-pub struct NeighborDensityInfo {
+pub struct DensityPeerInfo {
     pub data: SpatialDensityData,
     pub last_message_time: Instant,
 }
 
+#[derive(Default)]
 pub struct DNVE3DataStore {
     pub self_density: Option<SpatialDensityData>,
     pub merged_density_map: Option<Vec<f32>>,
-    pub neighbors: HashMap<NodeId, NeighborDensityInfo>,
+    pub density_peers: HashMap<NodeId, DensityPeerInfo>,
+    pub aoi_nodes: HashSet<NodeId>,
 }
 
 impl DNVE3DataStore {
     pub fn new() -> Self {
-        Self {
-            self_density: None,
-            merged_density_map: None,
-            neighbors: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn add_or_update_neighbor(&mut self, id: NodeId, data: SpatialDensityData) {
-        self.neighbors.insert(
+        self.density_peers.insert(
             id,
-            NeighborDensityInfo {
+            DensityPeerInfo {
                 data,
                 last_message_time: Instant::now(),
             },
@@ -34,11 +32,11 @@ impl DNVE3DataStore {
     }
 
     pub fn remove_neighbor(&mut self, id: &NodeId) {
-        self.neighbors.remove(id);
+        self.density_peers.remove(id);
     }
 
     pub fn update_last_message_time(&mut self, id: &NodeId) {
-        if let Some(info) = self.neighbors.get_mut(id) {
+        if let Some(info) = self.density_peers.get_mut(id) {
             info.last_message_time = Instant::now();
         }
     }
