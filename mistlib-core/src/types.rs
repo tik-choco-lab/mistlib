@@ -1,4 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+// Re-exported so the storage layer can depend on `crate::types::Vector3`
+// without importing `overlay::dnve3` directly (storage stays decoupled from
+// the DNVE3 overlay layer; see docs/specs/SPEC-16-spatial-storage-eviction.md).
+pub use crate::overlay::dnve3::spatial_density::Vector3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
@@ -30,12 +36,31 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+/// Raw FFI delivery-method codes for `DeliveryMethod::from_u32`, matching
+/// the enum's own `#[repr(u32)]` discriminants below.
+pub const DELIVERY_RELIABLE: u32 = 0;
+pub const DELIVERY_UNRELIABLE_ORDERED: u32 = 1;
+pub const DELIVERY_UNRELIABLE: u32 = 2;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum DeliveryMethod {
     ReliableOrdered = 0,
     UnreliableOrdered = 1,
     Unreliable = 2,
+}
+
+impl DeliveryMethod {
+    /// Converts a raw FFI `u32` delivery-method code into a `DeliveryMethod`,
+    /// falling back to `Unreliable` for any value other than the two
+    /// explicit codes above -- mirrors the native/wasm FFI boundary contract.
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            DELIVERY_RELIABLE => DeliveryMethod::ReliableOrdered,
+            DELIVERY_UNRELIABLE_ORDERED => DeliveryMethod::UnreliableOrdered,
+            _ => DeliveryMethod::Unreliable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,7 +88,13 @@ pub trait HostSendSync: Send + Sync {}
 #[cfg(not(target_arch = "wasm32"))]
 impl<T: Send + Sync + ?Sized> HostSendSync for T {}
 
+#[cfg(not(target_arch = "wasm32"))]
+pub type SessionReestablishedHook = Arc<dyn Fn() + Send + Sync>;
+
 #[cfg(target_arch = "wasm32")]
 pub trait HostSendSync {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> HostSendSync for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub type SessionReestablishedHook = Arc<dyn Fn()>;

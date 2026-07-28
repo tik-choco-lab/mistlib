@@ -7,7 +7,7 @@ impl DNVE3Exchanger {
         if let Ok(pos) = bincode::deserialize::<Vector3>(payload) {
             self.node_store
                 .lock()
-                .unwrap()
+                .expect("node_store lock poisoned")
                 .update_node_position(from, pos);
         }
     }

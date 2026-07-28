@@ -45,4 +45,18 @@ impl OverlayRouter {
             .flat_map(|s| s.tick(config, connected_node_states))
             .collect()
     }
+
+    /// Notifies strategies that a peer disconnect has been confirmed. Lets a
+    /// strategy such as DNVE3 trigger an immediate re-selection instead of
+    /// waiting for the next periodic `tick`.
+    pub fn notify_peer_disconnected(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        self.strategies
+            .iter()
+            .flat_map(|s| s.on_peer_disconnected(config, connected_node_states))
+            .collect()
+    }
 }

@@ -1,0 +1,14 @@
+# cargo-nextest configuration. The `ci` profile is used by GitHub Actions.
+
+[profile.ci]
+# Absorb transient failures via retry; keep running so one flake doesn't mask other results.
+retries = 2
+fail-fast = false
+
+# The real-timing WebRTC tests do live ICE/DTLS handshakes and occasionally miss their
+# connection deadline on shared CI runners (observed: "A did not reach Connected state").
+# Give the three known-flaky ones extra retries — a genuine regression still fails (it will
+# not pass in five attempts), but timing noise no longer reddens the run.
+[[profile.ci.overrides]]
+filter = 'test(/renegotiat|datachannel_close|ice_restart/)'
+retries = 4

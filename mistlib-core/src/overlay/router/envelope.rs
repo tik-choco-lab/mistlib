@@ -5,6 +5,12 @@ use crate::signaling::MessageContent;
 use crate::types::{DeliveryMethod, NodeId};
 use bytes::Bytes;
 
+#[derive(Debug, Clone)]
+pub struct HandleEnvelopeResult {
+    pub actions: Vec<OverlayAction>,
+    pub should_deliver: bool,
+}
+
 enum ForwardTargets {
     Broadcast(Vec<NodeId>),
     Unicast(NodeId),
@@ -18,7 +24,14 @@ impl ForwardTargets {
 }
 
 impl OverlayRouter {
-    pub fn handle_envelope(&self, envelope: OverlayEnvelope, from: NodeId) -> Vec<OverlayAction> {
+    pub fn handle_envelope(&self, envelope: OverlayEnvelope, from: NodeId) -> HandleEnvelopeResult {
+        if !self.mark_seen(&envelope) {
+            return HandleEnvelopeResult {
+                actions: Vec::new(),
+                should_deliver: false,
+            };
+        }
+
         let is_broadcast = envelope.to.is_broadcast();
         let mut actions = self.deliver_to_strategies(&envelope, is_broadcast);
 
@@ -27,7 +40,28 @@ impl OverlayRouter {
             actions.extend(self.forward_actions(envelope, targets));
         }
 
-        actions
+        HandleEnvelopeResult {
+            actions,
+            should_deliver: true,
+        }
+    }
+
+    fn mark_seen(&self, envelope: &OverlayEnvelope) -> bool {
+        if envelope.from == self.local_node_id {
+            return false;
+        }
+
+        self.seen_envelopes
+            .lock()
+            .expect("seen_envelopes lock poisoned")
+            .check_and_insert(&envelope.from, envelope.msg_id)
+    }
+
+    pub(crate) fn remember_outgoing(&self, envelope: &OverlayEnvelope) {
+        self.seen_envelopes
+            .lock()
+            .expect("seen_envelopes lock poisoned")
+            .check_and_insert(&envelope.from, envelope.msg_id);
     }
 
     pub fn learn_route(&self, source: &NodeId, from: &NodeId) {
@@ -122,7 +156,7 @@ impl OverlayRouter {
         }
 
         envelope.hop_count -= 1;
-        let Ok(serialized) = bincode::serialize(&envelope) else {
+        let Ok(serialized) = crate::overlay::wire::serialize(&envelope) else {
             return Vec::new();
         };
         let data = Bytes::from(serialized);

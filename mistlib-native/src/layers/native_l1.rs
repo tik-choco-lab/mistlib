@@ -13,6 +13,7 @@ pub struct NativeL1Transport {
     transport: Arc<dyn Transport>,
     node_store: Arc<Mutex<NodeStore>>,
     local_id: NodeId,
+    room_id: String,
 }
 
 impl NativeL1Transport {
@@ -20,11 +21,13 @@ impl NativeL1Transport {
         transport: Arc<dyn Transport>,
         node_store: Arc<Mutex<NodeStore>>,
         local_id: NodeId,
+        room_id: String,
     ) -> Self {
         Self {
             transport,
             node_store,
             local_id,
+            room_id,
         }
     }
 }
@@ -52,17 +55,18 @@ impl L1Transport for NativeL1Transport {
 
 impl L1Notifier for NativeL1Transport {
     fn notify_connected(&self, node_id: &NodeId) {
-        crate::events::on_connected_internal(node_id.clone());
+        crate::events::on_connected_internal(self.room_id.clone(), node_id.clone());
     }
 
     fn notify_disconnected(&self, node_id: &NodeId) {
-        crate::events::on_disconnected_internal(node_id.clone());
+        crate::events::on_disconnected_internal(self.room_id.clone(), node_id.clone());
     }
 
     fn notify_node_position_updated(&self, node_id: &NodeId, x: f32, y: f32, z: f32) {
         let payload = format!("{{\"x\":{}, \"y\":{}, \"z\":{}}}", x, y, z);
         crate::events::dispatch_event(
             crate::events::EVENT_NODE_POSITION_UPDATED,
+            &self.room_id,
             node_id,
             payload.as_bytes(),
         );

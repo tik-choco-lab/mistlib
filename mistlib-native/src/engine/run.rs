@@ -1,67 +1,79 @@
 use std::sync::Arc;
 
-use mistlib_core::action::OverlayAction;
-use mistlib_core::overlay::node_store::NodeStore;
-use mistlib_core::overlay::ActionHandler;
-use mistlib_core::signaling::MessageContent;
+use mistlib_core::signaling::{MessageContent, Signaler};
 use mistlib_core::transport::{NetworkEvent, Transport};
-use mistlib_core::types::NodeId;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc;
 
 use crate::runtime::TokioRuntime;
 
-use super::{EngineState, RunningContext};
+use super::SessionCtx;
 
 struct DummyActionHandler;
-impl ActionHandler for DummyActionHandler {
-    fn handle_action(&self, _action: OverlayAction) {}
+impl mistlib_core::overlay::ActionHandler for DummyActionHandler {
+    fn handle_action(&self, _action: mistlib_core::action::OverlayAction) {}
 }
 
-struct NetworkEventHandlerAdapter(mpsc::Sender<NetworkEvent>);
+struct NetworkEventHandlerAdapter(mpsc::UnboundedSender<NetworkEvent>);
 impl mistlib_core::transport::NetworkEventHandler for NetworkEventHandlerAdapter {
     fn on_event(&self, event: NetworkEvent) {
-        let _ = self.0.try_send(event);
+        if self.0.send(event).is_err() {
+            tracing::debug!("dropping network event: engine receiver closed");
+            mistlib_core::stats::STATS.add_dropped_receive_event();
+        }
     }
 }
 
 impl super::MistEngine {
-    pub async fn run(&self, ctx: Arc<RunningContext>) -> crate::error::Result<()> {
-        let (network_tx, network_rx) = mpsc::channel::<NetworkEvent>(8192);
+    /// Starts one session's stack (bootstrap signaling, transports, overlay
+    /// tick machinery, room announce), then pumps that session's network
+    /// events until it's torn down. `ctx.cancel` (set by
+    /// `leave_room`/`leave_room_id`) is what ends this loop and the
+    /// signaling loop spawned alongside it -- each session runs entirely
+    /// independently of any other active room.
+    pub async fn run(&self, ctx: Arc<SessionCtx>) -> crate::error::Result<()> {
+        let (network_tx, network_rx) = mpsc::unbounded_channel::<NetworkEvent>();
         let (sig_tx, sig_rx) = mpsc::channel::<MessageContent>(1024);
 
-        self.transition_to_running(ctx.clone()).await;
-        self.connect_signaling_server(&ctx, sig_tx).await?;
+        ctx.reset_connection_loss_tracking();
+        self.connect_bootstrap_signaler(&ctx, sig_tx).await?;
         self.start_transports(&ctx, network_tx).await?;
         self.start_overlay(&ctx).await;
         self.announce_to_room(&ctx).await?;
         self.spawn_signaling_loop(sig_rx, ctx.clone());
-        self.process_network_events(network_rx).await;
+        self.process_network_events(network_rx, ctx).await;
 
         Ok(())
     }
 
-    async fn transition_to_running(&self, ctx: Arc<RunningContext>) {
-        let mut state_lock = self.state.write().await;
-        *state_lock = EngineState::Running(ctx);
-        self.reset_connection_loss_tracking();
-    }
-
-    async fn connect_signaling_server(
+    async fn connect_bootstrap_signaler(
         &self,
-        ctx: &RunningContext,
+        ctx: &SessionCtx,
         sig_tx: mpsc::Sender<MessageContent>,
     ) -> crate::error::Result<()> {
-        if let Some(ws) = ctx.websocket_signaler.as_ref() {
-            ws.connect(sig_tx).await?;
+        if let Some(signaler) = ctx.bootstrap_signaler.as_ref() {
+            if let Some(webrtc) = ctx.webrtc_transport.as_ref() {
+                let webrtc = webrtc.clone();
+                signaler.set_on_session_reestablished(Arc::new(move || {
+                    let webrtc = webrtc.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = webrtc.announce_to_room().await {
+                            tracing::warn!(
+                                "NativeEngine: signaling reannounce failed after reconnect: {:?}",
+                                err
+                            );
+                        }
+                    });
+                }));
+            }
+            signaler.connect(sig_tx).await?;
         }
         Ok(())
     }
 
     async fn start_transports(
         &self,
-        ctx: &RunningContext,
-        network_tx: mpsc::Sender<NetworkEvent>,
+        ctx: &SessionCtx,
+        network_tx: mpsc::UnboundedSender<NetworkEvent>,
     ) -> crate::error::Result<()> {
         let adapter = Arc::new(NetworkEventHandlerAdapter(network_tx));
         if let Some(wt) = ctx.webrtc_transport.as_ref() {
@@ -71,7 +83,7 @@ impl super::MistEngine {
         Ok(())
     }
 
-    async fn start_overlay(&self, ctx: &RunningContext) {
+    async fn start_overlay(&self, ctx: &SessionCtx) {
         if let Some(ov) = ctx.overlay.as_ref() {
             let config = Arc::new(self.config.lock().unwrap().clone());
             let runtime = Arc::new(TokioRuntime::new(self.runtime.handle().clone()));
@@ -80,7 +92,7 @@ impl super::MistEngine {
         }
     }
 
-    async fn announce_to_room(&self, ctx: &RunningContext) -> crate::error::Result<()> {
+    async fn announce_to_room(&self, ctx: &SessionCtx) -> crate::error::Result<()> {
         if let Some(wt) = ctx.webrtc_transport.as_ref() {
             wt.announce_to_room().await?;
         }
@@ -90,33 +102,26 @@ impl super::MistEngine {
     pub(super) fn spawn_signaling_loop(
         &self,
         mut sig_rx: mpsc::Receiver<MessageContent>,
-        ctx: Arc<RunningContext>,
+        ctx: Arc<SessionCtx>,
     ) {
         let handler = ctx.ws_signaling_handler.clone();
-        let node_store = self.node_store.clone();
+        let cancel = ctx.cancel.clone();
 
         self.runtime.handle().spawn(async move {
-            while let Some(msg) = sig_rx.recv().await {
-                if let MessageContent::Data(ref d) = msg {
-                    register_node_if_new(&node_store, &d.sender_id);
-                }
-                if let Err(err) = handler.handle_message(msg).await {
-                    tracing::warn!("NativeEngine: ws signaling handler failed: {:?}", err);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    msg = sig_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let MessageContent::Data(ref d) = msg {
+                            ctx.ensure_node_registered(&d.sender_id);
+                        }
+                        if let Err(err) = handler.handle_message(msg).await {
+                            tracing::warn!("NativeEngine: ws signaling handler failed: {:?}", err);
+                        }
+                    }
                 }
             }
         });
-    }
-}
-
-fn register_node_if_new(node_store: &Arc<StdMutex<NodeStore>>, node_id: &NodeId) {
-    if node_id.is_server() {
-        return;
-    }
-    let mut store = node_store.lock().unwrap();
-    if !store.nodes.contains_key(node_id) {
-        store.update_node_position(
-            node_id.clone(),
-            mistlib_core::overlay::dnve3::Vector3::zero(),
-        );
     }
 }

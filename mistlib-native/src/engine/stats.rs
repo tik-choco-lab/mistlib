@@ -3,8 +3,6 @@ use std::fs;
 
 use mistlib_core::stats::{EngineStats, NodeStats, SctpStats};
 
-use super::EngineState;
-
 impl super::MistEngine {
     fn current_memory_mb() -> f32 {
         let Ok(status) = fs::read_to_string("/proc/self/status") else {
@@ -23,6 +21,9 @@ impl super::MistEngine {
             .unwrap_or(0.0)
     }
 
+    /// Stats stay a process-wide aggregate across all active sessions (v1;
+    /// see SPEC-15): per-room SCTP/connection-state maps are merged, so a
+    /// NodeId connected in more than one room collapses to a single entry.
     pub async fn get_stats_json(&self) -> String {
         let snapshot = mistlib_core::stats::STATS.snapshot_and_reset();
 
@@ -32,70 +33,70 @@ impl super::MistEngine {
             .map(|(k, v)| (k.0.clone(), *v))
             .collect();
 
-        let t_lock = std::time::Instant::now();
-        let wt_ref = {
-            let state_lock = self.state.read().await;
-            match &*state_lock {
-                EngineState::Initialized(ctx) | EngineState::Running(ctx) => {
-                    ctx.webrtc_transport.clone()
-                }
-                _ => None,
-            }
-        };
-        let lock_ms = t_lock.elapsed().as_millis();
+        let sessions = self.sessions_snapshot().await;
 
-        let t_sctp = std::time::Instant::now();
-        let (
-            mut sctp_raw,
-            connection_states,
-            diag_peers,
-            diag_connection_states,
-            diag_pending_candidates,
-        ) = if let Some(wt) = wt_ref.as_ref() {
+        let mut sctp_raw = HashMap::new();
+        let mut connection_states = HashMap::new();
+        let mut diag_peers = 0usize;
+        let mut diag_connection_states = 0usize;
+        let mut diag_pending_candidates = 0usize;
+
+        for (room_id, ctx) in &sessions {
+            let Some(wt) = ctx.webrtc_transport.as_ref() else {
+                continue;
+            };
+
+            let t_sctp = std::time::Instant::now();
             let stats_future = async {
                 let sctp = wt.get_sctp_stats().await;
                 let peers = wt.peers.read().await.len();
-                let (connection_states, states) = {
+                let (states_json, states_len) = {
                     let states_guard = wt.connection_states.read().unwrap();
-                    let connection_states = states_guard
+                    let map = states_guard
                         .iter()
                         .map(|(node_id, state)| (node_id.0.clone(), state.to_string()))
                         .collect::<HashMap<_, _>>();
-                    (connection_states, states_guard.len())
+                    (map, states_guard.len())
                 };
                 let cands = wt.pending_candidates.read().await.len();
-                (sctp, connection_states, peers, states, cands)
+                (sctp, states_json, peers, states_len, cands)
             };
-            match tokio::time::timeout(std::time::Duration::from_millis(500), stats_future).await {
-                Ok(result) => result,
-                Err(_) => {
-                    let states_guard = wt.connection_states.read().unwrap();
-                    let connection_states = states_guard
-                        .iter()
-                        .map(|(node_id, state)| (node_id.0.clone(), state.to_string()))
-                        .collect::<HashMap<_, _>>();
-                    let states = states_guard.len();
-                    tracing::error!(
-                        "[Diag] get_stats_json TIMEOUT (500ms) lock={}ms conn_states={}",
-                        lock_ms,
-                        states
-                    );
-                    (HashMap::new(), connection_states, 0, states, 0)
-                }
+            let (sctp, states_json, peers, states_len, cands) =
+                match tokio::time::timeout(std::time::Duration::from_millis(500), stats_future)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let states_guard = wt.connection_states.read().unwrap();
+                        let map = states_guard
+                            .iter()
+                            .map(|(node_id, state)| (node_id.0.clone(), state.to_string()))
+                            .collect::<HashMap<_, _>>();
+                        let len = states_guard.len();
+                        tracing::error!(
+                            "[Diag] get_stats_json TIMEOUT (500ms) room={} conn_states={}",
+                            room_id,
+                            len
+                        );
+                        (HashMap::new(), map, 0, len, 0)
+                    }
+                };
+            let sctp_ms = t_sctp.elapsed().as_millis();
+            if sctp_ms > 100 {
+                tracing::error!(
+                    "[Diag] get_stats_json slow: room={} sctp={}ms peers={} conn_states={}",
+                    room_id,
+                    sctp_ms,
+                    peers,
+                    states_len
+                );
             }
-        } else {
-            (HashMap::new(), HashMap::new(), 0, 0, 0)
-        };
-        let sctp_ms = t_sctp.elapsed().as_millis();
 
-        if lock_ms > 50 || sctp_ms > 100 {
-            tracing::error!(
-                "[Diag] get_stats_json slow: lock={}ms sctp={}ms peers={} conn_states={}",
-                lock_ms,
-                sctp_ms,
-                diag_peers,
-                diag_connection_states
-            );
+            sctp_raw.extend(sctp);
+            connection_states.extend(states_json);
+            diag_peers += peers;
+            diag_connection_states += states_len;
+            diag_pending_candidates += cands;
         }
 
         let nodes = sctp_raw
@@ -115,7 +116,6 @@ impl super::MistEngine {
                     messages_received: s.messages_received,
                     bytes_sent: s.bytes_sent,
                     bytes_received: s.bytes_received,
-                    estimated_packet_loss: 0,
                     state: s.state.to_string(),
                 });
                 NodeStats {
@@ -138,6 +138,8 @@ impl super::MistEngine {
             relay_send_bits: snapshot.relay_send_bits,
             relay_receive_bits: snapshot.relay_receive_bits,
             relay_message_count: snapshot.relay_message_count,
+            dropped_receive_events: snapshot.dropped_receive_events,
+            dropped_ffi_events: snapshot.dropped_ffi_events,
             nodes,
             diag_peers,
             diag_connection_states,

@@ -1,11 +1,10 @@
+# mistlib (公開リポジトリ) の .gitignore
+#
+# このファイルは mistlib-dev の publish/overlay/ が正。
+# 公開リポジトリ側で直接編集しても次回の `just publish-sync` で上書きされる。
+
 /target
-.venv/
-__pycache__/
-references/
+/dist
+mistlib-wasm/pkg/
 .env
 .env.local
-*.local.json
-*.txt
-cargo-licenses.json
-memray_*
-test_wrapper.py

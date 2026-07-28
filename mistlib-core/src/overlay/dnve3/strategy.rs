@@ -25,8 +25,14 @@ pub struct DNVE3Strategy {
     heartbeat_due_at: Mutex<Option<Instant>>,
     balancer_due_at: Mutex<Option<Instant>>,
     node_list_due_at: Mutex<Option<Instant>>,
+    ping_due_at: Mutex<Option<Instant>>,
+    node_list_adaptive: tick::node_list_adaptive::NodeListAdaptiveTracker,
     /// handle_message は config を受け取らないため、tick() で最新値に更新する
     connection_mode: Mutex<ConnectionMode>,
+    /// Same reason as `connection_mode`: `handle_message`'s PONG arm needs the
+    /// configured liveness threshold to decide whether a recovering peer was
+    /// latched-suspect, but only `tick()` receives `config`.
+    ping_timeout_count: Mutex<u32>,
 }
 
 impl DNVE3Strategy {
@@ -53,7 +59,10 @@ impl DNVE3Strategy {
             heartbeat_due_at: Mutex::new(None),
             balancer_due_at: Mutex::new(None),
             node_list_due_at: Mutex::new(None),
+            ping_due_at: Mutex::new(None),
+            node_list_adaptive: tick::node_list_adaptive::NodeListAdaptiveTracker::new(),
             connection_mode: Mutex::new(config.dnve.connection_mode),
+            ping_timeout_count: Mutex::new(config.limits.ping_timeout_count),
         }
     }
 
@@ -69,6 +78,20 @@ impl DNVE3Strategy {
             .connection_mode
             .lock()
             .expect("connection_mode lock poisoned")
+    }
+
+    pub(super) fn remember_ping_timeout_count(&self, timeout_count: u32) {
+        *self
+            .ping_timeout_count
+            .lock()
+            .expect("ping_timeout_count lock poisoned") = timeout_count;
+    }
+
+    pub(super) fn current_ping_timeout_count(&self) -> u32 {
+        *self
+            .ping_timeout_count
+            .lock()
+            .expect("ping_timeout_count lock poisoned")
     }
 }
 
@@ -102,8 +125,7 @@ impl TopologyStrategy for DNVE3Strategy {
                 ping::handle_ping(&self.local_node_id, from.clone(), self.hop_count, payload)
             }
             crate::overlay::OVERLAY_MSG_PONG => {
-                ping::handle_pong(from.clone(), payload);
-                vec![]
+                ping::handle_pong(from.clone(), payload, self.current_ping_timeout_count())
             }
             _ => vec![],
         }
@@ -116,6 +138,7 @@ impl TopologyStrategy for DNVE3Strategy {
     ) -> Vec<OverlayAction> {
         let mode = config.dnve.connection_mode;
         self.remember_connection_mode(mode);
+        self.remember_ping_timeout_count(config.limits.ping_timeout_count);
 
         let now = Instant::now();
         let connected_nodes = Self::connected_node_ids(connected_node_states);
@@ -129,5 +152,17 @@ impl TopologyStrategy for DNVE3Strategy {
             mode,
             density_guidance.as_ref(),
         )
+    }
+
+    fn on_peer_disconnected(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        let mode = config.dnve.connection_mode;
+        self.remember_connection_mode(mode);
+        let density_guidance = self.maybe_density_guidance(config, mode);
+
+        self.force_immediate_rebalance(config, connected_node_states, density_guidance.as_ref())
     }
 }

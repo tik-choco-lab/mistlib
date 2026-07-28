@@ -12,15 +12,15 @@ pub enum SignalingRoute {
 }
 
 pub struct RoutedSignaler {
-    websocket: Arc<dyn Signaler>,
+    bootstrap: Arc<dyn Signaler>,
     overlay: Arc<OverlayTransport>,
     peer_routes: Mutex<HashMap<NodeId, SignalingRoute>>,
 }
 
 impl RoutedSignaler {
-    pub fn new(websocket: Arc<dyn Signaler>, overlay: Arc<OverlayTransport>) -> Self {
+    pub fn new(bootstrap: Arc<dyn Signaler>, overlay: Arc<OverlayTransport>) -> Self {
         Self {
-            websocket,
+            bootstrap,
             overlay,
             peer_routes: Mutex::new(HashMap::new()),
         }
@@ -50,7 +50,7 @@ impl RoutedSignaler {
 impl Signaler for RoutedSignaler {
     async fn send_signaling(&self, to: &NodeId, msg: MessageContent) -> crate::error::Result<()> {
         if to.is_server() || to.is_broadcast() {
-            return self.websocket.send_signaling(to, msg).await;
+            return self.bootstrap.send_signaling(to, msg).await;
         }
 
         if self.overlay.has_signaling_route(to) {
@@ -58,13 +58,48 @@ impl Signaler for RoutedSignaler {
         }
 
         match self.route_for(to) {
-            Some(SignalingRoute::WebSocket) => self.websocket.send_signaling(to, msg).await,
-            Some(SignalingRoute::Overlay) | None => self.overlay.send_signaling(to, msg).await,
+            Some(SignalingRoute::WebSocket) => self.bootstrap.send_signaling(to, msg).await,
+            // `Some(Overlay)` means overlay signaling worked for this peer at
+            // some point in the past, not that it's live right now (we
+            // already know it isn't -- `has_signaling_route` above just
+            // returned false). That gap is routine and short-lived: the
+            // routing table's connected-node set is refreshed by a periodic
+            // tick (see `MistEngine::tick`, ~1s cadence) rather than the
+            // instant a peer's transport connection comes up, and it is
+            // briefly empty again while that same peer is mid-reconnect.
+            // `to` here is always a direct WebRTC signaling counterpart (an
+            // Offer/Answer/Candidate/Request target), never a third node
+            // being relayed through someone else, so bootstrap WebSocket is
+            // guaranteed reachable for it (every such peer was introduced via
+            // a WebSocket `Request`/`Offer` before any overlay route could
+            // ever have been recorded for it -- see `remember_route`).
+            // Falling back here turns "silently drop the exact signaling
+            // needed to recover this peer's own connection" into "briefly use
+            // the always-available bootstrap channel until the overlay route
+            // resyncs" -- self-limited to the reconnect window, not a general
+            // WebSocket fallback for live overlay routing.
+            //
+            // A peer with no recorded route at all (`None`) is different: it
+            // may be a brand-new node discovered purely through the overlay
+            // mesh (e.g. the cascade-distribution relay path) that we have
+            // never directly exchanged signaling with, so it keeps the
+            // original no-silent-fallback behavior and fails with
+            // `RouteNotFound` when overlay has no next hop.
+            Some(SignalingRoute::Overlay) => self.bootstrap.send_signaling(to, msg).await,
+            None => self.overlay.send_signaling(to, msg).await,
         }
     }
 
+    async fn reset_session(&self) -> crate::error::Result<()> {
+        self.peer_routes
+            .lock()
+            .expect("signaling route lock poisoned")
+            .clear();
+        self.bootstrap.reset_session().await
+    }
+
     async fn close(&self) -> crate::error::Result<()> {
-        self.websocket.close().await
+        self.bootstrap.close().await
     }
 }
 
@@ -100,176 +135,4 @@ impl SignalingHandler for RoutedSignalingHandler {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::action::OverlayAction;
-    use crate::config::Config;
-    use crate::overlay::{ActionHandler, OverlayRouter};
-    use crate::signaling::{SignalingData, SignalingType};
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct RecordingSignaler {
-        sent: Mutex<Vec<NodeId>>,
-    }
-
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    impl Signaler for RecordingSignaler {
-        async fn send_signaling(
-            &self,
-            to: &NodeId,
-            _msg: MessageContent,
-        ) -> crate::error::Result<()> {
-            self.sent.lock().unwrap().push(to.clone());
-            Ok(())
-        }
-
-        async fn close(&self) -> crate::error::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingActionHandler {
-        actions: Mutex<Vec<OverlayAction>>,
-    }
-
-    impl ActionHandler for RecordingActionHandler {
-        fn handle_action(&self, action: OverlayAction) {
-            self.actions.lock().unwrap().push(action);
-        }
-    }
-
-    fn signaling_msg(from: &str, to: &str) -> MessageContent {
-        MessageContent::Data(SignalingData {
-            sender_id: NodeId(from.to_string()),
-            receiver_id: NodeId(to.to_string()),
-            room_id: "room".to_string(),
-            data: "{}".to_string(),
-            signaling_type: SignalingType::Offer,
-        })
-    }
-
-    fn make_relay(
-        handler: Arc<RecordingActionHandler>,
-        websocket: Arc<RecordingSignaler>,
-    ) -> (Arc<RoutedSignaler>, Arc<OverlayRouter>) {
-        let router = Arc::new(OverlayRouter::new(
-            &Config::new_default(),
-            Arc::new(Mutex::new(crate::overlay::node_store::NodeStore::new())),
-            NodeId("local".to_string()),
-        ));
-        let overlay = Arc::new(OverlayTransport {
-            router: router.clone(),
-            action_handler: handler,
-        });
-        (Arc::new(RoutedSignaler::new(websocket, overlay)), router)
-    }
-
-    #[test]
-    fn server_signaling_uses_websocket_for_bootstrap() {
-        let handler = Arc::new(RecordingActionHandler::default());
-        let websocket = Arc::new(RecordingSignaler::default());
-        let (relay, _router) = make_relay(handler.clone(), websocket.clone());
-
-        futures::executor::block_on(relay.send_signaling(
-            &NodeId("server".to_string()),
-            signaling_msg("local", "server"),
-        ))
-        .unwrap();
-
-        assert_eq!(
-            websocket.sent.lock().unwrap().as_slice(),
-            &[NodeId("server".to_string())]
-        );
-        assert!(handler.actions.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn websocket_ingress_peer_uses_websocket_response_path() {
-        let handler = Arc::new(RecordingActionHandler::default());
-        let websocket = Arc::new(RecordingSignaler::default());
-        let (relay, _router) = make_relay(handler.clone(), websocket.clone());
-        relay.remember_route(&NodeId("peer-a".to_string()), SignalingRoute::WebSocket);
-
-        futures::executor::block_on(relay.send_signaling(
-            &NodeId("peer-a".to_string()),
-            signaling_msg("local", "peer-a"),
-        ))
-        .unwrap();
-
-        assert_eq!(
-            websocket.sent.lock().unwrap().as_slice(),
-            &[NodeId("peer-a".to_string())]
-        );
-        assert!(handler.actions.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn overlay_route_overrides_stale_websocket_ingress_route() {
-        let handler = Arc::new(RecordingActionHandler::default());
-        let websocket = Arc::new(RecordingSignaler::default());
-        let (relay, router) = make_relay(handler.clone(), websocket.clone());
-        relay.remember_route(&NodeId("peer-a".to_string()), SignalingRoute::WebSocket);
-        router
-            .routing_table
-            .lock()
-            .unwrap()
-            .on_connected(NodeId("peer-a".to_string()));
-
-        futures::executor::block_on(relay.send_signaling(
-            &NodeId("peer-a".to_string()),
-            signaling_msg("local", "peer-a"),
-        ))
-        .unwrap();
-
-        assert!(websocket.sent.lock().unwrap().is_empty());
-        assert!(matches!(
-            handler.actions.lock().unwrap().as_slice(),
-            [OverlayAction::SendMessage { to, .. }] if *to == NodeId("peer-a".to_string())
-        ));
-    }
-
-    #[test]
-    fn overlay_ingress_peer_uses_overlay_response_path() {
-        let handler = Arc::new(RecordingActionHandler::default());
-        let websocket = Arc::new(RecordingSignaler::default());
-        let (relay, router) = make_relay(handler.clone(), websocket.clone());
-        router
-            .routing_table
-            .lock()
-            .unwrap()
-            .on_connected(NodeId("peer-a".to_string()));
-        relay.remember_route(&NodeId("peer-a".to_string()), SignalingRoute::Overlay);
-
-        futures::executor::block_on(relay.send_signaling(
-            &NodeId("peer-a".to_string()),
-            signaling_msg("local", "peer-a"),
-        ))
-        .unwrap();
-
-        assert!(websocket.sent.lock().unwrap().is_empty());
-        assert!(matches!(
-            handler.actions.lock().unwrap().as_slice(),
-            [OverlayAction::SendMessage { to, .. }] if *to == NodeId("peer-a".to_string())
-        ));
-    }
-
-    #[test]
-    fn peer_without_recorded_route_defaults_to_overlay_without_websocket_fallback() {
-        let handler = Arc::new(RecordingActionHandler::default());
-        let websocket = Arc::new(RecordingSignaler::default());
-        let (relay, _router) = make_relay(handler.clone(), websocket.clone());
-
-        let err = futures::executor::block_on(relay.send_signaling(
-            &NodeId("peer-a".to_string()),
-            signaling_msg("local", "peer-a"),
-        ))
-        .unwrap_err();
-
-        assert!(matches!(err, crate::error::MistError::RouteNotFound(_)));
-        assert!(websocket.sent.lock().unwrap().is_empty());
-        assert!(handler.actions.lock().unwrap().is_empty());
-    }
-}
+mod tests;

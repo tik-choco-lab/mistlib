@@ -25,14 +25,23 @@ impl OverlayRouter {
     }
 
     pub fn wrap_data(&self, to: &NodeId, data: Bytes, method: DeliveryMethod) -> OverlayAction {
-        let envelope = OverlayEnvelope {
-            from: self.local_node_id.clone(),
-            to: to.clone(),
-            hop_count: self.hop_count,
-            content: MessageContent::Raw(data),
+        // Assign a per-destination sequence number only for reliable-ordered unicast;
+        // broadcasts and other methods keep seq == 0 (no sequencing).
+        let seq = if method == DeliveryMethod::ReliableOrdered && !to.is_broadcast() {
+            self.next_seq(to)
+        } else {
+            0
         };
-        let enveloped_data =
-            bincode::serialize(&envelope).expect("OverlayEnvelope serialization must not fail");
+        let envelope = OverlayEnvelope::new(
+            self.local_node_id.clone(),
+            to.clone(),
+            self.hop_count,
+            MessageContent::Raw(data),
+        )
+        .with_seq(seq);
+        self.remember_outgoing(&envelope);
+        let enveloped_data = crate::overlay::wire::serialize(&envelope)
+            .expect("OverlayEnvelope serialization must not fail");
         self.create_send_action(to, Bytes::from(enveloped_data), method)
     }
 }

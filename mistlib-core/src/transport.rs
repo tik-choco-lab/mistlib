@@ -25,6 +25,26 @@ pub trait Transport: HostSendSync {
     fn get_connection_state(&self, node: &NodeId) -> ConnectionState;
     async fn connect(&self, node: &NodeId) -> Result<()>;
     async fn disconnect(&self, node: &NodeId) -> Result<()>;
+
+    /// Called when overlay-level PING/PONG liveness suspects `node` may be
+    /// disconnected. Transports that track a reconnect-grace period (e.g. for
+    /// ICE Disconnected) should fold this into the same flow, recording that
+    /// this particular grace period was liveness-suspect-originated so
+    /// `clear_suspect` knows whether it may cancel it. No-op by default.
+    async fn suspect_disconnected(&self, _node: &NodeId) -> Result<()> {
+        Ok(())
+    }
+
+    /// Cancels a liveness-suspect grace period previously started by
+    /// `suspect_disconnected` for `node` (e.g. because a PONG arrived after
+    /// all). Must be a no-op if `node` has no active grace period, or if its
+    /// grace period was started by something other than
+    /// `suspect_disconnected` (e.g. ICE Disconnected) -- that kind only ends
+    /// via the transport's own recovery signal. No-op by default.
+    async fn clear_suspect(&self, _node: &NodeId) -> Result<()> {
+        Ok(())
+    }
+
     fn get_connected_nodes(&self) -> Vec<NodeId>;
     fn get_active_connection_states(&self) -> Vec<(NodeId, ConnectionState)> {
         self.get_connected_nodes()

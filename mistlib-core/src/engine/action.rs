@@ -39,6 +39,16 @@ impl ActionHandler for MistEngine {
                         tracing::warn!("Failed to disconnect from {}: {:?}", to.0, e);
                     }
                 }
+                OverlayAction::SuspectDisconnected { to } => {
+                    if let Err(e) = ctx.preferred_transport().suspect_disconnected(&to).await {
+                        tracing::warn!("Failed to mark {} as suspect-disconnected: {:?}", to.0, e);
+                    }
+                }
+                OverlayAction::ClearSuspect { to } => {
+                    if let Err(e) = ctx.preferred_transport().clear_suspect(&to).await {
+                        tracing::warn!("Failed to clear suspect state for {}: {:?}", to.0, e);
+                    }
+                }
                 OverlayAction::SendSignaling { to, envelope } => {
                     if let Some(sig) = &ctx.signaling_dispatch {
                         if let Err(e) = sig.send_signaling(&to, envelope.content).await {

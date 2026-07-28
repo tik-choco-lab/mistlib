@@ -43,6 +43,24 @@ impl MistEngine {
         for action in self.step_overlay_tick(&states) {
             self.handle_action(action);
         }
+
+        self.step_reorder_flush();
+    }
+
+    /// Delivers per-source reorder-buffer gaps that timed out without new
+    /// traffic arriving to trigger `OverlayRouter::reorder_inbound`'s lazy
+    /// flush (e.g. the sender went idle after a relay/direct route switch).
+    /// Runs every tick so a stalled gap isn't held forever waiting for a
+    /// message that will never arrive.
+    fn step_reorder_flush(&self) {
+        let Some(ov) = self.running_context().and_then(|ctx| ctx.overlay.clone()) else {
+            return;
+        };
+        for (from, contents) in ov.flush_expired_inbound() {
+            for content in contents {
+                self.handle_message_content(from.clone(), content);
+            }
+        }
     }
 
     /// Collects the current connected set and syncs the routing table.
@@ -102,5 +120,28 @@ impl MistEngine {
         };
         let config = self.config.lock().expect("config lock poisoned").clone();
         ov.tick(&config, states)
+    }
+
+    /// Notifies the overlay strategies that a peer disconnect has been
+    /// confirmed, so a strategy can trigger an immediate re-selection
+    /// instead of waiting for the next periodic `tick`. No-op if the engine
+    /// isn't running. Transports call this right after a disconnect is
+    /// confirmed.
+    pub fn notify_peer_disconnected(&self) {
+        let ctx = {
+            let state = self.state.lock().expect("state lock poisoned");
+            match &*state {
+                EngineState::Running(ctx) => Some(ctx.clone()),
+                _ => None,
+            }
+        };
+        let Some(ctx) = ctx else { return };
+        let Some(ov) = &ctx.overlay else { return };
+
+        let states = ctx.active_connection_states();
+        let config = self.config.lock().expect("config lock poisoned").clone();
+        for action in ov.notify_peer_disconnected(&config, &states) {
+            self.handle_action(action);
+        }
     }
 }

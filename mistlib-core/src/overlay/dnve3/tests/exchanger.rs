@@ -17,7 +17,8 @@ fn send_message_envelope(action: &OverlayAction) -> OverlayEnvelope {
     let OverlayAction::SendMessage { data, .. } = action else {
         panic!("expected SendMessage action");
     };
-    bincode::deserialize(data).expect("SendMessage data should be a valid overlay envelope")
+    crate::overlay::wire::deserialize(data)
+        .expect("SendMessage data should be a valid overlay envelope")
 }
 
 #[test]
@@ -64,12 +65,13 @@ fn exchanger_heartbeat_byte_payload_roundtrip_is_accepted() {
         );
     }
 
-    let actions = exchanger.update_and_send_heartbeat(&config, &[node("peer-a")]);
+    let actions =
+        exchanger.update_and_send_heartbeat(&config, web_time::Instant::now(), &[node("peer-a")]);
     assert_eq!(actions.len(), 1, "heartbeat action should be produced");
 
     let payload = match &actions[0] {
         OverlayAction::SendMessage { data, .. } => {
-            let env: OverlayEnvelope = bincode::deserialize(data).unwrap();
+            let env: OverlayEnvelope = crate::overlay::wire::deserialize(data).unwrap();
             match env.content {
                 MessageContent::Overlay(msg) => msg.payload,
                 _ => vec![],
@@ -118,12 +120,13 @@ fn exchanger_heartbeat_uses_configured_spatial_partition_type() {
         );
     }
 
-    let actions = exchanger.update_and_send_heartbeat(&config, &[node("peer-a")]);
+    let actions =
+        exchanger.update_and_send_heartbeat(&config, web_time::Instant::now(), &[node("peer-a")]);
     assert_eq!(actions.len(), 1, "heartbeat action should be produced");
 
     let payload = match &actions[0] {
         OverlayAction::SendMessage { data, .. } => {
-            let env: OverlayEnvelope = bincode::deserialize(data).unwrap();
+            let env: OverlayEnvelope = crate::overlay::wire::deserialize(data).unwrap();
             match env.content {
                 MessageContent::Overlay(msg) => msg.payload,
                 _ => vec![],
@@ -262,7 +265,7 @@ fn exchanger_control_envelopes_use_configured_hop_count() {
     }
 
     let heartbeat = exchanger
-        .update_and_send_heartbeat(&config, &[node("peer-a")])
+        .update_and_send_heartbeat(&config, web_time::Instant::now(), &[node("peer-a")])
         .pop()
         .expect("heartbeat action should be produced");
     assert_eq!(send_message_envelope(&heartbeat).hop_count, 7);
@@ -915,7 +918,8 @@ fn exchanger_update_and_send_heartbeat_returns_actions_per_connected_node() {
     }
 
     let connected = vec![node("peer-a"), node("peer-b")];
-    let actions = exchanger.update_and_send_heartbeat(&config, &connected);
+    let actions =
+        exchanger.update_and_send_heartbeat(&config, web_time::Instant::now(), &connected);
     assert_eq!(
         actions.len(),
         connected.len(),
@@ -950,9 +954,144 @@ fn exchanger_update_and_send_heartbeat_no_connected_nodes_returns_empty() {
         );
     }
 
-    let actions = exchanger.update_and_send_heartbeat(&config, &[]);
+    let actions = exchanger.update_and_send_heartbeat(&config, web_time::Instant::now(), &[]);
     assert!(
         actions.is_empty(),
         "接続ノードがない場合は heartbeat 送信アクション無しであるべき"
+    );
+}
+
+#[test]
+fn exchanger_update_and_send_heartbeat_skips_unchanged_density_within_refresh_window() {
+    let mut config = test_config();
+    config.limits.expire_node_seconds = 30.0; // min_refresh = 10s, well beyond this test's deltas
+    let (exchanger, _, ns) = make_exchanger("local");
+
+    {
+        let mut store = ns.lock().unwrap();
+        store.nodes.insert(
+            node("local"),
+            NodeInfo {
+                id: node("local"),
+                position: pos(0.0, 0.0, 0.0),
+            },
+        );
+    }
+
+    let connected = vec![node("peer-a")];
+    let now = web_time::Instant::now();
+    let first = exchanger.update_and_send_heartbeat(&config, now, &connected);
+    assert_eq!(first.len(), 1, "first heartbeat always sends");
+
+    let second = exchanger.update_and_send_heartbeat(&config, now, &connected);
+    assert!(
+        second.is_empty(),
+        "an unchanged density with the same targets and no elapsed refresh window should be skipped"
+    );
+}
+
+#[test]
+fn exchanger_update_and_send_heartbeat_min_refresh_forces_resend() {
+    let mut config = test_config();
+    config.limits.expire_node_seconds = 3.0; // min_refresh = 1s
+    let (exchanger, _, ns) = make_exchanger("local");
+
+    {
+        let mut store = ns.lock().unwrap();
+        store.nodes.insert(
+            node("local"),
+            NodeInfo {
+                id: node("local"),
+                position: pos(0.0, 0.0, 0.0),
+            },
+        );
+    }
+
+    let connected = vec![node("peer-a")];
+    let t0 = web_time::Instant::now();
+    let first = exchanger.update_and_send_heartbeat(&config, t0, &connected);
+    assert_eq!(first.len(), 1);
+
+    let t1 = t0 + web_time::Duration::from_millis(1500);
+    let second = exchanger.update_and_send_heartbeat(&config, t1, &connected);
+    assert_eq!(
+        second.len(),
+        1,
+        "the minimum refresh floor (expire_node_seconds/3) must force a resend \
+         even with unchanged density, so receivers don't prune this sender"
+    );
+}
+
+#[test]
+fn exchanger_update_and_send_heartbeat_new_peer_forces_resend_even_if_density_unchanged() {
+    let mut config = test_config();
+    config.limits.expire_node_seconds = 30.0;
+    let (exchanger, _, ns) = make_exchanger("local");
+
+    {
+        let mut store = ns.lock().unwrap();
+        store.nodes.insert(
+            node("local"),
+            NodeInfo {
+                id: node("local"),
+                position: pos(0.0, 0.0, 0.0),
+            },
+        );
+    }
+
+    let now = web_time::Instant::now();
+    let first = exchanger.update_and_send_heartbeat(&config, now, &[node("peer-a")]);
+    assert_eq!(first.len(), 1);
+
+    // peer-b just connected; density input is unaffected (its position isn't
+    // known yet), but it must still receive an initial heartbeat rather than
+    // waiting out the refresh window.
+    let second =
+        exchanger.update_and_send_heartbeat(&config, now, &[node("peer-a"), node("peer-b")]);
+    assert_eq!(
+        second.len(),
+        2,
+        "a newly connected peer must get a heartbeat immediately, not be starved by the diff gate"
+    );
+}
+
+#[test]
+fn exchanger_update_and_send_heartbeat_resends_when_density_changes() {
+    let config = test_config();
+    let (exchanger, _, ns) = make_exchanger("local");
+
+    {
+        let mut store = ns.lock().unwrap();
+        store.nodes.insert(
+            node("local"),
+            NodeInfo {
+                id: node("local"),
+                position: pos(0.0, 0.0, 0.0),
+            },
+        );
+    }
+
+    let connected = vec![node("peer-a")];
+    let now = web_time::Instant::now();
+    let first = exchanger.update_and_send_heartbeat(&config, now, &connected);
+    assert_eq!(first.len(), 1);
+
+    // A peer moving into view changes the computed density map.
+    {
+        let mut store = ns.lock().unwrap();
+        store.nodes.insert(
+            node("peer-a"),
+            NodeInfo {
+                id: node("peer-a"),
+                position: pos(5.0, 0.0, 0.0),
+            },
+        );
+    }
+
+    let second = exchanger.update_and_send_heartbeat(&config, now, &connected);
+    assert_eq!(
+        second.len(),
+        1,
+        "a changed density map must be sent even within the refresh window"
     );
 }

@@ -42,7 +42,7 @@ impl DNVE3Exchanger {
         {
             self.node_store
                 .lock()
-                .unwrap()
+                .expect("node_store lock poisoned")
                 .update_node_position(from.clone(), position);
         }
 

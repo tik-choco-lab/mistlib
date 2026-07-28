@@ -80,12 +80,12 @@ impl std::ops::Add for Vector3 {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SpatialDensityData {
     pub density_map: Vec<f32>,
     pub position: Vector3,
-    pub dir_count: usize,
-    pub layer_count: usize,
+    pub dir_count: u8,
+    pub layer_count: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -93,8 +93,8 @@ pub struct SpatialDensityDataByte {
     pub position: Vector3,
     pub max_value: f32,
     pub byte_densities: Vec<u8>,
-    pub dir_count: usize,
-    pub layer_count: usize,
+    pub dir_count: u8,
+    pub layer_count: u8,
 }
 
 impl SpatialDensityData {
@@ -170,6 +170,9 @@ impl SpatialDensityUtils {
     }
 
     fn generate_fibonacci_directions(count: usize) -> Vec<Vector3> {
+        // dir_count is wire-encoded as u8 (see SpatialDensityData), so the direction
+        // set itself must never grow past what a u8 can represent.
+        let count = count.min(u8::MAX as usize);
         let mut directions = Vec::with_capacity(count);
         if count == 1 {
             directions.push(Vector3::new(0.0, 0.0, 1.0));
@@ -285,6 +288,9 @@ impl SpatialDensityUtils {
         max_range: f32,
     ) -> SpatialDensityData {
         let dir_count = self.directions.len();
+        // layer_count is wire-encoded as u8 alongside dir_count; clamp (and keep >=1
+        // so the layer_index computation below never underflows) before sizing the map.
+        let layer_count = layer_count.clamp(1, u8::MAX as usize);
         let mut density_map = vec![0.0; dir_count * layer_count];
 
         let mut actual_max_range = max_range;
@@ -319,8 +325,8 @@ impl SpatialDensityUtils {
         SpatialDensityData {
             density_map,
             position: center,
-            dir_count,
-            layer_count,
+            dir_count: dir_count as u8,
+            layer_count: layer_count as u8,
         }
     }
 
@@ -334,15 +340,20 @@ impl SpatialDensityUtils {
             return data.clone();
         }
 
+        // Widen back to usize for indexing/arithmetic: dir_count * layer_count can
+        // exceed u8::MAX even though each factor individually fits in a u8.
+        let dir_count = data.dir_count as usize;
+        let layer_count = data.layer_count as usize;
+
         let offset_unit = offset.normalized();
         let mut projected_map = vec![0.0; data.density_map.len()];
 
-        for i in 0..data.dir_count {
+        for i in 0..dir_count {
             let cos_sim = self.directions[i].dot(offset_unit).clamp(-1.0, 1.0);
-            for j in 0..data.layer_count {
-                let val =
-                    data.density_map[i * data.layer_count + j] * (1.0 + EXPANSION_FACTOR * cos_sim);
-                projected_map[i * data.layer_count + j] = val.max(0.0);
+            for j in 0..layer_count {
+                let idx = i * layer_count + j;
+                let val = data.density_map[idx] * (1.0 + EXPANSION_FACTOR * cos_sim);
+                projected_map[idx] = val.max(0.0);
             }
         }
 

@@ -86,7 +86,7 @@ fn strategy_tick_empty_world_returns_heartbeat_only() {
             matches!(
                 a,
                 OverlayAction::SendMessage { data, .. }
-                if bincode::deserialize::<OverlayEnvelope>(data)
+                if crate::overlay::wire::deserialize::<OverlayEnvelope>(data)
                     .ok()
                     .and_then(|e| match e.content {
                         MessageContent::Overlay(msg) => Some(msg.message_type),
@@ -142,6 +142,70 @@ fn strategy_nodelist_proximity_first_tick_generates_connect_action() {
 }
 
 #[test]
+fn strategy_on_peer_disconnected_bypasses_balancer_tick_timer() {
+    let mut config = test_config();
+    config.dnve.connection_mode = ConnectionMode::NodeListProximity;
+    config.limits.max_connection_count = 2;
+    config.limits.reserved_connection_count = 0;
+
+    let node_store = Arc::new(Mutex::new(NodeStore::new()));
+    let routing_table = Arc::new(Mutex::new(RoutingTable::new()));
+    let strategy = DNVE3Strategy::new(&config, node_store, node("local"), routing_table);
+
+    {
+        let mut store = strategy.node_store.lock().unwrap();
+        store.nodes.insert(
+            node("local"),
+            NodeInfo {
+                id: node("local"),
+                position: pos(0.0, 0.0, 0.0),
+            },
+        );
+        store.nodes.insert(
+            node("near-peer"),
+            NodeInfo {
+                id: node("near-peer"),
+                position: pos(2.0, 0.0, 0.0),
+            },
+        );
+    }
+
+    let has_connect = |actions: &[OverlayAction]| {
+        actions
+            .iter()
+            .any(|a| matches!(a, OverlayAction::Connect { to } if *to == node("near-peer")))
+    };
+
+    // First tick always runs the balancer (its timer starts "due now").
+    assert!(
+        has_connect(&strategy.tick(&config, &[])),
+        "initial tick should select the known near peer"
+    );
+
+    // Immediately following tick: the balancer's own 2s(+jitter) timer isn't
+    // due yet, so a plain tick() must not re-run the selection.
+    assert!(
+        !has_connect(&strategy.tick(&config, &[])),
+        "a tick right after the first should be gated by the balancer timer"
+    );
+
+    // A confirmed disconnect must bypass that timer and re-select right away.
+    assert!(
+        has_connect(&strategy.on_peer_disconnected(&config, &[])),
+        "on_peer_disconnected should trigger an immediate re-selection \
+         instead of waiting for the next balancer tick"
+    );
+
+    // It must also reschedule the next periodic tick from now, so a plain
+    // tick() immediately after doesn't fire the balancer a second time.
+    assert!(
+        !has_connect(&strategy.tick(&config, &[])),
+        "on_peer_disconnected should push the next balancer tick out, \
+         not leave it due again immediately"
+    );
+}
+
+#[test]
 fn strategy_node_list_modes_push_node_list_instead_of_requesting() {
     for mode in [
         ConnectionMode::DirectionDensityLight,
@@ -191,7 +255,7 @@ fn strategy_node_list_modes_push_node_list_instead_of_requesting() {
             .iter()
             .filter_map(|action| match action {
                 OverlayAction::SendMessage { data, .. } => {
-                    let env: OverlayEnvelope = bincode::deserialize(data).ok()?;
+                    let env: OverlayEnvelope = crate::overlay::wire::deserialize(data).ok()?;
                     match env.content {
                         MessageContent::Overlay(msg) => Some(msg.message_type),
                         _ => None,
@@ -265,7 +329,7 @@ fn strategy_node_list_modes_pull_request_by_default() {
             .iter()
             .filter_map(|action| match action {
                 OverlayAction::SendMessage { data, .. } => {
-                    let env: OverlayEnvelope = bincode::deserialize(data).ok()?;
+                    let env: OverlayEnvelope = crate::overlay::wire::deserialize(data).ok()?;
                     match env.content {
                         MessageContent::Overlay(msg) => Some(msg.message_type),
                         _ => None,
@@ -320,7 +384,7 @@ fn strategy_node_list_aoi_proximity_does_not_send_density_heartbeat() {
         matches!(
             action,
             OverlayAction::SendMessage { data, .. }
-            if bincode::deserialize::<OverlayEnvelope>(data)
+            if crate::overlay::wire::deserialize::<OverlayEnvelope>(data)
                 .ok()
                 .and_then(|env| match env.content {
                     MessageContent::Overlay(msg) => Some(msg.message_type),
@@ -567,7 +631,7 @@ fn strategy_direction_density_orders_node_list_requests_by_density() {
         .iter()
         .filter_map(|action| match action {
             OverlayAction::SendMessage { to, data, .. } => {
-                let env: OverlayEnvelope = bincode::deserialize(data).ok()?;
+                let env: OverlayEnvelope = crate::overlay::wire::deserialize(data).ok()?;
                 match env.content {
                     MessageContent::Overlay(msg)
                         if msg.message_type == OVERLAY_MSG_REQUEST_NODE_LIST =>
@@ -638,7 +702,7 @@ fn strategy_direction_density_light_keeps_directional_node_list_target_order() {
         .iter()
         .filter_map(|action| match action {
             OverlayAction::SendMessage { to, data, .. } => {
-                let env: OverlayEnvelope = bincode::deserialize(data).ok()?;
+                let env: OverlayEnvelope = crate::overlay::wire::deserialize(data).ok()?;
                 match env.content {
                     MessageContent::Overlay(msg)
                         if msg.message_type == OVERLAY_MSG_REQUEST_NODE_LIST =>

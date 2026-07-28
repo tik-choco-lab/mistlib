@@ -1,0 +1,134 @@
+# mistlib (公開リポジトリ) のリリース。`v*` タグの push で発火する。
+#
+# このファイルは mistlib-dev の publish/overlay/ が正。公開リポジトリ側で直接
+# 編集しても次回の `just publish-sync` で上書きされる。
+#
+# タグは mistlib-dev の `just publish-release <version>` が打つ。手順:
+#   just publish-release 0.2.0          # ローカルで bump + 同期 + main へ ff-merge + タグ
+#   just publish-release 0.2.0 --push   # 上記に加えて push（= このワークフローが発火）
+#
+# 配布物には言語ラッパー (Unity / Python / JS) を含めない。ラッパーの正は
+# tik-choco-lab/mistlib-examples リポジトリで、そちらが独自にリリースを持つ。
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # タグが壊れたコードを指していないことを確認してから成果物を作る。
+  test:
+    name: test (core + native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run -p mistlib-core -p mistlib-native --locked --profile ci
+
+  wasm:
+    name: package wasm
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - run: wasm-pack build --target web --release
+        working-directory: mistlib-wasm
+
+      - name: Assemble archive
+        run: |
+          set -euo pipefail
+          rm -rf staging
+          mkdir -p staging/pkg
+          cp -R mistlib-wasm/pkg/. staging/pkg/
+          cp LICENSE README.md staging/
+          # pkg/ 単体を node_modules 等へ取り込む使い方でもライセンスが追える。
+          cp LICENSE staging/pkg/
+          (cd staging && zip -qr "../mistlib-wasm-${GITHUB_REF_NAME}.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wasm
+          path: mistlib-wasm-*.zip
+          if-no-files-found: error
+
+  native:
+    name: package native (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            binary: libmistlib.so
+          - os: windows-latest
+            target: windows-x86_64
+            binary: mistlib.dll
+          - os: macos-latest
+            target: macos-aarch64
+            binary: libmistlib.dylib
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked -p mistlib-native
+
+      # bash はどのランナーにも入っているので OS ごとにステップを分けない。
+      # zip コマンドは Linux/macOS には最初から入っているが Windows の Git Bash には
+      # 無い。逆に Windows ランナーには 7z が入っているので、あるほうを使う。
+      - name: Assemble archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf staging
+          mkdir -p staging
+          cp "target/release/${{ matrix.binary }}" staging/
+          cp LICENSE README.md staging/
+          out="$PWD/mistlib-native-${{ matrix.target }}-${GITHUB_REF_NAME}.zip"
+          cd staging
+          if command -v zip >/dev/null 2>&1; then zip -qr "$out" .; else 7z a -tzip "$out" . >/dev/null; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-native-${{ matrix.target }}
+          path: mistlib-native-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub Release
+    needs: [wasm, native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: assets
+          merge-multiple: true
+      - run: ls -lh assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: assets/*.zip

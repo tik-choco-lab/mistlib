@@ -4,6 +4,10 @@ pub mod node_store;
 pub mod router;
 pub mod routing_table;
 pub mod transport;
+/// Envelope v4 wire (de)serialization — the single source of truth for the
+/// on-wire bincode config. See [`wire`] for why envelope frames must go through
+/// here and inner payloads must not.
+pub mod wire;
 
 pub use message::{
     OverlayEnvelope, OverlayMessage, OVERLAY_MSG_HEARTBEAT, OVERLAY_MSG_NODE_LIST,
@@ -52,6 +56,17 @@ pub trait TopologyStrategy {
         config: &Config,
         connected_node_states: &[(NodeId, crate::types::ConnectionState)],
     ) -> Vec<OverlayAction>;
+
+    /// Called right after a peer disconnect is confirmed, so a strategy that
+    /// manages connection topology can react immediately instead of waiting
+    /// for the next periodic `tick`. Default is a no-op.
+    fn on_peer_disconnected(
+        &self,
+        _config: &Config,
+        _connected_node_states: &[(NodeId, crate::types::ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        Vec::new()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,4 +91,15 @@ pub trait TopologyStrategy: Send + Sync {
         config: &Config,
         connected_node_states: &[(NodeId, crate::types::ConnectionState)],
     ) -> Vec<OverlayAction>;
+
+    /// Called right after a peer disconnect is confirmed, so a strategy that
+    /// manages connection topology can react immediately instead of waiting
+    /// for the next periodic `tick`. Default is a no-op.
+    fn on_peer_disconnected(
+        &self,
+        _config: &Config,
+        _connected_node_states: &[(NodeId, crate::types::ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        Vec::new()
+    }
 }

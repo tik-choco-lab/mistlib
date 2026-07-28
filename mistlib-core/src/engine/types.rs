@@ -18,7 +18,13 @@ pub struct RunningContext {
 
 impl RunningContext {
     /// Returns the network transport when present, otherwise the primary transport.
-    pub(super) fn preferred_transport(&self) -> &dyn Transport {
+    ///
+    /// Use this to dispatch data that has already been serialized into an
+    /// `OverlayEnvelope` (e.g. via `overlay.wrap_data`). Sending such data
+    /// through `self.transport` (`OverlayTransport`) instead would wrap it a
+    /// second time, since `OverlayTransport::send`/`broadcast` call
+    /// `router.wrap_data` internally.
+    pub fn preferred_transport(&self) -> &dyn Transport {
         self.network_transport
             .as_deref()
             .unwrap_or(&*self.transport)

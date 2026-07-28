@@ -28,7 +28,7 @@ fn spatial_density_dir_count_matches_resolution() {
     let resolution = 8;
     let utils = SpatialDensityUtils::new(resolution);
     let data = utils.create_spatial_density(pos(0.0, 0.0, 0.0), &[], 3, 0.0);
-    assert_eq!(data.dir_count, resolution);
+    assert_eq!(data.dir_count, resolution as u8);
     assert_eq!(data.layer_count, 3);
     assert_eq!(data.density_map.len(), resolution * 3);
 }
@@ -129,6 +129,26 @@ fn spatial_density_polyhedron_partition_uses_fixed_direction_count() {
     assert_eq!(data.dir_count, 20);
     assert_eq!(data.layer_count, 3);
     assert_eq!(data.density_map.len(), 20 * 3);
+}
+
+#[test]
+fn spatial_density_dir_and_layer_count_are_clamped_to_u8_range() {
+    // dir_count/layer_count are wire-encoded as u8. An oversized fibonacci
+    // resolution or layer count must not silently truncate and desync the
+    // stored counts from the actual density_map length.
+    let utils = SpatialDensityUtils::new(500);
+    let data = utils.create_spatial_density(pos(0.0, 0.0, 0.0), &[], 1000, 0.0);
+
+    assert_eq!(data.dir_count, u8::MAX);
+    assert_eq!(data.layer_count, u8::MAX);
+    assert_eq!(
+        data.density_map.len(),
+        data.dir_count as usize * data.layer_count as usize,
+        "density_map length must stay consistent with the clamped dir/layer counts"
+    );
+
+    // project/merge must not panic or index out of range on the clamped data.
+    let _ = utils.project_spatial_density(&data, pos(1.0, 2.0, 3.0));
 }
 
 fn contains_direction(

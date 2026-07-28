@@ -50,8 +50,11 @@ impl DNVE3Exchanger {
     }
 
     pub fn delete_old_data(&self, config: &Config) {
-        let mut store = self.dnve_data_store.lock().unwrap();
-        let mut node_store = self.node_store.lock().unwrap();
+        let mut store = self
+            .dnve_data_store
+            .lock()
+            .expect("dnve_data_store lock poisoned");
+        let mut node_store = self.node_store.lock().expect("node_store lock poisoned");
 
         let now = web_time::Instant::now();
         let expire_duration = Duration::from_secs_f32(config.limits.expire_node_seconds.max(0.0));

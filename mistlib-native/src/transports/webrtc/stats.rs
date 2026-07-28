@@ -19,10 +19,10 @@ static SCTP_STATS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new(
 
 impl WebRtcTransport {
     pub async fn get_sctp_stats(&self) -> HashMap<String, SctpPeerStats> {
-        // Enable by setting MISTLIB_ENABLE_SCTP_STATS=1.
+        // Collected by default. Disable by setting MISTLIB_DISABLE_SCTP_STATS=1.
         let enabled = *SCTP_STATS_ENABLED.get_or_init(|| {
-            matches!(
-                env::var("MISTLIB_ENABLE_SCTP_STATS").as_deref(),
+            !matches!(
+                env::var("MISTLIB_DISABLE_SCTP_STATS").as_deref(),
                 Ok("1" | "true" | "True" | "TRUE")
             )
         });

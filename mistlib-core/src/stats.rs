@@ -25,6 +25,8 @@ pub struct EngineStats {
     pub relay_send_bits: u64,
     pub relay_receive_bits: u64,
     pub relay_message_count: u64,
+    pub dropped_receive_events: u64,
+    pub dropped_ffi_events: u64,
     pub nodes: Vec<NodeStats>,
 
     pub diag_peers: usize,
@@ -48,8 +50,18 @@ pub struct SctpStats {
     pub messages_received: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    pub estimated_packet_loss: i64,
     pub state: String,
+}
+
+/// Per-peer PING/PONG liveness bookkeeping. `awaiting` tracks whether the most
+/// recently sent PING for this peer has not yet been answered by the time the
+/// next PING is about to go out; `consecutive_misses` counts how many rounds in
+/// a row that has happened. A single miss is expected/normal since PING travels
+/// Unreliable — this is only meaningful once it crosses a configured threshold.
+#[derive(Default)]
+struct PingHealth {
+    awaiting: bool,
+    consecutive_misses: u32,
 }
 
 pub struct MistStats {
@@ -62,7 +74,10 @@ pub struct MistStats {
     pub total_relay_send_bytes: AtomicU64,
     pub total_relay_receive_bytes: AtomicU64,
     pub total_relay_message_count: AtomicU64,
+    pub dropped_receive_events: AtomicU64,
+    pub dropped_ffi_events: AtomicU64,
     pub rtt_millis: Mutex<Arc<HashMap<NodeId, f32>>>,
+    ping_health: Mutex<HashMap<NodeId, PingHealth>>,
 }
 
 #[derive(Clone)]
@@ -77,6 +92,8 @@ pub struct StatsSnapshot {
     pub relay_send_bits: u64,
     pub relay_receive_bits: u64,
     pub relay_message_count: u64,
+    pub dropped_receive_events: u64,
+    pub dropped_ffi_events: u64,
 }
 
 impl Default for MistStats {
@@ -97,7 +114,10 @@ impl MistStats {
             total_relay_send_bytes: AtomicU64::new(0),
             total_relay_receive_bytes: AtomicU64::new(0),
             total_relay_message_count: AtomicU64::new(0),
+            dropped_receive_events: AtomicU64::new(0),
+            dropped_ffi_events: AtomicU64::new(0),
             rtt_millis: Mutex::new(Arc::new(HashMap::new())),
+            ping_health: Mutex::new(HashMap::new()),
         }
     }
 
@@ -178,6 +198,14 @@ impl MistStats {
         }
     }
 
+    pub fn add_dropped_receive_event(&self) {
+        self.dropped_receive_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_dropped_ffi_event(&self) {
+        self.dropped_ffi_events.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_rtt(&self, node_id: NodeId, rtt_ms: f32) {
         if let Ok(mut arc) = self.rtt_millis.lock() {
             let map = Arc::make_mut(&mut arc);
@@ -197,6 +225,50 @@ impl MistStats {
             let map = Arc::make_mut(&mut arc);
             map.remove(node_id);
         }
+        if let Ok(mut health) = self.ping_health.lock() {
+            health.remove(node_id);
+        }
+    }
+
+    /// Records that a PING is about to be (re)sent to `node_id`. If the previous
+    /// round's PING was never answered, bumps the consecutive-miss counter;
+    /// otherwise resets it. Returns the updated miss count.
+    pub(crate) fn note_ping_sent(&self, node_id: &NodeId) -> u32 {
+        let mut health = self.ping_health.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = health.entry(node_id.clone()).or_default();
+        if entry.awaiting {
+            entry.consecutive_misses = entry.consecutive_misses.saturating_add(1);
+        } else {
+            entry.consecutive_misses = 0;
+        }
+        entry.awaiting = true;
+        entry.consecutive_misses
+    }
+
+    /// Records a PONG from `node_id`, clearing its miss streak. `timeout_count`
+    /// is the same liveness-suspect threshold `note_ping_sent` is checked
+    /// against; returns whether the miss streak had already crossed it (i.e.
+    /// whether a `SuspectDisconnected` was latched for this peer), so the
+    /// caller knows whether to emit a matching `ClearSuspect`.
+    pub(crate) fn note_pong_received(&self, node_id: &NodeId, timeout_count: u32) -> bool {
+        let mut health = self.ping_health.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = health.get_mut(node_id) else {
+            return false;
+        };
+        let was_suspect = timeout_count > 0 && entry.consecutive_misses >= timeout_count;
+        entry.awaiting = false;
+        entry.consecutive_misses = 0;
+        was_suspect
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ping_consecutive_misses(&self, node_id: &NodeId) -> u32 {
+        self.ping_health
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|e| e.consecutive_misses)
+            .unwrap_or(0)
     }
 
     pub fn snapshot_and_reset(&self) -> StatsSnapshot {
@@ -209,6 +281,8 @@ impl MistStats {
         let relay_send_bytes = self.total_relay_send_bytes.swap(0, Ordering::Relaxed);
         let relay_receive_bytes = self.total_relay_receive_bytes.swap(0, Ordering::Relaxed);
         let relay_message_count = self.total_relay_message_count.swap(0, Ordering::Relaxed);
+        let dropped_receive_events = self.dropped_receive_events.swap(0, Ordering::Relaxed);
+        let dropped_ffi_events = self.dropped_ffi_events.swap(0, Ordering::Relaxed);
 
         let rtt = {
             let arc = self.rtt_millis.lock().unwrap();
@@ -226,6 +300,8 @@ impl MistStats {
             relay_send_bits: relay_send_bytes * 8,
             relay_receive_bits: relay_receive_bytes * 8,
             relay_message_count,
+            dropped_receive_events,
+            dropped_ffi_events,
         }
     }
 }
@@ -239,7 +315,7 @@ enum OverlayFrameClass {
 }
 
 pub fn is_network_partition_check_frame(data: &[u8]) -> bool {
-    let Ok(envelope) = bincode::deserialize::<OverlayEnvelope>(data) else {
+    let Ok(envelope) = crate::overlay::wire::deserialize::<OverlayEnvelope>(data) else {
         return false;
     };
     let MessageContent::Raw(payload) = envelope.content else {
@@ -249,7 +325,7 @@ pub fn is_network_partition_check_frame(data: &[u8]) -> bool {
 }
 
 fn classify_overlay_frame(data: &[u8]) -> Option<OverlayFrameClass> {
-    let envelope: OverlayEnvelope = bincode::deserialize(data).ok()?;
+    let envelope: OverlayEnvelope = crate::overlay::wire::deserialize(data).ok()?;
     let bytes = data.len() as u64;
 
     match envelope.content {
@@ -302,6 +378,22 @@ mod tests {
     }
 
     #[test]
+    fn drop_counters_are_reported_and_reset() {
+        let stats = MistStats::new();
+        stats.add_dropped_receive_event();
+        stats.add_dropped_receive_event();
+        stats.add_dropped_ffi_event();
+
+        let snapshot = stats.snapshot_and_reset();
+        assert_eq!(snapshot.dropped_receive_events, 2);
+        assert_eq!(snapshot.dropped_ffi_events, 1);
+
+        let snapshot = stats.snapshot_and_reset();
+        assert_eq!(snapshot.dropped_receive_events, 0);
+        assert_eq!(snapshot.dropped_ffi_events, 0);
+    }
+
+    #[test]
     fn test_eval_stats_counts() {
         let stats = MistStats::new();
         stats.add_world_send(100);
@@ -337,13 +429,15 @@ mod tests {
         let envelope = OverlayEnvelope {
             from: NodeId("local".to_string()),
             to: NodeId("peer".to_string()),
+            msg_id: 1,
+            seq: 0,
             hop_count: 1,
             content: MessageContent::Overlay(OverlayMessage {
                 message_type: OVERLAY_MSG_REQUEST_NODE_LIST,
                 payload: vec![],
             }),
         };
-        let data = bincode::serialize(&envelope).unwrap();
+        let data = crate::overlay::wire::serialize(&envelope).unwrap();
 
         stats.add_world_send_frame(&data);
         stats.add_world_receive_frame(&data);
@@ -363,13 +457,15 @@ mod tests {
         let ping = OverlayEnvelope {
             from: NodeId("local".to_string()),
             to: NodeId("peer".to_string()),
+            msg_id: 2,
+            seq: 0,
             hop_count: 1,
             content: MessageContent::Overlay(OverlayMessage {
                 message_type: OVERLAY_MSG_PING,
                 payload: vec![1, 2, 3],
             }),
         };
-        let ping_data = bincode::serialize(&ping).unwrap();
+        let ping_data = crate::overlay::wire::serialize(&ping).unwrap();
 
         stats.add_world_send_frame(&ping_data);
         stats.add_world_receive_frame(b"not-an-envelope");
@@ -386,6 +482,8 @@ mod tests {
         let envelope = OverlayEnvelope {
             from: NodeId("local".to_string()),
             to: NodeId("peer".to_string()),
+            msg_id: 1,
+            seq: 0,
             hop_count: 1,
             content: MessageContent::Data(SignalingData {
                 sender_id: NodeId("local".to_string()),
@@ -395,7 +493,7 @@ mod tests {
                 signaling_type: SignalingType::Candidate,
             }),
         };
-        let data = bincode::serialize(&envelope).unwrap();
+        let data = crate::overlay::wire::serialize(&envelope).unwrap();
 
         stats.add_world_send_frame(&data);
         stats.add_world_receive_frame(&data);
@@ -415,10 +513,12 @@ mod tests {
         let envelope = OverlayEnvelope {
             from: NodeId("local".to_string()),
             to: NodeId("peer".to_string()),
+            msg_id: 1,
+            seq: 0,
             hop_count: 1,
             content: MessageContent::Raw(bytes::Bytes::from_static(b"world payload")),
         };
-        let data = bincode::serialize(&envelope).unwrap();
+        let data = crate::overlay::wire::serialize(&envelope).unwrap();
 
         stats.add_world_send_frame(&data);
 
@@ -435,12 +535,14 @@ mod tests {
         let envelope = OverlayEnvelope {
             from: NodeId("local".to_string()),
             to: NodeId::broadcast(),
+            msg_id: 3,
+            seq: 0,
             hop_count: 3,
             content: MessageContent::Raw(bytes::Bytes::from_static(
                 br#"{"type":"network_partition_probe","id":"probe-1","origin":"local"}"#,
             )),
         };
-        let data = bincode::serialize(&envelope).unwrap();
+        let data = crate::overlay::wire::serialize(&envelope).unwrap();
 
         assert!(is_network_partition_check_frame(&data));
         stats.add_send_frame(&data);

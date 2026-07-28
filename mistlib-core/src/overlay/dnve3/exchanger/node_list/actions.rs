@@ -12,23 +12,23 @@ impl DNVE3Exchanger {
         let payload = self
             .node_store
             .lock()
-            .unwrap()
+            .expect("node_store lock poisoned")
             .nodes
             .get(&self.local_node_id)
             .and_then(|node| bincode::serialize(&node.position).ok())
             .unwrap_or_default();
 
-        let envelope = OverlayEnvelope {
-            from: self.local_node_id.clone(),
-            to: to.clone(),
-            hop_count: self.hop_count,
-            content: MessageContent::Overlay(OverlayMessage {
+        let envelope = OverlayEnvelope::new(
+            self.local_node_id.clone(),
+            to.clone(),
+            self.hop_count,
+            MessageContent::Overlay(OverlayMessage {
                 message_type: OVERLAY_MSG_REQUEST_NODE_LIST,
                 payload,
             }),
-        };
+        );
 
-        let data = bincode::serialize(&envelope)
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| {
                 tracing::warn!(
                     "[DNVE3] failed to serialize request_node_list to {}: {}",
@@ -61,17 +61,17 @@ impl DNVE3Exchanger {
                 return None;
             }
         };
-        let envelope = OverlayEnvelope {
-            from: self.local_node_id.clone(),
-            to: to.clone(),
-            hop_count: self.hop_count,
-            content: MessageContent::Overlay(OverlayMessage {
+        let envelope = OverlayEnvelope::new(
+            self.local_node_id.clone(),
+            to.clone(),
+            self.hop_count,
+            MessageContent::Overlay(OverlayMessage {
                 message_type: OVERLAY_MSG_NODE_LIST,
                 payload,
             }),
-        };
+        );
 
-        let data = bincode::serialize(&envelope)
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| {
                 tracing::warn!(
                     "[DNVE3] failed to serialize node_list envelope to {}: {}",

@@ -21,26 +21,6 @@ impl Default for NodeStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn touch_node_refreshes_known_node_only() {
-        let mut store = NodeStore::new();
-        let known = NodeId("known".to_string());
-        let unknown = NodeId("unknown".to_string());
-
-        store.update_node_position(known.clone(), Vector3::zero());
-        assert!(store.touch_node(&known));
-        assert!(store.last_updated.contains_key(&known));
-
-        assert!(!store.touch_node(&unknown));
-        assert!(!store.nodes.contains_key(&unknown));
-        assert!(!store.last_updated.contains_key(&unknown));
-    }
-}
-
 impl NodeStore {
     pub fn new() -> Self {
         Self {
@@ -128,17 +108,37 @@ impl NodeStore {
         serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Drops nodes whose `last_updated` timestamp is older than `duration`
+    /// ("forgotten" -- e.g. the mutual-forgetting side-effect of DNVE3's
+    /// 10s expiry). Logs one `[ConnTiming] kind=forgotten` line per node
+    /// actually dropped, via plain `tracing::info!` -- this crate has no
+    /// access to `mistlib-native`'s `conn_timing` rate limiter (and doesn't
+    /// need one: expiry only ever removes each node once, so volume is
+    /// naturally bounded).
     pub fn retain_recent(&mut self, duration: web_time::Duration) {
         let now = Instant::now();
-        self.nodes.retain(|id, _| {
-            if let Some(last) = self.last_updated.get(id) {
-                now.duration_since(*last) < duration
-            } else {
+        let mut expired: Vec<(NodeId, u64)> = Vec::new();
+        self.last_updated.retain(|id, last| {
+            let age = now.duration_since(*last);
+            if age < duration {
                 true
+            } else {
+                expired.push((id.clone(), age.as_millis() as u64));
+                false
             }
         });
-        self.last_updated
-            .retain(|_, last| now.duration_since(*last) < duration);
+        for (id, age_ms) in &expired {
+            tracing::info!(
+                "[ConnTiming] peer={} kind=forgotten age_ms={}",
+                id.0,
+                age_ms
+            );
+        }
+        if !expired.is_empty() {
+            let expired_ids: std::collections::HashSet<&NodeId> =
+                expired.iter().map(|(id, _)| id).collect();
+            self.nodes.retain(|id, _| !expired_ids.contains(id));
+        }
     }
 
     pub fn get_nodes_in_range(
@@ -162,5 +162,51 @@ impl NodeStore {
             }
         }
         in_range
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_node_refreshes_known_node_only() {
+        let mut store = NodeStore::new();
+        let known = NodeId("known".to_string());
+        let unknown = NodeId("unknown".to_string());
+
+        store.update_node_position(known.clone(), Vector3::zero());
+        assert!(store.touch_node(&known));
+        assert!(store.last_updated.contains_key(&known));
+
+        assert!(!store.touch_node(&unknown));
+        assert!(!store.nodes.contains_key(&unknown));
+        assert!(!store.last_updated.contains_key(&unknown));
+    }
+
+    #[test]
+    fn retain_recent_drops_only_expired_nodes() {
+        let mut store = NodeStore::new();
+        let old = NodeId("old".to_string());
+        let fresh = NodeId("fresh".to_string());
+
+        store.update_node_position(old.clone(), Vector3::zero());
+        // A zero-length window means anything already inserted counts as
+        // expired ("forgotten"): `age < duration` can never hold once
+        // `duration` is zero.
+        store.retain_recent(web_time::Duration::from_millis(0));
+        assert!(
+            !store.nodes.contains_key(&old),
+            "node past the retention window must be dropped"
+        );
+        assert!(!store.last_updated.contains_key(&old));
+
+        store.update_node_position(fresh.clone(), Vector3::zero());
+        store.retain_recent(web_time::Duration::from_secs(60));
+        assert!(
+            store.nodes.contains_key(&fresh),
+            "node within the retention window must be kept"
+        );
+        assert!(store.last_updated.contains_key(&fresh));
     }
 }

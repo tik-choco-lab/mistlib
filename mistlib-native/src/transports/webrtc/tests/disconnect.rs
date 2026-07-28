@@ -9,7 +9,7 @@ use mistlib_core::{
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-struct LoopbackSignaler {
+pub(crate) struct LoopbackSignaler {
     tx: mpsc::UnboundedSender<MessageContent>,
 }
 
@@ -25,7 +25,8 @@ impl Signaler for LoopbackSignaler {
     }
 }
 
-fn make_connected_pair() -> (Arc<WebRtcTransport>, Arc<WebRtcTransport>, NodeId, NodeId) {
+pub(crate) fn make_connected_pair() -> (Arc<WebRtcTransport>, Arc<WebRtcTransport>, NodeId, NodeId)
+{
     let id_a = NodeId("peer-a".to_string());
     let id_b = NodeId("peer-b".to_string());
 
@@ -60,7 +61,7 @@ fn make_connected_pair() -> (Arc<WebRtcTransport>, Arc<WebRtcTransport>, NodeId,
     (ta, tb, id_a, id_b)
 }
 
-async fn wait_for_state(
+pub(crate) async fn wait_for_state(
     transport: &WebRtcTransport,
     node: &NodeId,
     expected: ConnectionState,
@@ -82,7 +83,13 @@ async fn wait_for_state(
 /// B側のDataChannel on_closeコールバックが即座に発火して
 /// connection_statesが更新されることを確認する。
 /// ICEタイムアウト(~30s)を待たず2秒以内に検知できることが基準。
-#[tokio::test]
+///
+/// multi_thread必須: A/Bは本来別プロセス/別マシンで動く独立ピアであり、
+/// 片方の(重い)クリーンアップ処理がもう片方のイベント処理をスケジューリング上
+/// ブロックすることは実際のデプロイでは起こり得ない。current_thread(デフォルト)
+/// だとテスト内でA/Bが同一OSスレッドを共有してしまい、そのアーティファクトにより
+/// 本来ならもっと早く発火するはずのB側on_closeが数秒単位で遅延することがある。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn datachannel_close_notifies_remote_immediately() {
     let (ta, tb, id_a, id_b) = make_connected_pair();
 
@@ -121,7 +128,9 @@ async fn datachannel_close_notifies_remote_immediately() {
 
 /// on_closeが複数回呼ばれても on_disconnected_internal は1回だけ呼ばれることを確認。
 /// peersからの削除が1回だけ成功することで重複を防いでいる。
-#[tokio::test]
+///
+/// multi_thread必須: 上のテストと同じ理由(A/Bを同一OSスレッドに縛らない)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn datachannel_close_does_not_duplicate_cleanup() {
     let (ta, tb, id_a, id_b) = make_connected_pair();
 

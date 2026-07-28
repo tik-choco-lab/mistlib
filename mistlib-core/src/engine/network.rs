@@ -7,6 +7,9 @@ use crate::transport::NetworkEvent;
 use crate::types::NodeId;
 
 const MSG_TYPE_SYNC_POS: u32 = 100;
+/// Binary position sync: payload is a bincode `Vector3` (12 bytes). Senders:
+/// `mistlib-wasm/src/app.rs::MSG_TYPE_POSITION_SYNC_BIN` (must stay in sync).
+const MSG_TYPE_SYNC_POS_BIN: u32 = 200;
 
 impl MistEngine {
     pub(super) async fn process_network_event(&self, event: NetworkEvent) {
@@ -17,7 +20,7 @@ impl MistEngine {
             event.data.len()
         );
 
-        let Ok(envelope) = bincode::deserialize::<OverlayEnvelope>(&event.data) else {
+        let Ok(envelope) = crate::overlay::wire::deserialize::<OverlayEnvelope>(&event.data) else {
             tracing::debug!(
                 "MistEngine: Deserialization failed for event from {}. Forwarding as raw data.",
                 from.0
@@ -47,24 +50,44 @@ impl MistEngine {
         );
 
         let content = envelope.content.clone();
+        let seq = envelope.seq;
 
-        let actions = self
-            .running_context()
-            .and_then(|ctx| ctx.overlay.clone())
-            .map(|ov| ov.handle_envelope(envelope, from.clone()))
-            .unwrap_or_default();
+        let overlay = self.running_context().and_then(|ctx| ctx.overlay.clone());
+        let result = overlay
+            .as_ref()
+            .map(|ov| ov.handle_envelope(envelope, from.clone()));
 
-        for action in actions {
-            self.handle_action(action);
+        let should_deliver = result
+            .as_ref()
+            .map(|result| result.should_deliver)
+            .unwrap_or(true);
+
+        if let Some(result) = result {
+            for action in result.actions {
+                self.handle_action(action);
+            }
         }
 
-        if to_self {
-            self.handle_message_content(envelope_from, content);
+        if to_self && should_deliver {
+            // Restore end-to-end order per source before dispatching. seq == 0 and
+            // the no-overlay path deliver immediately (no reordering applied).
+            match overlay {
+                Some(ov) => {
+                    for ordered in ov.reorder_inbound(&envelope_from, seq, content) {
+                        self.handle_message_content(envelope_from.clone(), ordered);
+                    }
+                }
+                None => self.handle_message_content(envelope_from, content),
+            }
         }
     }
 
     /// Dispatches a decoded message to the appropriate handler based on content type.
-    fn handle_message_content(&self, from: NodeId, content: MessageContent) {
+    ///
+    /// `pub(super)` (not private): also called from `tick.rs`'s periodic
+    /// `flush_expired_inbound` poll, which delivers reorder-buffer gaps that
+    /// timed out without new traffic to re-trigger the lazy flush above.
+    pub(super) fn handle_message_content(&self, from: NodeId, content: MessageContent) {
         match content {
             MessageContent::Raw(payload) => {
                 tracing::debug!(
@@ -83,6 +106,9 @@ impl MistEngine {
                 }
                 if msg.message_type == MSG_TYPE_SYNC_POS {
                     self.try_apply_sync_pos(&from, &msg.payload);
+                }
+                if msg.message_type == MSG_TYPE_SYNC_POS_BIN {
+                    self.try_apply_sync_pos_bin(&from, &msg.payload);
                 }
                 self.emit(EngineEvent::OverlayMessage(from, msg.payload));
             }
@@ -159,5 +185,21 @@ impl MistEngine {
             .lock()
             .expect("node_store lock poisoned")
             .update_node_position(from.clone(), Vector3::new(x as f32, y as f32, z as f32));
+    }
+
+    /// Applies a binary position-sync payload (bincode `Vector3`) to the node store.
+    fn try_apply_sync_pos_bin(&self, from: &NodeId, payload: &[u8]) {
+        // Strict length check so unrelated overlay payloads can never be
+        // misread as a position (bincode tolerates trailing bytes).
+        if payload.len() != std::mem::size_of::<f32>() * 3 {
+            return;
+        }
+        let Ok(pos) = bincode::deserialize::<Vector3>(payload) else {
+            return;
+        };
+        self.node_store
+            .lock()
+            .expect("node_store lock poisoned")
+            .update_node_position(from.clone(), pos);
     }
 }

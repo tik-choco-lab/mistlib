@@ -52,6 +52,7 @@ pub fn make_exchanger(
     (exchanger, ds, ns)
 }
 
+#[allow(clippy::type_complexity)]
 pub fn make_exchanger_full(
     id: &str,
     config: &Config,
@@ -78,8 +79,8 @@ pub fn make_strategy(local: &str) -> DNVE3Strategy {
 pub fn extract_node_list_payload(action: &OverlayAction) -> Vec<u8> {
     match action {
         OverlayAction::SendMessage { data, .. } => {
-            let env: OverlayEnvelope =
-                bincode::deserialize(data).expect("SendMessage data should be a valid envelope");
+            let env: OverlayEnvelope = crate::overlay::wire::deserialize(data)
+                .expect("SendMessage data should be a valid envelope");
             match env.content {
                 MessageContent::Overlay(msg) => msg.payload,
                 _ => vec![],

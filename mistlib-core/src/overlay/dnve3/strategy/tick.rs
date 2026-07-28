@@ -1,6 +1,8 @@
 mod balancer;
 mod heartbeat;
 mod node_list;
+pub(crate) mod node_list_adaptive;
+mod ping;
 mod timer;
 
 use super::DNVE3Strategy;
@@ -32,7 +34,21 @@ impl DNVE3Strategy {
     ) -> Vec<OverlayAction> {
         let mut actions = self.tick_balancer(config, now, connected_node_states, density_guidance);
         actions.extend(self.tick_periodic(config, now, connected_nodes, mode));
+        actions.extend(self.tick_ping(config, now, connected_nodes));
         actions.extend(self.tick_node_list(config, now, connected_nodes, mode, density_guidance));
         actions
+    }
+
+    /// Runs the balancer immediately, bypassing its periodic timer, and
+    /// reschedules the next periodic balancer tick from now so it doesn't
+    /// fire again moments later. Called when a peer disconnect is confirmed
+    /// so recovery doesn't wait for the next tick window.
+    pub(super) fn force_immediate_rebalance(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+        density_guidance: Option<&DensityGuidance>,
+    ) -> Vec<OverlayAction> {
+        self.force_immediate_balancer_tick(config, connected_node_states, density_guidance)
     }
 }

@@ -1,0 +1,7 @@
+# Locks Rust formatting so PR diffs stay semantic-only.
+# Stable-channel options only — nightly-only keys would be ignored with a warning.
+edition = "2021"
+max_width = 100
+# Repo has Windows contributors (see Justfile powershell.exe fallbacks);
+# force LF so line endings never show up as diff noise.
+newline_style = "Unix"

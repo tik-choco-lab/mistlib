@@ -42,7 +42,7 @@ impl DNVE3Strategy {
             let layer_count = store
                 .self_density
                 .as_ref()
-                .map(|data| data.layer_count.max(1))
+                .map(|data| (data.layer_count as usize).max(1))
                 .unwrap_or(fallback_layer_count);
             let self_map = store
                 .self_density

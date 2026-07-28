@@ -9,6 +9,9 @@ pub const EVENT_AOI_LEFT: u32 = crate::app::EVENT_AOI_LEFT;
 pub const EVENT_PEER_CONNECTED: u32 = crate::app::EVENT_PEER_CONNECTED;
 pub const EVENT_PEER_DISCONNECTED: u32 = crate::app::EVENT_PEER_DISCONNECTED;
 pub const EVENT_AOI_NODES: u32 = crate::app::EVENT_AOI_NODES;
+pub const EVENT_ROOM_JOINED: u32 = crate::app::EVENT_ROOM_JOINED;
+pub const EVENT_ROOM_JOIN_FAILED: u32 = crate::app::EVENT_ROOM_JOIN_FAILED;
+pub const EVENT_ROOM_LEFT: u32 = crate::app::EVENT_ROOM_LEFT;
 pub const MEDIA_EVENT_TRACK_ADDED: u32 = crate::app::MEDIA_EVENT_TRACK_ADDED;
 pub const MEDIA_EVENT_TRACK_REMOVED: u32 = crate::app::MEDIA_EVENT_TRACK_REMOVED;
 
@@ -32,8 +35,18 @@ pub fn init(id: String, url: String) {
 }
 
 #[wasm_bindgen]
+pub fn init_with_config(id: String, config: String) -> bool {
+    crate::app::init_with_config(id, config)
+}
+
+#[wasm_bindgen]
 pub fn update_position(x: f32, y: f32, z: f32) {
     crate::app::update_position(x, y, z);
+}
+
+#[wasm_bindgen]
+pub fn update_position_in_room(room_id: String, x: f32, y: f32, z: f32) -> Result<(), JsValue> {
+    crate::app::update_position_in_room(room_id, x, y, z)
 }
 
 #[wasm_bindgen]
@@ -42,8 +55,18 @@ pub fn get_neighbors() -> String {
 }
 
 #[wasm_bindgen]
+pub fn get_neighbors_in_room(room_id: String) -> Result<String, JsValue> {
+    crate::app::get_neighbors_in_room(room_id)
+}
+
+#[wasm_bindgen]
 pub fn get_all_nodes() -> String {
     crate::app::get_all_nodes()
+}
+
+#[wasm_bindgen]
+pub fn get_all_nodes_in_room(room_id: String) -> Result<String, JsValue> {
+    crate::app::get_all_nodes_in_room(room_id)
 }
 
 #[wasm_bindgen]
@@ -52,8 +75,23 @@ pub fn join_room(room_id: String) {
 }
 
 #[wasm_bindgen]
+pub fn join_room_async(room_id: String) -> js_sys::Promise {
+    crate::app::join_room_async(room_id)
+}
+
+#[wasm_bindgen]
+pub fn is_room_joined(room_id: String) -> bool {
+    crate::app::is_room_joined(room_id)
+}
+
+#[wasm_bindgen]
 pub fn leave_room() {
     crate::app::leave_room();
+}
+
+#[wasm_bindgen]
+pub fn leave_room_id(room_id: String) -> Result<(), JsValue> {
+    crate::app::leave_room_id(room_id)
 }
 
 #[wasm_bindgen]
@@ -64,6 +102,16 @@ pub fn set_config(data: String) -> bool {
 #[wasm_bindgen]
 pub fn send_message(target_id: String, data: &[u8], method: u32) {
     crate::app::send_message(target_id, data, method);
+}
+
+#[wasm_bindgen]
+pub fn send_message_in_room(
+    room_id: String,
+    target_id: String,
+    data: &[u8],
+    method: u32,
+) -> Result<(), JsValue> {
+    crate::app::send_message_in_room(room_id, target_id, data, method)
 }
 
 #[wasm_bindgen]

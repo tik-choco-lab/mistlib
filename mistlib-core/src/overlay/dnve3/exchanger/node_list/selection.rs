@@ -12,8 +12,11 @@ impl DNVE3Exchanger {
         requester: &NodeId,
         mode: ConnectionMode,
     ) -> Vec<NodeStoreNode> {
-        let node_store = self.node_store.lock().unwrap();
-        let routing_table = self.routing_table.lock().unwrap();
+        let node_store = self.node_store.lock().expect("node_store lock poisoned");
+        let routing_table = self
+            .routing_table
+            .lock()
+            .expect("routing_table lock poisoned");
 
         match mode {
             ConnectionMode::DirectionDensity => {

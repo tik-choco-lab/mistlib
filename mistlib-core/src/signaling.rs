@@ -1,4 +1,6 @@
 pub mod message;
+pub mod nostr;
+pub mod reconnect;
 pub mod relay;
 pub mod r#trait;
 

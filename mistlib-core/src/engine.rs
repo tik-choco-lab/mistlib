@@ -5,6 +5,7 @@ use crate::types::NodeId;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
 mod action;
 mod events;
@@ -28,6 +29,9 @@ pub struct MistEngine {
     // Inner Arc lets us clone the handler out of the Mutex before calling on_event,
     // so the lock is not held during the (potentially slow) handler invocation.
     event_handler: Arc<Mutex<Arc<dyn EngineEventHandler>>>,
+    // Signals when the previous leave_room()'s disconnect cleanup has
+    // finished, so a subsequent run() can wait for it instead of racing it.
+    cleanup_done: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl MistEngine {
@@ -41,6 +45,7 @@ impl MistEngine {
             aoi_nodes: Arc::new(Mutex::new(HashSet::new())),
             run_generation: AtomicU64::new(0),
             event_handler: Arc::new(Mutex::new(Arc::new(DummyEngineEventHandler))),
+            cleanup_done: Mutex::new(None),
         })
     }
 

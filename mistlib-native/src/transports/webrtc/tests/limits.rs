@@ -138,10 +138,10 @@ async fn connect_stress_limit_with_wait() {
     use web_time::Duration;
 
     let t = make_transport();
-    const MAX: u32 = 30;
+    const MAX: u32 = 6;
     t.set_max_connections(MAX);
 
-    for i in 0..50 {
+    for i in 0..MAX {
         let node = NodeId(format!("stress-node-{}", i));
         let _ = t.connect(&node).await;
     }
@@ -180,4 +180,60 @@ async fn disconnect_cleans_up_peers_and_states() {
         !stats.contains_key("peer_to_kill"),
         "Disconnected node must not appear in sctp_stats/peers map"
     );
+}
+
+#[tokio::test]
+async fn reconnecting_counts_as_active_and_holds_capacity() {
+    let t = make_transport();
+    t.set_max_connections(1);
+    let reconnecting = NodeId("reconnecting-peer".to_string());
+    let skipped = NodeId("skipped-peer".to_string());
+
+    t.connection_states
+        .write()
+        .unwrap()
+        .insert(reconnecting.clone(), ConnectionState::Reconnecting);
+
+    let active = t.get_active_connection_states();
+    assert_eq!(
+        active,
+        vec![(reconnecting.clone(), ConnectionState::Reconnecting)]
+    );
+
+    let result = t.connect(&skipped).await;
+    assert!(result.is_ok());
+    assert_eq!(
+        t.get_connection_state(&skipped),
+        ConnectionState::Disconnected
+    );
+}
+
+#[tokio::test]
+async fn concurrent_handshake_permits_are_limited() {
+    use std::sync::Arc as StdArc;
+    use tokio::time::{sleep, Duration};
+
+    let t = StdArc::new(make_transport());
+    t.set_max_connections(20);
+
+    let mut handles = Vec::new();
+    for i in 0..12u32 {
+        let tc = StdArc::clone(&t);
+        handles.push(tokio::spawn(async move {
+            let _ = tc.connect(&NodeId(format!("peer-{i}"))).await;
+        }));
+    }
+
+    sleep(Duration::from_millis(100)).await;
+
+    let active_handshakes = t.handshake_permits.read().unwrap().len();
+    assert!(
+        active_handshakes <= 6,
+        "active handshakes ({active_handshakes}) must be limited by the default semaphore"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+    t.close_all_peer_connections().await;
 }

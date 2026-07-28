@@ -1,164 +1,20 @@
 use async_trait::async_trait;
+pub use mistlib_core::storage::protocol::{
+    build_have_chunk_message, build_have_message, build_have_status_message, build_query_message,
+    parse_have_chunk_message, parse_have_message, parse_have_status_message, parse_query_message,
+    parse_want_message, WantRegistry, HAVE_CHUNK_SIZE, MSG_HAVE, MSG_HAVE_CHUNK, MSG_HAVE_STATUS,
+    MSG_QUERY, MSG_WANT,
+};
 use mistlib_core::storage::PeerResolver;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
-
-pub const MSG_WANT: u8 = 0x01;
-pub const MSG_HAVE: u8 = 0x02;
-pub const MSG_QUERY: u8 = 0x03;
-pub const MSG_HAVE_STATUS: u8 = 0x04;
-pub const MSG_HAVE_CHUNK: u8 = 0x05;
-pub const HAVE_CHUNK_SIZE: usize = 16 * 1024;
-
-type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>>;
-type PeerCache = Arc<Mutex<HashMap<String, Vec<mistlib_core::types::NodeId>>>>;
-type PeerNotifiers = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>;
-type ChunkMap = Arc<Mutex<HashMap<String, ChunkAssembly>>>;
-
-#[derive(Debug, Clone)]
-struct ChunkAssembly {
-    total_chunks: u16,
-    received_chunks: u16,
-    chunks: Vec<Option<Vec<u8>>>,
-}
-
-#[derive(Clone)]
-pub struct WantRegistry {
-    pending: PendingMap,
-    peer_cache: PeerCache,
-    peer_notifiers: PeerNotifiers,
-    chunk_assemblies: ChunkMap,
-}
-
-impl WantRegistry {
-    pub fn new() -> Self {
-        Self {
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            peer_cache: Arc::new(Mutex::new(HashMap::new())),
-            peer_notifiers: Arc::new(Mutex::new(HashMap::new())),
-            chunk_assemblies: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub fn register(&self, cid: &str) -> oneshot::Receiver<Vec<u8>> {
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(cid.to_string(), tx);
-        rx
-    }
-
-    pub fn fulfill(&self, cid: &str, data: Vec<u8>) {
-        self.chunk_assemblies.lock().unwrap().remove(cid);
-        if let Some(tx) = self.pending.lock().unwrap().remove(cid) {
-            let _ = tx.send(data);
-        }
-    }
-
-    pub fn fulfill_chunk(&self, cid: &str, chunk_index: u16, chunk_total: u16, data: Vec<u8>) {
-        if chunk_total == 0 || chunk_index >= chunk_total {
-            return;
-        }
-
-        let mut assembled_payload: Option<Vec<u8>> = None;
-
-        {
-            let mut assemblies = self.chunk_assemblies.lock().unwrap();
-            let entry = assemblies
-                .entry(cid.to_string())
-                .or_insert_with(|| ChunkAssembly {
-                    total_chunks: chunk_total,
-                    received_chunks: 0,
-                    chunks: vec![None; chunk_total as usize],
-                });
-
-            if entry.total_chunks != chunk_total {
-                *entry = ChunkAssembly {
-                    total_chunks: chunk_total,
-                    received_chunks: 0,
-                    chunks: vec![None; chunk_total as usize],
-                };
-            }
-
-            let slot = &mut entry.chunks[chunk_index as usize];
-            if slot.is_none() {
-                *slot = Some(data);
-                entry.received_chunks += 1;
-            }
-
-            if entry.received_chunks == entry.total_chunks {
-                let mut full = Vec::new();
-                for chunk in &mut entry.chunks {
-                    if let Some(part) = chunk.take() {
-                        full.extend_from_slice(&part);
-                    }
-                }
-                assembled_payload = Some(full);
-                assemblies.remove(cid);
-            }
-        }
-
-        if let Some(full) = assembled_payload {
-            self.fulfill(cid, full);
-        }
-    }
-
-    pub fn cancel(&self, cid: &str) {
-        self.pending.lock().unwrap().remove(cid);
-        self.peer_notifiers.lock().unwrap().remove(cid);
-        self.chunk_assemblies.lock().unwrap().remove(cid);
-    }
-
-    pub fn register_peer_notifier(&self, cid: &str) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        self.peer_notifiers
-            .lock()
-            .unwrap()
-            .entry(cid.to_string())
-            .or_default()
-            .push(tx);
-        rx
-    }
-
-    pub fn register_peer(&self, cid: &str, peer_id: mistlib_core::types::NodeId) {
-        {
-            let mut cache = self.peer_cache.lock().unwrap();
-            let peers = cache.entry(cid.to_string()).or_default();
-            if !peers.contains(&peer_id) {
-                peers.push(peer_id);
-            }
-        }
-
-        if let Some(notifiers) = self.peer_notifiers.lock().unwrap().remove(cid) {
-            for tx in notifiers {
-                let _ = tx.send(());
-            }
-        }
-    }
-
-    pub fn get_peers(&self, cid: &str) -> Vec<mistlib_core::types::NodeId> {
-        self.peer_cache
-            .lock()
-            .unwrap()
-            .get(cid)
-            .cloned()
-            .unwrap_or_default()
-    }
-}
 
 pub struct WasmPeerResolver {
-    transport: Arc<dyn mistlib_core::transport::Transport>,
     registry: WantRegistry,
     timeout_ms: u32,
 }
 
 impl WasmPeerResolver {
-    pub fn new(
-        transport: Arc<dyn mistlib_core::transport::Transport>,
-        registry: WantRegistry,
-        timeout_ms: u32,
-    ) -> Self {
+    pub fn new(registry: WantRegistry, timeout_ms: u32) -> Self {
         Self {
-            transport,
             registry,
             timeout_ms,
         }
@@ -177,14 +33,19 @@ impl PeerResolver for WasmPeerResolver {
             tracing::debug!("PeerResolver: Discovery phase for {}", cid);
             let rx_peer = self.registry.register_peer_notifier(cid);
 
+            // Storage is process-wide but content-addressed blocks aren't
+            // room-scoped, so fan the QUERY out across every joined room's
+            // transport, snapshotted right before sending (no single
+            // captured transport -- multi-room contract point 10).
             let query_msg = build_query_message(cid);
-            let _ = self
-                .transport
-                .broadcast(
-                    bytes::Bytes::from(query_msg),
-                    DeliveryMethod::ReliableOrdered,
-                )
-                .await;
+            for transport in crate::app::all_session_transports() {
+                let _ = transport
+                    .broadcast(
+                        bytes::Bytes::from(query_msg.clone()),
+                        DeliveryMethod::ReliableOrdered,
+                    )
+                    .await;
+            }
 
             let timeout = gloo_timers::future::TimeoutFuture::new(500);
             futures::select! {
@@ -207,14 +68,18 @@ impl PeerResolver for WasmPeerResolver {
                 tracing::debug!("PeerResolver: targeted WANT for {} to {}", cid, target.0);
                 let mut want_msg = vec![MSG_WANT];
                 want_msg.extend_from_slice(cid.as_bytes());
-                let _ = self
-                    .transport
-                    .send(
-                        &target,
-                        bytes::Bytes::from(want_msg),
-                        DeliveryMethod::ReliableOrdered,
-                    )
-                    .await;
+                // We don't track which session's transport actually knows
+                // `target`, so fan the unicast WANT out too: transports
+                // without a route to it just return an error, harmlessly.
+                for transport in crate::app::all_session_transports() {
+                    let _ = transport
+                        .send(
+                            &target,
+                            bytes::Bytes::from(want_msg.clone()),
+                            DeliveryMethod::ReliableOrdered,
+                        )
+                        .await;
+                }
             }
         } else {
             tracing::debug!(
@@ -223,13 +88,14 @@ impl PeerResolver for WasmPeerResolver {
             );
             let mut want_msg = vec![MSG_WANT];
             want_msg.extend_from_slice(cid.as_bytes());
-            let _ = self
-                .transport
-                .broadcast(
-                    bytes::Bytes::from(want_msg),
-                    DeliveryMethod::ReliableOrdered,
-                )
-                .await;
+            for transport in crate::app::all_session_transports() {
+                let _ = transport
+                    .broadcast(
+                        bytes::Bytes::from(want_msg.clone()),
+                        DeliveryMethod::ReliableOrdered,
+                    )
+                    .await;
+            }
         }
 
         let timeout = gloo_timers::future::TimeoutFuture::new(self.timeout_ms);
@@ -242,98 +108,4 @@ impl PeerResolver for WasmPeerResolver {
             }
         }
     }
-}
-
-pub fn parse_have_message(raw: &[u8]) -> Option<(String, Vec<u8>)> {
-    if raw.len() < 2 || raw[0] != MSG_HAVE {
-        return None;
-    }
-    let cid_len = raw[1] as usize;
-    if raw.len() < 2 + cid_len {
-        return None;
-    }
-    let cid = std::str::from_utf8(&raw[2..2 + cid_len]).ok()?.to_string();
-    Some((cid, raw[2 + cid_len..].to_vec()))
-}
-
-pub fn build_have_message(cid: &str, data: &[u8]) -> Vec<u8> {
-    let cb = cid.as_bytes();
-    let mut msg = Vec::with_capacity(2 + cb.len() + data.len());
-    msg.push(MSG_HAVE);
-    msg.push(cb.len() as u8);
-    msg.extend_from_slice(cb);
-    msg.extend_from_slice(data);
-    msg
-}
-
-pub fn build_have_chunk_message(
-    cid: &str,
-    chunk_index: u16,
-    chunk_total: u16,
-    data: &[u8],
-) -> Vec<u8> {
-    let cb = cid.as_bytes();
-    let mut msg = Vec::with_capacity(6 + cb.len() + data.len());
-    msg.push(MSG_HAVE_CHUNK);
-    msg.push(cb.len() as u8);
-    msg.extend_from_slice(&chunk_index.to_be_bytes());
-    msg.extend_from_slice(&chunk_total.to_be_bytes());
-    msg.extend_from_slice(cb);
-    msg.extend_from_slice(data);
-    msg
-}
-
-pub fn parse_have_chunk_message(raw: &[u8]) -> Option<(String, u16, u16, Vec<u8>)> {
-    if raw.len() < 6 || raw[0] != MSG_HAVE_CHUNK {
-        return None;
-    }
-
-    let cid_len = raw[1] as usize;
-    let header_end = 6 + cid_len;
-    if raw.len() < header_end {
-        return None;
-    }
-
-    let chunk_index = u16::from_be_bytes([raw[2], raw[3]]);
-    let chunk_total = u16::from_be_bytes([raw[4], raw[5]]);
-    if chunk_total == 0 || chunk_index >= chunk_total {
-        return None;
-    }
-
-    let cid = std::str::from_utf8(&raw[6..header_end]).ok()?.to_string();
-    let payload = raw[header_end..].to_vec();
-    Some((cid, chunk_index, chunk_total, payload))
-}
-
-pub fn parse_want_message(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() || raw[0] != MSG_WANT {
-        return None;
-    }
-    std::str::from_utf8(&raw[1..]).ok().map(|s| s.to_string())
-}
-
-pub fn build_query_message(cid: &str) -> Vec<u8> {
-    let mut msg = vec![MSG_QUERY];
-    msg.extend_from_slice(cid.as_bytes());
-    msg
-}
-
-pub fn parse_query_message(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() || raw[0] != MSG_QUERY {
-        return None;
-    }
-    std::str::from_utf8(&raw[1..]).ok().map(|s| s.to_string())
-}
-
-pub fn build_have_status_message(cid: &str) -> Vec<u8> {
-    let mut msg = vec![MSG_HAVE_STATUS];
-    msg.extend_from_slice(cid.as_bytes());
-    msg
-}
-
-pub fn parse_have_status_message(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() || raw[0] != MSG_HAVE_STATUS {
-        return None;
-    }
-    std::str::from_utf8(&raw[1..]).ok().map(|s| s.to_string())
 }

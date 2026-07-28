@@ -1,0 +1,7 @@
+[toolchain]
+# Pin the toolchain so fmt/clippy output is deterministic across contributors and CI.
+# Bump deliberately (in its own commit) so any resulting fmt/clippy drift is reviewable.
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+# mistlib-wasm builds for the browser; make the target available out of the box.
+targets = ["wasm32-unknown-unknown"]

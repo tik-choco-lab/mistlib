@@ -1,195 +1,77 @@
+# mistlib (公開リポジトリ) の CI。
+#
+# このファイルは mistlib-dev の publish/overlay/ が正。公開リポジトリ側で直接
+# 編集しても次回の `just publish-sync` で上書きされる。内容は mistlib-dev の
+# .github/workflows/ci.yml と同じゲート（fmt / clippy / nextest / wasm build）を
+# 公開側の crates だけに適用したもの。dev 側の CI 定義を変えたらこちらも揃える。
+
 name: CI
 
 on:
   push:
-    tags: [ "v*" ]
+    branches: [develop, main]
   pull_request:
-    branches: [ "main" ]
+    branches: [develop, main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 警告のゲートは clippy コマンド側の `-- -D warnings` で明示する。グローバルな
+# RUSTFLAGS にすると wasm ビルド（wasm-pack は clippy ではなく rustc を走らせる）が
+# 既知の dead_code ベースラインで落ちる。
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: read
-
 jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml がバージョンと components を固定している。
+      - run: rustup show
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (core + native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p mistlib-core -p mistlib-native --all-targets --locked -- -D warnings
+      # wasm は既知の警告ベースライン（単一スレッドのブラウザ標的における
+      # arc_with_non_send_sync 誤検知が大半）を抱えている。報告はするがゲートしない。
+      - name: clippy (wasm, informational)
+        continue-on-error: true
+        run: cargo clippy -p mistlib-wasm --target wasm32-unknown-unknown --all-targets
+
   test:
-    name: Rust Tests
+    name: test (core + native)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-      - name: Run tests
-        run: cargo test --workspace
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # ci プロファイル (.config/nextest.toml) が実タイミング依存の WebRTC テストを
+      # リトライするので、共有ランナーのタイミングゆらぎで run が赤くならない。
+      - run: cargo nextest run -p mistlib-core -p mistlib-native --locked --profile ci
+      # nextest は doctest を走らせないので別途実行し、静かに腐るのを防ぐ。
+      - run: cargo test -p mistlib-core -p mistlib-native --doc --locked
 
-  build-wasm:
-    name: Build WASM
-    needs: test
+  wasm:
+    name: wasm build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
         with:
-          targets: wasm32-unknown-unknown
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          key: wasm
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-      - name: Build WASM
-        run: |
-          cd mistlib-wasm
-          wasm-pack build --target web
-      - name: Upload WASM Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mistlib-wasm-pkg
-          path: mistlib-wasm/pkg/
-
-      - name: Package WASM Release Asset
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          rm -rf release
-          mkdir -p release/mistlib-wasm
-          mkdir -p release/wrappers/web
-          cp -r mistlib-wasm/pkg release/mistlib-wasm/pkg
-          cp mistlib-wasm/LICENSE release/mistlib-wasm/LICENSE
-          cp mistlib-wasm/README.md release/mistlib-wasm/README.md
-          cp wrappers/web/index.js release/wrappers/web/index.js
-          cp wrappers/web/index.d.ts release/wrappers/web/index.d.ts
-          cp wrappers/web/package.json release/wrappers/web/package.json
-          cp README.md release/README.md
-          cp LICENSE release/LICENSE
-          cd release
-          zip -r ../mistlib-wasm-pkg-${{ github.ref_name }}.zip .
-
-      - name: Upload WASM Release Asset
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: mistlib-wasm-release
-          path: mistlib-wasm-pkg-${{ github.ref_name }}.zip
-
-  build-native:
-    name: Build Native (${{ matrix.os }})
-    needs: test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact_name: mistlib-native-linux
-            binary_path: target/release/libmistlib.so
-            binary_name: libmistlib.so
-          - os: windows-latest
-            artifact_name: mistlib-native-windows
-            binary_path: target/release/mistlib.dll
-            binary_name: mistlib.dll
-          - os: macos-latest
-            artifact_name: mistlib-native-macos
-            binary_path: target/release/libmistlib.dylib
-            binary_name: libmistlib.dylib
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}
-      - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-      - name: Build (Release)
-        run: cargo build --release -p mistlib-native
-      - name: Upload Binary (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: mistlib-native-windows
-          path: target/release/mistlib.dll
-      - name: Upload Binary (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: mistlib-native-linux
-          path: target/release/libmistlib.so
-      - name: Upload Binary (macOS)
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: mistlib-native-macos
-          path: target/release/libmistlib.dylib
-
-      - name: Prepare Release Asset (Windows)
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release/wrappers/python | Out-Null
-          New-Item -ItemType Directory -Force -Path release/wrappers/unity | Out-Null
-          Copy-Item "${{ matrix.binary_path }}" "release/${{ matrix.binary_name }}"
-          Copy-Item "README.md" "release/README.md"
-          Copy-Item "LICENSE" "release/LICENSE"
-          Copy-Item "wrappers/python/README.md" "release/wrappers/python/README.md"
-          Copy-Item "wrappers/python/.env.example" "release/wrappers/python/.env.example"
-          Copy-Item "wrappers/python/mist" "release/wrappers/python/mist" -Recurse
-          Copy-Item "wrappers/unity/MistLib" "release/wrappers/unity/MistLib" -Recurse
-          Compress-Archive -Path release/* -DestinationPath "${{ matrix.artifact_name }}-${{ github.ref_name }}.zip" -Force
-
-      - name: Prepare Release Asset (Linux/macOS)
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.os != 'windows-latest'
-        run: |
-          rm -rf release
-          mkdir -p release/wrappers/python
-          mkdir -p release/wrappers/unity
-          cp "${{ matrix.binary_path }}" "release/${{ matrix.binary_name }}"
-          cp README.md release/README.md
-          cp LICENSE release/LICENSE
-          cp wrappers/python/README.md release/wrappers/python/README.md
-          cp wrappers/python/.env.example release/wrappers/python/.env.example
-          cp -r wrappers/python/mist release/wrappers/python/mist
-          cp -r wrappers/unity/MistLib release/wrappers/unity/MistLib
-          cd release
-          zip -r ../${{ matrix.artifact_name }}-${{ github.ref_name }}.zip .
-
-      - name: Upload Native Release Asset
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}-release
-          path: ${{ matrix.artifact_name }}-${{ github.ref_name }}.zip
-
-  publish-release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - build-wasm
-      - build-native
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download release assets
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "*-release"
-          path: release-assets
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            release-assets/**/*.zip
+          tool: wasm-pack
+      - run: wasm-pack build --target web
+        working-directory: mistlib-wasm

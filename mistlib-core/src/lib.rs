@@ -6,10 +6,13 @@ pub mod layers;
 pub mod overlay;
 pub mod runtime;
 pub mod signaling;
+#[cfg(all(feature = "sim", not(target_arch = "wasm32")))]
+pub mod sim;
 pub mod stats;
 pub mod storage;
 pub mod transport;
 pub mod types;
+mod util;
 
 pub use action::OverlayAction;
 pub use config::Config;

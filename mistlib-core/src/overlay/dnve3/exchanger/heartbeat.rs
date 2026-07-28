@@ -8,6 +8,7 @@ use crate::signaling::MessageContent;
 use crate::types::{DeliveryMethod, NodeId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use web_time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) enum HeartbeatDensityPayload {
@@ -46,11 +47,28 @@ impl DNVE3Exchanger {
     pub fn update_and_send_heartbeat(
         &self,
         config: &Config,
+        now: Instant,
         connected_nodes: &[NodeId],
     ) -> Vec<OverlayAction> {
         let input = self.local_density_input(connected_nodes);
         let self_density = self.create_self_density(&input, config);
         let self_density_data = self.store_self_density_and_merge(input.self_pos, self_density);
+
+        // Receivers prune density_peers by last-message time (expire_node_seconds),
+        // so an unchanged sender must still refresh at least this often.
+        let min_refresh =
+            Duration::from_secs_f32((config.limits.expire_node_seconds / 3.0).max(0.0));
+        let should_send = {
+            let mut store = self
+                .dnve_data_store
+                .lock()
+                .expect("dnve_data_store lock poisoned");
+            store.should_send_heartbeat(&self_density_data, connected_nodes, min_refresh, now)
+        };
+        if !should_send {
+            return Vec::new();
+        }
+
         let payload = Self::encode_heartbeat_payload(&self_density_data, config);
 
         connected_nodes
@@ -67,7 +85,7 @@ impl DNVE3Exchanger {
 
     fn local_density_input(&self, connected_nodes: &[NodeId]) -> LocalDensityInput {
         let connected_set = connected_nodes.iter().collect::<HashSet<_>>();
-        let store = self.node_store.lock().unwrap();
+        let store = self.node_store.lock().expect("node_store lock poisoned");
         let self_id = self.local_node_id.clone();
         let self_pos = store
             .nodes
@@ -106,7 +124,10 @@ impl DNVE3Exchanger {
         self_pos: Vector3,
         self_density: SpatialDensityData,
     ) -> SpatialDensityData {
-        let mut store = self.dnve_data_store.lock().unwrap();
+        let mut store = self
+            .dnve_data_store
+            .lock()
+            .expect("dnve_data_store lock poisoned");
         let merged_density = self.merged_density_map(&store, self_pos, &self_density);
         store.self_density = Some(self_density.clone());
         store.merged_density_map = Some(merged_density);
@@ -139,17 +160,17 @@ impl DNVE3Exchanger {
         target: &NodeId,
         payload: &[u8],
     ) -> Option<OverlayAction> {
-        let envelope = OverlayEnvelope {
-            from: from.clone(),
-            to: target.clone(),
-            hop_count: self.hop_count,
-            content: MessageContent::Overlay(OverlayMessage {
+        let envelope = OverlayEnvelope::new(
+            from.clone(),
+            target.clone(),
+            self.hop_count,
+            MessageContent::Overlay(OverlayMessage {
                 message_type: OVERLAY_MSG_HEARTBEAT,
                 payload: payload.to_vec(),
             }),
-        };
+        );
 
-        let data = bincode::serialize(&envelope)
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| {
                 tracing::warn!(
                     "[DNVE3] failed to serialize heartbeat envelope to {}: {}",
@@ -168,11 +189,11 @@ impl DNVE3Exchanger {
     fn apply_heartbeat_density(&self, from: NodeId, data: SpatialDensityData) {
         self.dnve_data_store
             .lock()
-            .unwrap()
+            .expect("dnve_data_store lock poisoned")
             .add_or_update_neighbor(from.clone(), data.clone());
         self.node_store
             .lock()
-            .unwrap()
+            .expect("node_store lock poisoned")
             .update_node_position(from, data.position);
     }
 }

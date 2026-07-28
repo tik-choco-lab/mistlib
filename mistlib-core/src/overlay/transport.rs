@@ -59,13 +59,14 @@ impl Transport for OverlayTransport {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signaler for OverlayTransport {
     async fn send_signaling(&self, to: &NodeId, msg: MessageContent) -> crate::error::Result<()> {
-        let envelope = OverlayEnvelope {
-            from: self.router.local_node_id.clone(),
-            to: to.clone(),
-            hop_count: self.router.hop_count,
-            content: msg,
-        };
-        let data = bincode::serialize(&envelope)
+        let envelope = OverlayEnvelope::new(
+            self.router.local_node_id.clone(),
+            to.clone(),
+            self.router.hop_count,
+            msg,
+        );
+        self.router.remember_outgoing(&envelope);
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| crate::error::MistError::Internal(e.to_string()))?;
         let next_hop = {
             let rt = self.router.routing_table.lock().unwrap();

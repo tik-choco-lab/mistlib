@@ -1,20 +1,15 @@
-use mistlib_core::overlay::ActionHandler;
-use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
 
-use super::{EngineState, ENGINE};
+use super::{SessionCtx, ENGINE};
 
 impl super::MistEngine {
-    pub fn spawn_background_loops(&self) {
-        let cancel = CancellationToken::new();
-        {
-            let mut lock = self.background_loops_cancel.lock().unwrap();
-            if lock.is_some() {
-                return;
-            }
-            *lock = Some(cancel.clone());
-        }
-
-        let cancel_aoi = cancel.clone();
+    /// Spawns this session's periodic AOI/neighbor and overlay-tick loops.
+    /// Called exactly once, right after a session is inserted into the
+    /// registry (see `layers/native_l0/room.rs::join_room`); cancelled via
+    /// `ctx.cancel` when the room is left.
+    pub fn spawn_background_loops(&self, ctx: Arc<SessionCtx>) {
+        let cancel_aoi = ctx.cancel.clone();
+        let ctx_aoi = ctx.clone();
         self.runtime.spawn(async move {
             let mut interval = tokio::time::interval(web_time::Duration::from_millis(1000));
             loop {
@@ -22,12 +17,12 @@ impl super::MistEngine {
                     _ = cancel_aoi.cancelled() => break,
                     _ = interval.tick() => {}
                 }
-                ENGINE.check_and_dispatch_aoi().await;
-                ENGINE.check_and_dispatch_neighbors().await;
+                ctx_aoi.check_and_dispatch_aoi().await;
+                ctx_aoi.check_and_dispatch_neighbors().await;
             }
         });
 
-        let cancel_overlay = cancel;
+        let cancel_overlay = ctx.cancel.clone();
         self.runtime.spawn(async move {
             let mut interval = tokio::time::interval(web_time::Duration::from_millis(1000));
             loop {
@@ -36,34 +31,21 @@ impl super::MistEngine {
                     _ = interval.tick() => {}
                 }
 
-                let actions = {
-                    let state_lock = ENGINE.state.read().await;
-                    match &*state_lock {
-                        EngineState::Running(ctx) => {
-                            if let (Some(ov), Some(wt)) = (&ctx.overlay, &ctx.webrtc_transport) {
-                                let states = wt.get_active_connection_states();
-                                ov.sync_connection_states(&states);
-                                let config = ENGINE.config.lock().unwrap().clone();
-                                ov.tick(&config, &states)
-                            } else {
-                                vec![]
-                            }
-                        }
-                        _ => vec![],
-                    }
+                let actions = if let (Some(ov), Some(wt)) = (&ctx.overlay, &ctx.webrtc_transport) {
+                    let states = wt.get_active_connection_states();
+                    ov.sync_connection_states(&states);
+                    let config = ENGINE.config.lock().unwrap().clone();
+                    ov.tick(&config, &states)
+                } else {
+                    vec![]
                 };
 
                 for action in actions {
-                    ENGINE.handle_action(action);
+                    ENGINE.handle_action_for(ctx.clone(), action);
                 }
+
+                ENGINE.flush_expired_reorder(&ctx);
             }
         });
-    }
-
-    pub fn stop_background_loops(&self) {
-        let cancel = self.background_loops_cancel.lock().unwrap().take();
-        if let Some(cancel) = cancel {
-            cancel.cancel();
-        }
     }
 }

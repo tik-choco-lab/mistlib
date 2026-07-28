@@ -25,6 +25,7 @@ web-sys = { version = "0.3", features = [
     "RtcIceServer",
     "RtcIceCandidate",
     "RtcIceCandidateInit",
+    "RtcOfferOptions",
     "RtcPeerConnectionIceEvent",
     "RtcRtpReceiver",
     "RtcRtpSender",
@@ -34,7 +35,9 @@ web-sys = { version = "0.3", features = [
     "RtcTrackEvent",
     "RtcDataChannelState",
     "RtcIceConnectionState",
+    "RtcPeerConnectionState",
     "Window",
+    "Response",
     "console",
     "WebSocket",
     "BinaryType",
@@ -66,3 +69,5 @@ futures = "0.3"
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 web-time = "1.1.0"
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

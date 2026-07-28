@@ -4,9 +4,15 @@ use crate::types::NodeId;
 
 impl DNVE3Exchanger {
     pub(super) fn apply_node_list(&self, from: &NodeId, nodes: Vec<NodeStoreNode>) {
-        let mut node_store = self.node_store.lock().unwrap();
-        let mut dnve_data_store = self.dnve_data_store.lock().unwrap();
-        let mut routing_table = self.routing_table.lock().unwrap();
+        let mut node_store = self.node_store.lock().expect("node_store lock poisoned");
+        let mut dnve_data_store = self
+            .dnve_data_store
+            .lock()
+            .expect("dnve_data_store lock poisoned");
+        let mut routing_table = self
+            .routing_table
+            .lock()
+            .expect("routing_table lock poisoned");
 
         for node in nodes.into_iter().take(MAX_NODE_LIST_NODES) {
             if node.id == self.local_node_id || node.id.is_broadcast() {

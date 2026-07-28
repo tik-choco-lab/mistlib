@@ -2,7 +2,6 @@ use super::timer;
 use crate::action::OverlayAction;
 use crate::config::{Config, ConnectionMode};
 use crate::overlay::dnve3::strategy::DNVE3Strategy;
-use crate::stats::ping;
 use crate::types::NodeId;
 use web_time::Instant;
 
@@ -14,7 +13,7 @@ impl DNVE3Strategy {
         connected_nodes: &[NodeId],
         mode: ConnectionMode,
     ) -> Vec<OverlayAction> {
-        let interval = timer::heartbeat_interval(config);
+        let interval = timer::heartbeat_interval_with_jitter(config);
         if !timer::is_due(
             &self.heartbeat_due_at,
             "heartbeat_due_at",
@@ -26,27 +25,23 @@ impl DNVE3Strategy {
         }
 
         self.exchanger.delete_old_data(config);
-        let mut actions = self.heartbeat_actions(config, connected_nodes, mode);
-        actions.extend(ping::tick_actions(
-            &self.local_node_id,
-            config.limits.hop_count,
-            connected_nodes,
-        ));
-        actions
+        self.heartbeat_actions(config, now, connected_nodes, mode)
     }
 
     fn heartbeat_actions(
         &self,
         config: &Config,
+        now: Instant,
         connected_nodes: &[NodeId],
         mode: ConnectionMode,
     ) -> Vec<OverlayAction> {
         match mode {
             ConnectionMode::DirectionDensity
             | ConnectionMode::DirectionDensityLight
-            | ConnectionMode::NodeListAoiDensity => self
-                .exchanger
-                .update_and_send_heartbeat(config, connected_nodes),
+            | ConnectionMode::NodeListAoiDensity => {
+                self.exchanger
+                    .update_and_send_heartbeat(config, now, connected_nodes)
+            }
             ConnectionMode::NodeListDirectional
             | ConnectionMode::NodeListAoiGuard
             | ConnectionMode::NodeListAoiProximity

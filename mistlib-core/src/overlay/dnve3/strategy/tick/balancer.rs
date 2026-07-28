@@ -26,4 +26,23 @@ impl DNVE3Strategy {
 
         self.run_select_connection(config, connected_node_states, density_guidance)
     }
+
+    /// Runs a connection re-selection immediately, bypassing the periodic
+    /// balancer timer, and pushes the next periodic tick out from now so it
+    /// doesn't fire again moments later. Used when a peer disconnect is
+    /// confirmed, so recovery doesn't wait for the next tick window.
+    pub(super) fn force_immediate_balancer_tick(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+        density_guidance: Option<&DensityGuidance>,
+    ) -> Vec<OverlayAction> {
+        let next_due_at = Instant::now() + timer::balancer_interval_with_jitter(config);
+        *self
+            .balancer_due_at
+            .lock()
+            .expect("balancer_due_at lock poisoned") = Some(next_due_at);
+
+        self.run_select_connection(config, connected_node_states, density_guidance)
+    }
 }
