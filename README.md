@@ -1,94 +1,180 @@
+<div align="center">
+
 # mistlib
 
-**mistlib** は、Webブラウザ、ネイティブ、およびゲームエンジン間で動作する分散P2Pネットワークライブラリです。
-サーバーを介さずユーザー間で直接通信を行うことで、低遅延な状態同期を実現します。
+**Peer-to-peer networking for large shared 3D spaces.**
+
+[![npm](https://img.shields.io/npm/v/mistlib?logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/mistlib)
+[![release](https://img.shields.io/github/v/release/tik-choco-lab/mistlib?label=release&color=2f6feb)](https://github.com/tik-choco-lab/mistlib/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/tik-choco-lab/mistlib/ci.yml?branch=main&label=CI)](https://github.com/tik-choco-lab/mistlib/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
+
+English · [日本語](README.ja.md) · [简体中文](README.zh.md)
+
+</div>
 
 ---
 
-## 機能
+Peers talk directly over WebRTC data channels. Connecting everyone to everyone does not scale,
+so mistlib bounds each node's connection count and picks *which* peers to hold from 3D proximity
+and neighbour density per direction. Messages for peers outside that set are relayed across the
+resulting overlay.
 
-- **マルチプラットフォーム & マルチ言語**: Rust製の共通コアにより、デスクトップ(Native)およびブラウザ(WASM)の両方に対応。Unity (C#)、Python、JavaScript/TypeScript から利用可能です。
-- **通信・ネットワーク**:
-  - WebRTC (P2P) と WebSocket を併用し、環境に応じた最適な接続（NAT越え等）を構築。
-  - 接続状況に応じてネットワークトポロジーを動的に更新・最適化。
-  - ルームへの参加・退出およびノードの状態管理。
-- **空間同期 (AOI) & トポロジー最適化**: 3次元座標に基づき、近接ノード間での通信を自動最適化。**[方向密度マップ](spatial_density_map.md)** を用いて、周囲のノード分布に基づいた効率的な接続維持と負荷分散（DNVE3）を実現。
-- **メッセージング**: バイナリ・テキスト・JSONデータの送受信。
-  - ユニキャストおよびブロードキャスト（`toId` を空に指定）に対応。
-  - 配送品質（Reliable / UnreliableOrdered / Unreliable）を選択可能。
-- **メディア同期**: WebRTCによる音声・ビデオトラックのリアルタイム公開と受信。
-- **ストレージ**: OPFS (Origin Private File System) 等を利用したデータの永続化。
+Written in Rust. Ships as a native library for engines and desktop apps, and as WebAssembly for
+the browser.
 
-## プロジェクト構成
+## Features
 
-- **mistlib-core**: P2Pアルゴリズムおよび通信制御ロジックの基盤。
-- **mistlib-native**: PC・サーバー向け実装。
-- **mistlib-wasm**: WebAssembly環境向け実装。
-- **wrappers**: 各開発環境向けのインターフェース。
+|  |  |
+| --- | --- |
+| **Bounded fan-out** | ~30 connections per node (configurable), however crowded the world gets |
+| **Area of interest** | You hear about the nodes near you, not about everyone |
+| **Serverless signaling** | Peers meet over [Nostr](https://nostr.com) relays — no signaling server to run |
+| **Multiple rooms** | Several rooms per process, each with its own overlay |
+| **Shared storage** | Content-addressed blobs replicated between peers, persisted to OPFS |
+| **Media** | Audio and video tracks over the same WebRTC connections |
 
-## 始め方
+## Install
 
-[Releases](https://github.com/tik-choco-lab/mistlib/releases/latest) から、環境に合ったZIPをダウンロードしてご利用ください。
-
-| ターゲット | 配布ファイル名 | 同梱されているもの |
-| --- | --- | --- |
-| **Web / WASM** | `mistlib-wasm-pkg.zip` | WASM本体 (`pkg/`) + JSラッパー (`wrappers/web/`) |
-| **Windows** | `mistlib-native-windows.zip` | `.dll` + Python/Unity用ラッパー |
-| **Linux** | `mistlib-native-linux.zip` | `.so` + Python/Unity用ラッパー |
-| **macOS** | `mistlib-native-macos.zip` | `.dylib` + Python/Unity用ラッパー |
-
-
-## AIエージェントを利用した開発
-
-各種AIエージェントがプロジェクト構造を把握しやすくするため、API定義や開発ルールをまとめたファイルを用意しています。
-最新のLLMの場合は不要かもしれませんが、小規模なLLMをご利用の際は、ご活用ください。
-
-- **[AI.md](AI.md)**
-
-## 主要API
-
-`MistNode` クラス
-
-- `node.joinRoom(roomId)` / `node.leaveRoom()`: ルームへの参加と退出。
-- `node.updatePosition(x, y, z)`: 自身の座標を更新。
-- `node.sendMessage(toId, data, method)`: メッセージ送受信。
-- `node.getNeighbors()`: 周囲（AOI内）のノード一覧を取得。
-- `node.getAllNodes()`: ルーム内の全ノード一覧を取得。
-- `node.setConfig(config)`: 設定の更新（`{ "aoiRange": 100 }` 等の部分更新も可能）。
-- `node.getStats()`: 通信統計の取得。
-- `node.onEvent(handler)`: 以下の定数に基づくイベント処理。
-  - 0: RAW, 1: OVERLAY, 2: NEIGHBORS, 3: AOI_ENTERED, 4: AOI_LEFT
-- `node.onMediaEvent(handler)`: メディア関連イベント。
-  - 100: TRACK_ADDED, 101: TRACK_REMOVED
-- `storage_add(path, data)` / `storage_get(path)`: データ保存と取得。
-
-## 利用例 (Web)
-
-```javascript
-import { MistNode } from '../wrappers/web/index.js';
-
-const node = new MistNode("user-123");
-await node.init();
-
-node.joinRoom("mistlib-room-id");
-node.updatePosition(10.5, 0, -5.2);
-
-node.onEvent((type, fromId, payload) => {
-    // イベント処理
-});
-
-node.sendMessage("target-id", "Hello P2P!");
+```sh
+npm install mistlib
 ```
 
----
+No build step? Import a pinned version straight from a CDN:
 
-## 開発状況
+```js
+import init, { init_with_config } from "https://cdn.jsdelivr.net/npm/mistlib@0.6.0/mistlib_wasm.js";
+```
 
-現在**テスト版**です。仕様変更が頻繁に行われる可能性があるため、現時点では評価・テスト目的での利用を推奨します。正式公開は後日を予定しています。
+For engines and desktop apps, grab a native build from
+[Releases](https://github.com/tik-choco-lab/mistlib/releases/latest):
 
----
+| Platform | Asset | Library |
+| --- | --- | --- |
+| Linux | `mistlib-native-linux-x86_64-<version>.zip` | `libmistlib.so` |
+| Windows | `mistlib-native-windows-x86_64-<version>.zip` | `mistlib.dll` |
+| macOS | `mistlib-native-macos-aarch64-<version>.zip` | `libmistlib.dylib` |
+| Web | `mistlib-wasm-<version>.zip` | `pkg/` — the same wasm build, to vendor |
 
-## ライセンス
+> [!IMPORTANT]
+> Pin a version. The overlay wire protocol may change between releases, and every peer in a
+> deployment must run the same one.
 
-[MPL-2.0](LICENSE)
+Unity, Python and JavaScript wrappers with runnable samples live in
+[**mistlib-examples**](https://github.com/tik-choco-lab/mistlib-examples).
 
+## Usage
+
+```js
+import init, {
+  init_with_config, join_room, update_position, send_message,
+  register_event_callback, MistEvent, Delivery,
+} from "mistlib";
+
+await init();
+
+init_with_config("alice", JSON.stringify({
+  signaling: {
+    mode: "nostr",
+    nostr: {
+      relays: ["wss://relay.example.com"],
+      inviteSalt: "my-app-2026",     // peers sharing a salt and code find each other
+      inviteCode: "a-shared-secret", // pick your own — the built-in values are placeholders
+    },
+  },
+  aoiRange: 20.0,
+}));
+
+register_event_callback((eventType, fromId, payload, roomId) => {
+  if (eventType === MistEvent.PeerConnected) console.log("peer joined:", fromId);
+});
+
+join_room("lobby");
+update_position(0.0, 1.5, 0.0);
+send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" = broadcast
+```
+
+Call `update_position` as your avatar moves — it is what drives topology and area of interest.
+
+## API
+
+| Call | Does |
+| --- | --- |
+| `init_with_config(id, json)` | Create the node. Returns `false` if the config is invalid |
+| `join_room(id)` / `leave_room_id(id)` | Enter or leave a room |
+| `update_position(x, y, z)` | Report where you are |
+| `send_message(target, bytes, delivery)` | Send to one peer, or to the room with `""` |
+| `get_neighbors()` / `get_all_nodes()` | Current view of the room, as JSON |
+| `storage_add(name, bytes)` / `storage_get(cid)` | Content-addressed storage |
+| `register_event_callback(fn)` | Peer, area-of-interest and room events |
+
+Without an explicit room, these act across every room you have joined: `send_message("", …)`
+broadcasts to all of them and `get_neighbors()` merges their views. Multi-room applications
+should use the `*_in_room` variants, which take a room id.
+
+The native library offers the same operations over a C ABI with `(pointer, length)` pairs, with
+two differences: there is no `get_neighbors` / `get_all_nodes` (that data arrives as events
+instead), and only `update_position` and `send_message` have `*_in_room` variants. See
+`mistlib-native/src/ffi.rs`.
+
+**Delivery modes** — `Delivery.Reliable` (`0`) arrives in order; `Delivery.UnreliableOrdered`
+(`1`) may drop but never reorders; `Delivery.Unreliable` (`2`) may drop or reorder, for the
+lowest latency. Event ids come from the `MistEvent` enum the same way.
+
+## Configuration
+
+A JSON object passed to `init_with_config`, or to `set_config` later. Anything you omit keeps its
+default, and `get_config()` dumps the configuration currently in effect, which is the quickest way
+to see every key and what it is set to.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `signaling.mode` | `"nostr"` | `"nostr"` or `"websocket"` |
+| `signaling.nostr.relays` | *(empty)* | Relays used for peer discovery. Left empty, mistlib fetches a relay list over the network at startup — set this to keep discovery under your control |
+| `signaling.nostr.inviteSalt` / `inviteCode` | placeholders | Shared secret scoping discovery to your app |
+| `aoiRange` | `10.0` | Radius, in world units, that counts as near |
+| `maxConnectionCount` | `30` | Upper bound on simultaneous peer connections |
+| `hopCount` | `2` | Maximum relay hops for a message |
+| `maxMessageBytes` | `65536` | Rejection threshold for a single message |
+| `storageMaxCapacityMb` | `8192` | Local budget for content-addressed storage |
+| `iceServers` | 3 public STUN servers | WebRTC ICE servers. Replace to add your own TURN |
+
+### NAT traversal
+
+The default `iceServers` are three public STUN servers, spread across operators so a peer
+behind a network that blocks one still gets a reflexive candidate. STUN cannot get through
+symmetric NAT, though — that needs a TURN relay, and relaying costs real bandwidth, so none
+ships as a default. Supply your own to cover it:
+
+```json
+{
+  "iceServers": [
+    { "urls": ["stun:stun.l.google.com:19302"] },
+    { "urls": ["turn:turn.example.com:3478"], "username": "user", "credential": "pass" }
+  ]
+}
+```
+
+Without TURN, expect a small share of peer pairs to fail to connect.
+
+## Building from source
+
+The toolchain version is pinned in `rust-toolchain.toml`, so `rustup` picks it up for you.
+
+```sh
+cargo build --release -p mistlib-native                        # .so / .dll / .dylib
+cd mistlib-wasm && wasm-pack build --target web --release      # pkg/
+```
+
+## Built with mistlib
+
+A family of browser apps shares state peer-to-peer using mistlib — [TC Space](https://tik-choco.github.io/tc-vrsns2/), [TC Town](https://tik-choco.github.io/tc-town/), [TC Chat](https://tik-choco.github.io/tc-chat/), [TC Storage](https://tik-choco.github.io/tc-storage/) and more. Browse them from [TC Home](https://tik-choco.github.io/tc-home/).
+
+## Status
+
+Under active development; the API is not yet stable. Releases are tagged, and the wire protocol
+may change between them.
+
+## License
+
+[Mozilla Public License 2.0](LICENSE)

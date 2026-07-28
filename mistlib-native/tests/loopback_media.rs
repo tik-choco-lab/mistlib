@@ -6,7 +6,7 @@
 //! for why it isn't library API) against real WebRTC-delivered RTP.
 //!
 //! This can't reach a real Nostr relay (no live counterpart to publish to in
-//! CI/sandbox environments), so it substitutes a trivial in-process
+//! CI environments), so it substitutes a trivial in-process
 //! `Signaler` that hands `MessageContent` directly between two
 //! `WebRtcTransport` instances instead of going over Nostr. Everything
 //! downstream of signaling — ICE, DTLS, SRTP, RTP — is real: two actual
@@ -93,8 +93,8 @@ async fn wait_until<F: Fn() -> bool>(condition: F, timeout: Duration) {
 }
 
 // Requires real UDP ICE connectivity (STUN + connectivity checks) between two
-// local RTCPeerConnections, which this development sandbox's network
-// restrictions don't reliably allow (confirmed: STUN candidate gathering
+// local RTCPeerConnections, which restricted networks don't reliably
+// allow (confirmed: STUN candidate gathering
 // succeeds — genuine outbound UDP reaches the internet — but ICE
 // connectivity checks stall and mistlib-native's own 6s connection watchdog
 // kills the session before Connected is ever reached; this matches the
@@ -102,7 +102,7 @@ async fn wait_until<F: Fn() -> bool>(condition: F, timeout: Duration) {
 // `datachannel_close_notifies_remote_immediately`). Run manually with
 // `cargo test -p mistlib-native --test loopback_media -- --ignored` in an
 // environment with normal UDP egress to verify the full pipeline live.
-#[ignore = "needs real UDP ICE connectivity; unreliable in this sandbox, see comment"]
+#[ignore = "needs real UDP ICE connectivity; unreliable on restricted networks, see comment"]
 #[tokio::test]
 async fn webrtc_track_flows_through_bridge_into_an_hls_segment() {
     let node_a = NodeId("publisher".to_string());
@@ -254,7 +254,7 @@ async fn webrtc_track_flows_through_bridge_into_an_hls_segment() {
 // crate's `NostrSignaler`) is expected to preserve that order, but
 // reproducing the guarantee here would make the test about signaling
 // ordering rather than about publish/attach.
-#[ignore = "needs real UDP ICE connectivity; unreliable in this sandbox, see comment"]
+#[ignore = "needs real UDP ICE connectivity; unreliable on restricted networks, see comment"]
 #[tokio::test]
 async fn publish_local_track_delivers_media_to_an_already_connected_peer() {
     let node_a = NodeId("publisher2".to_string());

@@ -1,7 +1,5 @@
-# mistlib (公開リポジトリ) の .gitignore
-#
-# このファイルは mistlib-dev の publish/overlay/ が正。
-# 公開リポジトリ側で直接編集しても次回の `just publish-sync` で上書きされる。
+# Generated file. Edits here are overwritten the next time sources are synced
+# from the upstream development repository -- change it there instead.
 
 /target
 /dist

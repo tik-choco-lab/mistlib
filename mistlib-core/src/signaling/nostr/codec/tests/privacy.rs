@@ -235,8 +235,8 @@ fn message_filter_p_tag_is_exactly_own_pubkey_plus_accepted_sentinels() {
     );
 }
 
-/// Simulates relay-side `#p` matching without a real relay (the relay's
-/// generic tag matcher lives in tests/misteval, out of scope here): a
+/// Simulates relay-side `#p` matching without a real relay (a relay's own
+/// generic tag matcher is out of scope here): a
 /// message's `p` tag value must be a member of the accepted `#p` set on the
 /// intended recipient's own filter for it to have been delivered.
 #[test]

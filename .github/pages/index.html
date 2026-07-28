@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="description" content="mistlib — peer-to-peer networking for large shared 3D spaces. WebRTC overlay with bounded fan-out, area-of-interest filtering and serverless signaling.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0e12" media="(prefers-color-scheme: dark)">
+<title>mistlib</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke='%235646d9' stroke-width='2'%3E%3Cpath d='M16 7 6 24h20z' opacity='.35'/%3E%3C/g%3E%3Cg fill='%235646d9'%3E%3Ccircle cx='16' cy='7' r='3.4'/%3E%3Ccircle cx='6' cy='24' r='3.4'/%3E%3Ccircle cx='26' cy='24' r='3.4'/%3E%3C/g%3E%3C/svg%3E">
+
+<!-- Apply the saved theme before first paint to avoid a flash of the wrong theme.
+     Mirrors the other tik-choco apps: the choice is stored as a raw "light"/"dark"
+     string under mistlib:theme, and light is the default. -->
+<script>
+  (function () {
+    try {
+      if (localStorage.getItem('mistlib:theme') === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    } catch (e) {}
+  })();
+</script>
+
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface: #fff;
+  --surface-2: #f3f4f7;
+  --surface-3: #e9ebf0;
+  --border: #e4e6eb;
+  --border-strong: #cfd2d9;
+  --text: #16181d;
+  --text-muted: #5a5f6b;
+  --text-subtle: #888e9a;
+  --on-primary: #fff;
+  --primary: #5646d9;
+  --primary-hover: #4638ba;
+  --primary-soft: #5646d91a;
+  --primary-border: #5646d959;
+  --shadow-1: 0 1px 2px #1018280f, 0 1px 3px #10182814;
+  --shadow-2: 0 4px 12px #10182814, 0 2px 6px #1018280d;
+  --header-bg: #ffffffb8;
+  --code-bg: #f3f4f7;
+
+  --radius-s: 8px;
+  --radius-m: 12px;
+  --radius-l: 16px;
+  --radius-pill: 999px;
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 20px; --space-6: 24px;
+  --ease: cubic-bezier(.2, 0, 0, 1);
+  --dur-fast: .13s;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+
+  font: 16px/1.5 var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0d0e12;
+  --surface: #16181e;
+  --surface-2: #1b1e25;
+  --surface-3: #23262e;
+  --border: #2a2e37;
+  --border-strong: #3a3f4a;
+  --text: #e8eaee;
+  --text-muted: #a0a6b0;
+  --text-subtle: #737985;
+  --on-primary: #0b0820;
+  --primary: #9b8cf7;
+  --primary-hover: #b0a4f9;
+  --primary-soft: #9b8cf724;
+  --primary-border: #9b8cf766;
+  --shadow-1: 0 1px 2px #0006, 0 1px 3px #0000004d;
+  --shadow-2: 0 4px 14px #00000073, 0 2px 6px #00000059;
+  --header-bg: #13151bb8;
+  --code-bg: #12141a;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ---------- header ---------- */
+.app-header {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--header-bg);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+.app-header-brand {
+  display: flex; align-items: center; gap: var(--space-2);
+  font-size: 1.05rem; font-weight: 700; letter-spacing: .01em;
+  color: var(--primary); white-space: nowrap;
+}
+.app-header-brand:hover { text-decoration: none; }
+.app-header-brand svg { display: block; }
+.app-header-links {
+  display: flex; align-items: center; gap: var(--space-2);
+  margin-left: auto; flex-shrink: 0;
+}
+.app-header-links a { color: var(--text-muted); font-size: .875rem; font-weight: 500; padding: var(--space-1) var(--space-2); }
+.app-header-links a:hover { color: var(--text); text-decoration: none; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  font: inherit; font-size: .85rem; font-weight: 600;
+  color: var(--text); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  cursor: pointer; white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.btn:hover { background: var(--surface-3); text-decoration: none; }
+.btn-primary { color: var(--on-primary); background: var(--primary); border-color: var(--primary); }
+.btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+.btn-icon { padding: var(--space-2); border-radius: var(--radius-pill); line-height: 0; }
+
+/* ---------- layout ---------- */
+main { max-width: 60rem; margin: 0 auto; padding: 0 var(--space-5) var(--space-6); }
+section { padding: 3.5rem 0; border-bottom: 1px solid var(--border); }
+section:last-of-type { border-bottom: 0; }
+h2 {
+  margin: 0 0 var(--space-5);
+  font-size: .8rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+/* ---------- hero ---------- */
+.hero { padding: 4.5rem 0 3.5rem; text-align: center; }
+.pill {
+  display: inline-block; margin-bottom: var(--space-5);
+  padding: var(--space-1) var(--space-3);
+  font-size: .75rem; font-weight: 600; letter-spacing: .04em;
+  color: var(--primary); background: var(--primary-soft);
+  border: 1px solid var(--primary-border); border-radius: var(--radius-pill);
+}
+.hero h1 {
+  margin: 0 auto var(--space-4); max-width: 20ch;
+  font-size: clamp(2rem, 5.5vw, 3rem); line-height: 1.12; letter-spacing: -.025em; font-weight: 700;
+}
+.lede {
+  margin: 0 auto var(--space-6); max-width: 54ch;
+  font-size: 1.0625rem; color: var(--text-muted);
+}
+.cta { display: flex; flex-wrap: wrap; gap: var(--space-3); justify-content: center; }
+
+/* ---------- copy row ---------- */
+.copy {
+  display: flex; align-items: stretch; gap: var(--space-2);
+  max-width: 32rem; margin: 0 auto var(--space-5);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-pill); box-shadow: var(--shadow-1);
+}
+.copy code {
+  flex: 1; min-width: 0; align-self: center;
+  font-family: var(--mono); font-size: .875rem; color: var(--text);
+  overflow-x: auto; white-space: nowrap; text-align: left;
+}
+.copy code::before { content: "$ "; color: var(--text-subtle); }
+
+/* ---------- feature grid ---------- */
+.grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
+.card {
+  padding: var(--space-5);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-l); box-shadow: var(--shadow-1);
+}
+.card h3 { margin: 0 0 var(--space-2); font-size: .95rem; font-weight: 700; letter-spacing: -.005em; }
+.card p { margin: 0; font-size: .9rem; line-height: 1.6; color: var(--text-muted); }
+
+/* ---------- code ---------- */
+pre {
+  margin: 0; padding: var(--space-5);
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  overflow-x: auto; font-family: var(--mono); font-size: .8125rem; line-height: 1.65;
+}
+p code, li code, td code {
+  padding: .1rem .35rem;
+  font-family: var(--mono); font-size: .875em;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+}
+
+/* ---------- table ---------- */
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { padding: var(--space-3) var(--space-2); text-align: left; border-bottom: 1px solid var(--border); }
+th { font-size: .75rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--text-subtle); }
+td { color: var(--text-muted); }
+tr:last-child td { border-bottom: 0; }
+
+/* ---------- app chips ---------- */
+.apps { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.app-chip {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  font-size: .875rem; font-weight: 600;
+  color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+.app-chip:hover {
+  background: var(--surface-2); border-color: var(--primary-border);
+  transform: translateY(-1px); text-decoration: none;
+}
+.app-chip::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--primary); flex-shrink: 0;
+}
+
+.note {
+  margin: var(--space-5) 0 0; padding: var(--space-4);
+  font-size: .875rem; color: var(--text-muted);
+  background: var(--primary-soft); border: 1px solid var(--primary-border);
+  border-radius: var(--radius-m);
+}
+.note strong { color: var(--text); }
+
+.scroller { overflow-x: auto; }
+
+footer {
+  padding: var(--space-6) var(--space-5) 3rem;
+  border-top: 1px solid var(--border);
+  font-size: .8125rem; color: var(--text-subtle); text-align: center;
+}
+footer p { margin: var(--space-2) 0; }
+
+@media (max-width: 34rem) {
+  .app-header { gap: var(--space-2); padding: var(--space-3) var(--space-4); }
+  .app-header-links a { padding: var(--space-1); }
+  main { padding: 0 var(--space-4) var(--space-6); }
+  section { padding: 2.5rem 0; }
+}
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <a class="app-header-brand" href="./">
+    <svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M16 7 6 24h20z" fill="none" stroke="currentColor" stroke-width="2" opacity=".35"/>
+      <g fill="currentColor"><circle cx="16" cy="7" r="3.4"/><circle cx="6" cy="24" r="3.4"/><circle cx="26" cy="24" r="3.4"/></g>
+    </svg>
+    mistlib
+  </a>
+  <nav class="app-header-links">
+    <a href="https://github.com/tik-choco-lab/mistlib">GitHub</a>
+    <a href="https://www.npmjs.com/package/mistlib">npm</a>
+    <a href="https://github.com/tik-choco-lab/mistlib/releases">Releases</a>
+    <button class="btn btn-icon" id="theme-toggle" type="button" aria-label="Toggle theme" title="Toggle theme">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>
+      </svg>
+    </button>
+  </nav>
+</header>
+
+<main>
+
+  <section class="hero">
+    <span class="pill">__VERSION__</span>
+    <h1>Peer-to-peer networking for shared 3D spaces</h1>
+    <p class="lede">
+      Peers talk directly over WebRTC. mistlib bounds each node's connection count and picks
+      which peers to hold from 3D proximity and neighbour density — so a crowded world never
+      becomes a quadratic mesh.
+    </p>
+    <div class="copy">
+      <code id="install-cmd">npm install mistlib</code>
+      <button class="btn" id="copy-btn" type="button">Copy</button>
+    </div>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/tik-choco-lab/mistlib#readme">Documentation</a>
+      <a class="btn" href="https://github.com/tik-choco-lab/mistlib-examples">Examples</a>
+    </div>
+  </section>
+
+  <section>
+    <h2>What you get</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Bounded fan-out</h3>
+        <p>Around 30 connections per node, configurable, however crowded the world gets.</p>
+      </div>
+      <div class="card">
+        <h3>Area of interest</h3>
+        <p>You hear about the nodes near you rather than about everyone in the room.</p>
+      </div>
+      <div class="card">
+        <h3>Serverless signaling</h3>
+        <p>Peers meet over Nostr relays, so there is no signaling server to operate.</p>
+      </div>
+      <div class="card">
+        <h3>Multiple rooms</h3>
+        <p>Several rooms in one process, each with its own independent overlay.</p>
+      </div>
+      <div class="card">
+        <h3>Shared storage</h3>
+        <p>Content-addressed blobs replicated between peers and persisted to OPFS.</p>
+      </div>
+      <div class="card">
+        <h3>Media tracks</h3>
+        <p>Audio and video published over the very same WebRTC connections.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Every app listed here ships mistlib_wasm in its published bundle. Re-check with
+       `curl` against the app's asset bundle before adding or removing an entry. -->
+  <section>
+    <h2>Built with mistlib</h2>
+    <p class="lede" style="margin-left:0;text-align:left">
+      A family of browser apps that share state peer-to-peer using this library.
+    </p>
+    <div class="apps">
+      <a class="app-chip" href="https://tik-choco.github.io/tc-vrsns2/">TC Space</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-town/">TC Town</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-chat/">TC Chat</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-vrm-viewer/">TC Avatar</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-storage/">TC Storage</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-note/">TC Note</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-books/">TC Books</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-news/">TC News</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-travel/">TC Travel</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-presenter/">TC Presenter</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-lingo/">TC Lingo</a>
+      <a class="app-chip" href="https://tik-choco.github.io/tc-pdf-viewer/">PDF Viewer</a>
+    </div>
+    <p class="note">
+      Browse the whole family from <a href="https://tik-choco.github.io/tc-home/">TC Home</a>.
+    </p>
+  </section>
+
+  <section>
+    <h2>Getting started</h2>
+<pre><code>import init, {
+  init_with_config, join_room, update_position, send_message,
+  register_event_callback, MistEvent, Delivery,
+} from "mistlib";
+
+await init();
+
+init_with_config("alice", JSON.stringify({
+  signaling: {
+    mode: "nostr",
+    nostr: {
+      relays: ["wss://relay.example.com"],
+      inviteSalt: "my-app",          // peers sharing a salt and code find each other
+      inviteCode: "a-shared-secret", // pick your own, the built-ins are placeholders
+    },
+  },
+  aoiRange: 20.0,
+}));
+
+register_event_callback((eventType, fromId, payload, roomId) =&gt; {
+  if (eventType === MistEvent.PeerConnected) console.log("peer joined:", fromId);
+});
+
+join_room("lobby");
+update_position(0.0, 1.5, 0.0);
+send_message("", new TextEncoder().encode("hello"), Delivery.Reliable);</code></pre>
+    <p class="note">
+      Call <code>update_position</code> as your avatar moves — it is what drives the topology
+      and area-of-interest calculation.
+    </p>
+  </section>
+
+  <section>
+    <h2>Every way to get it</h2>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Target</th><th>How</th></tr></thead>
+        <tbody>
+          <tr><td>Bundled web app</td><td><code>npm install mistlib</code></td></tr>
+          <tr><td>No build step</td><td><code>https://cdn.jsdelivr.net/npm/mistlib@__NPM_VERSION__/mistlib_wasm.js</code></td></tr>
+          <tr><td>Latest build, this site</td><td><code>./pkg/mistlib_wasm.js</code></td></tr>
+          <tr><td>Unity, C/C++, Python</td><td><a href="https://github.com/tik-choco-lab/mistlib/releases/latest">Native library from Releases</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      <strong>Pin a version.</strong> The URL on this site moves with every release. The overlay
+      wire protocol may change between releases, and every peer in a deployment must run the
+      same one.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <p>Also available as a native library for Unity, C/C++ and Python.</p>
+  <p>
+    <a href="https://github.com/tik-choco-lab/mistlib/blob/main/LICENSE">Mozilla Public License 2.0</a>
+    · <a href="https://github.com/tik-choco-lab">tik-choco</a>
+  </p>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    document.getElementById('theme-toggle').addEventListener('click', function () {
+      var dark = root.getAttribute('data-theme') === 'dark';
+      if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+      try { localStorage.setItem('mistlib:theme', dark ? 'light' : 'dark'); } catch (e) {}
+    });
+
+    var btn = document.getElementById('copy-btn');
+    btn.addEventListener('click', function () {
+      var text = document.getElementById('install-cmd').textContent;
+      navigator.clipboard.writeText(text).then(function () {
+        btn.textContent = 'Copied';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 1600);
+      }).catch(function () {});
+    });
+  })();
+</script>
+
+</body>
+</html>

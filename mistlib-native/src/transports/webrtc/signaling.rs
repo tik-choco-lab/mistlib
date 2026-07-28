@@ -716,8 +716,8 @@ impl WebRtcTransport {
             // a follow-up offer of our own -- webrtc-rs's `create_offer` does
             // include unmatched local transceivers once a remote description
             // is already set, so this picks them up. A live network test of
-            // this exact path isn't possible in this sandbox (no real UDP
-            // ICE, see `tests/loopback_media.rs`); this is deliberately a
+            // this exact path needs real UDP ICE, which restricted networks
+            // do not provide (see `tests/loopback_media.rs`); this is deliberately a
             // separate, best-effort step so a renegotiation failure here
             // doesn't undo the connection that `apply_offer` already
             // established.

@@ -1,4 +1,4 @@
-use super::{Config, IceServer, SpatialPartitionType};
+use super::{default_ice_servers, Config, IceServer, SpatialPartitionType, DEFAULT_STUN_URLS};
 
 fn ice_server(urls: &[&str], username: Option<&str>, credential: Option<&str>) -> IceServer {
     IceServer {
@@ -80,4 +80,71 @@ fn auto_direction_threshold_uses_partition_direction_count() {
         config.effective_direction_threshold(),
         Config::effective_direction_threshold_for(20, 0.0)
     );
+}
+
+/// `webrtc.ice_servers` used to be reachable only by supplying a *complete*
+/// nested `Config` -- every section spelled out -- because `FlatConfig` had no
+/// field for it and `deny_unknown_fields` rejected one. That left a host
+/// application no practical way to point mistlib at its own TURN relay, which
+/// is the only thing that gets a connection through symmetric NAT.
+#[test]
+fn flat_config_can_set_stun_and_turn_servers() {
+    let mut config = Config::new_default();
+    config
+        .update_from_json(
+            r#"{
+                "aoiRange": 20.0,
+                "iceServers": [
+                    { "urls": ["stun:stun.example.com:3478"] },
+                    {
+                        "urls": ["turn:turn.example.com:3478"],
+                        "username": "u",
+                        "credential": "p"
+                    }
+                ]
+            }"#,
+        )
+        .expect("flat config carrying iceServers must parse");
+
+    assert_eq!(config.dnve.aoi_range, 20.0);
+    assert_eq!(config.webrtc.ice_servers.len(), 2);
+    let turn = &config.webrtc.ice_servers[1];
+    assert_eq!(turn.urls, vec!["turn:turn.example.com:3478"]);
+    assert_eq!(turn.username.as_deref(), Some("u"));
+    assert!(turn.is_usable(), "TURN with credentials must be usable");
+}
+
+/// `get_config()` emits the flat form, so whatever it prints has to be valid
+/// input to `set_config()` -- otherwise a read-modify-write round trip would
+/// silently drop the host's TURN credentials.
+#[test]
+fn ice_servers_survive_a_flat_json_round_trip() {
+    let mut config = Config::new_default();
+    config
+        .update_from_json(
+            r#"{"iceServers":[{"urls":["turn:turn.example.com:3478"],"username":"u","credential":"p"}]}"#,
+        )
+        .unwrap();
+
+    let dumped = config.to_json_string();
+    let mut reloaded = Config::new_default();
+    reloaded
+        .update_from_json(&dumped)
+        .expect("get_config() output must be accepted by set_config()");
+
+    assert_eq!(reloaded.webrtc.ice_servers, config.webrtc.ice_servers);
+}
+
+/// Every default STUN entry must be a bare `stun:` URL: a `turn:` default would
+/// need credentials, and `IceServer::is_usable` would drop the whole entry at
+/// construction time, leaving peers with no reflexive candidate at all.
+#[test]
+fn default_ice_servers_are_usable_stun_only() {
+    let servers = default_ice_servers();
+    assert_eq!(servers.len(), 1);
+    assert!(servers[0].is_usable());
+    assert_eq!(servers[0].urls.len(), DEFAULT_STUN_URLS.len());
+    for url in &servers[0].urls {
+        assert!(url.starts_with("stun:"), "unexpected default ICE URL: {url}");
+    }
 }

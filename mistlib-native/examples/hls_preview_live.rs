@@ -33,8 +33,7 @@
 //! gracefully renegotiate in place. This example works around that by only
 //! expecting tracks that arrive as part of the *initial* offer (i.e. the
 //! publisher adds its track before calling `connect`/sending its first
-//! offer, exactly like mistlink's Go `sender` does in `pc_factory.go`). See
-//! the team-lead check-in message for this task for the full writeup.
+//! offer, exactly like mistlink's Go `sender` does in `pc_factory.go`).
 
 use std::env;
 use std::net::SocketAddr;

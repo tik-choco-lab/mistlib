@@ -271,7 +271,7 @@ pub(crate) mod session_registry {
 }
 
 /// Regression coverage for the self-inflicted reordering bug described in
-/// `docs/REORDER_RELIABILITY_NOTES.md`: `handle_action_for` used to spawn an
+/// the reorder-reliability notes: `handle_action_for` used to spawn an
 /// independent `tokio::task` per `OverlayAction::SendMessage`, so N
 /// sequential (non-concurrent) calls from the *same* caller -- exactly how
 /// `SessionActionHandler::handle_action` (`layers/native_l0/init.rs`) is
@@ -316,7 +316,7 @@ mod action_ordering {
         // thing in the process to dereference it, first-time construction
         // (`MistEngine::new`) synchronously builds an entire second Tokio
         // multi-thread runtime plus an OS dispatch thread. Doing that at the
-        // same time as this sandbox's already-marginal real (local) UDP ICE
+        // same time as an already-marginal real (local) UDP ICE
         // connectivity check was observed to noticeably raise this test's
         // connect-timeout flakiness; deferring every `ENGINE` access until
         // after the pair is already `Connected` avoids stacking that cost on

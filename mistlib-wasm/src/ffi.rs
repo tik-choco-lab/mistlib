@@ -19,6 +19,75 @@ pub const DELIVERY_RELIABLE: u32 = crate::app::DELIVERY_RELIABLE;
 pub const DELIVERY_UNRELIABLE_ORDERED: u32 = crate::app::DELIVERY_UNRELIABLE_ORDERED;
 pub const DELIVERY_UNRELIABLE: u32 = crate::app::DELIVERY_UNRELIABLE;
 
+// wasm-bindgen cannot export a free `pub const`, so the constants above are
+// invisible to JS -- importing `EVENT_PEER_CONNECTED` from the generated module
+// is a link-time error that takes the whole import statement down with it. These
+// enums are what JS actually sees; wasm-bindgen emits them as frozen objects
+// (`MistEvent.PeerConnected === 5`) plus matching TypeScript declarations.
+// The consts stay for Rust callers, and the const assertions below make the two
+// impossible to drift apart.
+
+/// Event ids passed as the first argument of the `register_event_callback`
+/// callback. Media events are numbered separately, see [`MistMediaEvent`].
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MistEvent {
+    Raw = 0,
+    Overlay = 1,
+    Neighbors = 2,
+    AoiEntered = 3,
+    AoiLeft = 4,
+    PeerConnected = 5,
+    PeerDisconnected = 6,
+    AoiNodes = 7,
+    RoomJoined = 8,
+    RoomJoinFailed = 9,
+    RoomLeft = 10,
+}
+
+/// Event ids passed to the `register_media_event_callback` callback. Numbered
+/// from 100 so they never collide with [`MistEvent`].
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MistMediaEvent {
+    TrackAdded = 100,
+    TrackRemoved = 101,
+}
+
+/// Delivery guarantee for `send_message`, mapping onto the underlying WebRTC
+/// data channel configuration.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Arrives, and in order.
+    Reliable = 0,
+    /// May be dropped, but never arrives out of order.
+    UnreliableOrdered = 1,
+    /// May be dropped or reordered. Lowest latency.
+    Unreliable = 2,
+}
+
+// A mismatch here means JS and Rust disagree about a wire-visible number, which
+// would surface as silently misrouted events rather than as a build failure.
+const _: () = {
+    assert!(MistEvent::Raw as u32 == EVENT_RAW);
+    assert!(MistEvent::Overlay as u32 == EVENT_OVERLAY);
+    assert!(MistEvent::Neighbors as u32 == EVENT_NEIGHBORS);
+    assert!(MistEvent::AoiEntered as u32 == EVENT_AOI_ENTERED);
+    assert!(MistEvent::AoiLeft as u32 == EVENT_AOI_LEFT);
+    assert!(MistEvent::PeerConnected as u32 == EVENT_PEER_CONNECTED);
+    assert!(MistEvent::PeerDisconnected as u32 == EVENT_PEER_DISCONNECTED);
+    assert!(MistEvent::AoiNodes as u32 == EVENT_AOI_NODES);
+    assert!(MistEvent::RoomJoined as u32 == EVENT_ROOM_JOINED);
+    assert!(MistEvent::RoomJoinFailed as u32 == EVENT_ROOM_JOIN_FAILED);
+    assert!(MistEvent::RoomLeft as u32 == EVENT_ROOM_LEFT);
+    assert!(MistMediaEvent::TrackAdded as u32 == MEDIA_EVENT_TRACK_ADDED);
+    assert!(MistMediaEvent::TrackRemoved as u32 == MEDIA_EVENT_TRACK_REMOVED);
+    assert!(Delivery::Reliable as u32 == DELIVERY_RELIABLE);
+    assert!(Delivery::UnreliableOrdered as u32 == DELIVERY_UNRELIABLE_ORDERED);
+    assert!(Delivery::Unreliable as u32 == DELIVERY_UNRELIABLE);
+};
+
 #[wasm_bindgen]
 pub fn register_event_callback(callback: &js_sys::Function) {
     crate::app::register_event_callback(callback);

@@ -248,7 +248,7 @@ impl StorageManager {
     /// is a deterministic hash of `(cid, sweep_counter)` rather than an RNG,
     /// so sweeps are reproducible in tests and avoid pulling in a `rand`
     /// dependency or wall-clock time (unavailable under the wasm target;
-    /// see docs/investigation/TROUBLESHOOTING.md).
+    /// see the troubleshooting notes).
     pub fn decay_candidates(
         &self,
         self_positions: &[Vector3],

@@ -2,7 +2,7 @@
 //! measures connection-establishment time, reconnection downtime, and
 //! connection-attempt timeouts, and logs one `tracing::info!` line per event
 //! in a fixed, machine-parseable format so an external tool (the eval
-//! harness's Go FFI layer) can grep and parse these lines without ambiguity.
+//! harness) can grep and parse these lines without ambiguity.
 //! The exact formats (key order, kind values) are a contract with that
 //! parser -- do not reorder or rename fields without updating it.
 //!
@@ -11,7 +11,7 @@
 //! struct, so the formatting and rate-limiting logic are exhaustively
 //! unit-testable on their own, independent of a real WebRTC handshake.
 //!
-//! Note the emitted lines never contain the literal `[CS]` tag -- the Go FFI
+//! Note the emitted lines never contain the literal `[CS]` tag -- the log
 //! layer filters lines containing it, so `[ConnTiming]` intentionally uses a
 //! distinct tag.
 
@@ -157,7 +157,7 @@ pub(crate) static RATE_LIMITER: RateLimiter = RateLimiter::new(
 
 // --- Log-line formatting -----------------------------------------------------
 //
-// Exact contract (a Go agent parses these): `[ConnTiming] ` followed by
+// Exact contract (an external log parser consumes these): `[ConnTiming] ` followed by
 // space-separated `key=value` pairs in the order below. Do not deviate.
 
 pub(crate) fn format_connect(peer: &str, attempt_ms: u64, total_connected: usize) -> String {
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn no_formatted_line_contains_the_cs_tag() {
-        // The Go FFI layer filters any line containing "[CS]" -- none of
+        // The log parser filters any line containing "[CS]" -- none of
         // these formats may ever produce that substring.
         for line in [
             format_connect("peer-1", 1, 1),

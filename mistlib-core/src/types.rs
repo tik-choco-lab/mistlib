@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 // Re-exported so the storage layer can depend on `crate::types::Vector3`
 // without importing `overlay::dnve3` directly (storage stays decoupled from
-// the DNVE3 overlay layer; see docs/specs/SPEC-16-spatial-storage-eviction.md).
+// the DNVE3 overlay layer; see SPEC-16).
 pub use crate::overlay::dnve3::spatial_density::Vector3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

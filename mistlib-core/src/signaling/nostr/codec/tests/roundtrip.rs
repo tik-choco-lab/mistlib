@@ -57,7 +57,7 @@ fn message_event_round_trips_and_hides_plaintext() {
     // Directed messages tag the real recipient pubkey (standard Nostr `p`
     // tag targeting) so the relay can filter without decrypting; this is an
     // intentional, documented metadata tradeoff for O(1) fan-out (see
-    // docs/architecture/SIGNALING.md).
+    // the signaling design notes).
     assert_eq!(event.tag_value(TAG_P), Some(bob.public_key.as_str()));
     let decoded = decode_message_event(
         &codec,

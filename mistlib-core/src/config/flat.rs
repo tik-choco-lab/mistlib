@@ -1,5 +1,5 @@
 use super::{
-    Config, ConnectionMode, DensityEncoding, NodeListExchangeMode, SignalingConfig,
+    Config, ConnectionMode, DensityEncoding, IceServer, NodeListExchangeMode, SignalingConfig,
     SpatialPartitionType,
 };
 use crate::error::MistError;
@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 pub(super) struct FlatConfig {
     signaling_url: Option<String>,
     signaling: Option<SignalingConfig>,
+    /// STUN/TURN servers. Without this the flat form could not reach
+    /// `webrtc.ice_servers` at all, and the nested `Config` needs every one of
+    /// its sections spelled out -- so there was no practical way for a host
+    /// application to supply TURN credentials.
+    ice_servers: Option<Vec<IceServer>>,
     max_connection_count: Option<u32>,
     connection_balancer_interval_seconds: Option<f32>,
     expire_seconds: Option<f32>,
@@ -40,6 +45,7 @@ impl FlatConfig {
         Self {
             signaling_url: Some(c.signaling_url.clone()),
             signaling: Some(c.signaling.clone()),
+            ice_servers: Some(c.webrtc.ice_servers.clone()),
             max_connection_count: Some(c.limits.max_connection_count),
             connection_balancer_interval_seconds: Some(c.intervals.connection_balancer),
             expire_seconds: Some(c.limits.expire_node_seconds),
@@ -72,6 +78,9 @@ impl FlatConfig {
         }
         if let Some(v) = self.signaling {
             c.signaling = v;
+        }
+        if let Some(v) = self.ice_servers {
+            c.webrtc.ice_servers = v;
         }
         if let Some(v) = self.max_connection_count {
             c.limits.max_connection_count = v;

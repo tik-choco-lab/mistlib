@@ -141,7 +141,39 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// STUN servers used when the host application configures none.
+///
+/// Three entries, deliberately: a peer that cannot reach *any* STUN server has
+/// no server-reflexive candidate at all and will only connect on the local
+/// network. Google's is unreachable from mainland China, and reaching only one
+/// operator's is a single point of failure, so the list spans three independent
+/// ones. Cloudflare's is anycast and therefore close from most of the world;
+/// Xiaomi's is the well-known choice that resolves and answers inside China.
+///
+/// Kept at three on purpose. Each additional server adds another candidate to
+/// gather and another set of pairs for ICE to check, and the marginal value
+/// drops off quickly once the geographic gaps are covered.
+///
+/// None of this helps against symmetric NAT — that needs a TURN relay, which
+/// costs real bandwidth and so cannot ship as a default. Host applications that
+/// need to traverse it must configure `webrtc.iceServers` with their own TURN
+/// credentials.
+pub const DEFAULT_STUN_URLS: [&str; 3] = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun.cloudflare.com:3478",
+    "stun:stun.miwifi.com:3478",
+];
+
+/// The `webrtc.iceServers` entry used when the host configures none.
+pub fn default_ice_servers() -> Vec<IceServer> {
+    vec![IceServer {
+        urls: DEFAULT_STUN_URLS.iter().map(|u| u.to_string()).collect(),
+        username: None,
+        credential: None,
+    }]
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct IceServer {
     pub urls: Vec<String>,
@@ -209,11 +241,7 @@ impl Config {
                 ping: default_ping_interval(),
             },
             webrtc: WebRtcConfig {
-                ice_servers: vec![IceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    username: None,
-                    credential: None,
-                }],
+                ice_servers: default_ice_servers(),
             },
             storage: StorageConfig::default(),
         }

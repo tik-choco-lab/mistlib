@@ -190,17 +190,12 @@ impl WasmWebRtcTransport {
             pending_candidates: Arc::new(RwLock::new(PendingCandidates::default())),
             disconnected_since: Arc::new(RwLock::new(HashMap::new())),
             room_id: Arc::new(RwLock::new("lobby".to_string())),
-            // Mirrors `Config::new_default()`'s `webrtc.ice_servers` (a single
-            // Google STUN entry), same as `max_connections` below defaulting
-            // to that config's `limits.max_connection_count`. `build_session`
-            // overwrites this via `set_ice_servers` with the actual config,
-            // so this default only matters for callers that construct the
-            // transport directly without going through it.
-            ice_servers: RwLock::new(vec![IceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                username: None,
-                credential: None,
-            }]),
+            // Mirrors `Config::new_default()`'s `webrtc.ice_servers`, same as
+            // `max_connections` below defaulting to that config's
+            // `limits.max_connection_count`. `build_session` overwrites this via
+            // `set_ice_servers` with the actual config, so this default only
+            // matters for callers that construct the transport directly.
+            ice_servers: RwLock::new(mistlib_core::config::default_ice_servers()),
             max_connections: AtomicU32::new(30),
             // Mirrors `Config::new_default()`'s `limits.max_message_bytes`;
             // `build_session` overwrites this via `set_max_message_bytes`,

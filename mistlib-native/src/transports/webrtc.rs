@@ -317,7 +317,7 @@ const DEFAULT_MAX_CONCURRENT_HANDSHAKES: usize = 6;
 /// resynchronizes into a retry storm instead of spreading load out.
 ///
 /// The cap was originally 10s, then lowered to 4s based on a load-test A/B
-/// (run2: fixed 1s baseline: run3: 10s-cap backoff): the 10s cap improved the
+/// (fixed 1s baseline vs. 10s-cap backoff): the 10s cap improved the
 /// typical case (p50/p90 recovery time, >60s rate) but *worsened* the worst
 /// case (max recovery time 198s -> 316s) and the unrelated first-connect
 /// `attempt_ms` tail (p90 1054ms -> 1394ms, p99 3938ms -> 4834ms), while the
@@ -339,7 +339,7 @@ const DEFAULT_CONNECT_REQUEST_RETRIES: u32 = 10;
 /// Default for the `disconnected_grace_ms` instance field (how long a peer
 /// stays in `Reconnecting` -- e.g. mid ICE-restart -- before the sweeper
 /// reaps it) -- overridable via `MIST_WEBRTC_DISCONNECTED_GRACE_MS`, read
-/// once at construction (see `WebRtcTransport::new`). `docs/architecture/ARCHITECTURE.md`
+/// once at construction (see `WebRtcTransport::new`). The architecture notes
 /// documents `REORDER_GAP_TIMEOUT` (8s) as chosen to outlive *this default*
 /// (5s) -- an env override changes a single process's own grace window, not
 /// the documented default relationship.
@@ -401,7 +401,7 @@ pub(crate) const REMOTE_TAKEOVER_MIN_INTERVAL_MS: u64 = 10_000;
 /// absorbed with no state change at all, and longer outages go through
 /// grace -> (gated, degraded-only) restart -> teardown as designed. The env
 /// overrides remain for experiments only. Full record:
-/// docs/archive/investigation/RECONNECT_LATENCY_INVESTIGATION.md.
+/// the reconnect-latency investigation.
 pub(crate) const ICE_DISCONNECTED_TIMEOUT_MS: u64 = 5_000;
 /// See `ICE_DISCONNECTED_TIMEOUT_MS` -- webrtc-rs default, kept.
 /// Overridable via `MIST_WEBRTC_ICE_FAILED_TIMEOUT_MS`.
@@ -1103,8 +1103,14 @@ impl WebRtcTransport {
             connection_states: Arc::new(StdRwLock::new(HashMap::new())),
             room_id: Arc::new(StdRwLock::new("lobby".to_string())),
             pending_candidates: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            // Mirrors `Config::new_default()`'s `webrtc.ice_servers`; `build_session`
+            // overwrites it with the real config via `set_ice_servers`, so this only
+            // matters for callers constructing the transport directly.
             ice_servers: Arc::new(StdRwLock::new(vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                urls: mistlib_core::config::DEFAULT_STUN_URLS
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect(),
                 ..Default::default()
             }])),
             max_connections: AtomicU32::new(30),

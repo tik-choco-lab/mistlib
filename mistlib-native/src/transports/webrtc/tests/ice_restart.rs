@@ -66,13 +66,13 @@ async fn wait_for_dc_open(peer: &Peer, method: DeliveryMethod, timeout_ms: u64) 
 /// more timing-sensitive to set up reliably. It also polls for the reliable
 /// DataChannel's own `Open` state (`wait_for_dc_open`) instead of racing on
 /// the aggregate connection state, and gives real ICE renegotiation a
-/// generous budget -- this sandbox's network stack fails to bind several of
-/// its own advertised interfaces during candidate gathering (observed via
+/// generous budget -- on restricted networks the stack can fail to bind several
+/// of its own advertised interfaces during candidate gathering (observed via
 /// `RUST_LOG=debug`), which can slow an ICE restart's reconvergence well
 /// beyond the ~1s common case.
 ///
 /// Known flaky, same as `disconnect.rs`'s tests: a real ICE renegotiation
-/// occasionally exceeds even this generous budget in this sandbox. Treat a
+/// occasionally exceeds even this generous budget. Treat a
 /// failure here the same way -- rerun in isolation before treating it as a
 /// regression.
 ///

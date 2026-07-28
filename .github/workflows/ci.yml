@@ -1,9 +1,9 @@
-# mistlib (公開リポジトリ) の CI。
+# CI for mistlib.
 #
-# このファイルは mistlib-dev の publish/overlay/ が正。公開リポジトリ側で直接
-# 編集しても次回の `just publish-sync` で上書きされる。内容は mistlib-dev の
-# .github/workflows/ci.yml と同じゲート（fmt / clippy / nextest / wasm build）を
-# 公開側の crates だけに適用したもの。dev 側の CI 定義を変えたらこちらも揃える。
+# Generated file. Edits here are overwritten the next time sources are synced
+# from the upstream development repository -- change it there instead.
+# The gates (fmt / clippy / nextest / wasm build) mirror the ones the library is
+# developed against.
 
 name: CI
 
@@ -17,9 +17,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# 警告のゲートは clippy コマンド側の `-- -D warnings` で明示する。グローバルな
-# RUSTFLAGS にすると wasm ビルド（wasm-pack は clippy ではなく rustc を走らせる）が
-# 既知の dead_code ベースラインで落ちる。
+# Warnings are gated on the clippy invocation itself (`-- -D warnings`) rather
+# than a global RUSTFLAGS: the latter would fail the wasm build on its known
+# dead_code baseline, since wasm-pack runs rustc, not clippy.
 env:
   CARGO_TERM_COLOR: always
 
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rust-toolchain.toml がバージョンと components を固定している。
+      # rust-toolchain.toml pins the version and components; this materializes it.
       - run: rustup show
       - run: cargo fmt --all -- --check
 
@@ -41,8 +41,8 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p mistlib-core -p mistlib-native --all-targets --locked -- -D warnings
-      # wasm は既知の警告ベースライン（単一スレッドのブラウザ標的における
-      # arc_with_non_send_sync 誤検知が大半）を抱えている。報告はするがゲートしない。
+      # wasm carries a known warning baseline, mostly arc_with_non_send_sync false
+      # positives on the single-threaded browser target. Report, don't gate.
       - name: clippy (wasm, informational)
         continue-on-error: true
         run: cargo clippy -p mistlib-wasm --target wasm32-unknown-unknown --all-targets
@@ -57,10 +57,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      # ci プロファイル (.config/nextest.toml) が実タイミング依存の WebRTC テストを
-      # リトライするので、共有ランナーのタイミングゆらぎで run が赤くならない。
+      # The ci profile (.config/nextest.toml) retries the timing-sensitive WebRTC
+      # tests so scheduling noise on shared runners doesn't redden the run.
       - run: cargo nextest run -p mistlib-core -p mistlib-native --locked --profile ci
-      # nextest は doctest を走らせないので別途実行し、静かに腐るのを防ぐ。
+      # nextest does not run doctests; run them separately so they can't rot silently.
       - run: cargo test -p mistlib-core -p mistlib-native --doc --locked
 
   wasm:

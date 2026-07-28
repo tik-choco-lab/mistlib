@@ -1,6 +1,6 @@
 //! Coverage for `Peer::spawn_send_queue` (`transports/webrtc/peer.rs`), the
 //! per-peer ordered send queue introduced to fix the self-inflicted
-//! reordering bug described in `docs/REORDER_RELIABILITY_NOTES.md`.
+//! reordering bug described in the reorder-reliability notes.
 //!
 //! IMPORTANT SCOPE NOTE: the actual bug (and its regression test) lives one
 //! layer up, at `MistEngine::handle_action_for`/`handle_action_in_room`
@@ -116,7 +116,7 @@ async fn sequential_sends_to_same_peer_arrive_in_order() {
 }
 
 /// SPEC-13-style bound check for `PEER_SEND_QUEUE_CAPACITY` (task #3 in
-/// `docs/REORDER_RELIABILITY_NOTES.md`): once more than
+/// the reorder-reliability notes): once more than
 /// `PEER_SEND_QUEUE_CAPACITY` messages are enqueued for a peer without the
 /// drainer having a chance to catch up, further enqueues must fail fast
 /// (`try_send` on a bounded channel) rather than growing unboundedly or
