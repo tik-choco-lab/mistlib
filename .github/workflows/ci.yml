@@ -75,3 +75,89 @@ jobs:
           tool: wasm-pack
       - run: wasm-pack build --target web
         working-directory: mistlib-wasm
+
+      # Handed to release-readiness so it checks the same bytes a release would
+      # ship, instead of rebuilding and hoping the two agree.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-wasm-pkg
+          path: mistlib-wasm/pkg/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Everything the release workflow does that can fail for reasons unrelated to
+  # the code compiling -- version skew between the manifests, a package npm
+  # would reject, a landing page with an unsubstituted placeholder. Without this
+  # those only surface after a tag is pushed, when the tag is already public and
+  # the fix costs a new version.
+  release-readiness:
+    name: release readiness
+    needs: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-wasm-pkg
+          path: pkg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # release.sh sets all three from one version argument, so a mismatch here
+      # means someone edited a manifest by hand.
+      - name: Crate versions agree
+        run: |
+          set -euo pipefail
+          versions=""
+          for c in mistlib-core mistlib-native mistlib-wasm; do
+            v=$(sed -n '0,/^version = /s/^version = "\(.*\)"/\1/p' "$c/Cargo.toml")
+            echo "$c: $v"
+            versions="$versions $v"
+          done
+          uniq_count=$(echo $versions | tr ' ' '\n' | sort -u | wc -l)
+          test "$uniq_count" -eq 1 || { echo "::error::crate versions disagree:$versions"; exit 1; }
+
+      # The npm job copies these into pkg/; without them the npmjs.com page
+      # would be blank and the package would ship no license.
+      - name: Files the npm job depends on exist
+        run: test -f README.md && test -f LICENSE
+
+      - name: Package is publishable
+        working-directory: pkg
+        run: |
+          set -euo pipefail
+          cp ../README.md ../LICENSE .
+          npm pkg set name="mistlib"
+          npm pkg set version="0.0.0-ci"
+          npm pkg set repository.type="git"
+          npm pkg set repository.url="git+https://github.com/tik-choco-lab/mistlib.git"
+          npm pack --dry-run
+          # The wasm and its bindings are the whole point of the package.
+          npm pack --dry-run --json > files.json
+          node -e '
+            const f = require("./files.json")[0].files.map(x => x.path);
+            const need = ["mistlib_wasm.js", "mistlib_wasm_bg.wasm", "mistlib_wasm.d.ts", "README.md", "LICENSE"];
+            const missing = need.filter(n => !f.includes(n));
+            if (missing.length) { console.error("::error::npm package would omit: " + missing.join(", ")); process.exit(1); }
+            console.log("package contents ok: " + f.join(", "));
+          '
+
+      # Constants are not exported by wasm-bindgen, so the documented enums are
+      # the only way JS can name an event or a delivery mode. A rename would
+      # break every published example at import time, not at call time.
+      - name: Documented JS exports are present
+        run: |
+          set -euo pipefail
+          for sym in init_with_config join_room update_position send_message \
+                     register_event_callback MistEvent Delivery; do
+            grep -q "export .*\\b$sym\\b" pkg/mistlib_wasm.js \
+              || { echo "::error::pkg/mistlib_wasm.js does not export $sym"; exit 1; }
+          done
+
+      - name: Landing page renders without placeholders
+        run: |
+          set -euo pipefail
+          sed 's/__VERSION__/v0.0.0/g; s/__NPM_VERSION__/0.0.0/g' \
+            .github/pages/index.html > /tmp/index.html
+          ! grep -q '__[A-Z_]*__' /tmp/index.html

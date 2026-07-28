@@ -277,8 +277,8 @@ footer p { margin: var(--space-2) 0; }
     <h1>Peer-to-peer networking for shared 3D spaces</h1>
     <p class="lede">
       Peers talk directly over WebRTC. mistlib bounds each node's connection count and picks
-      which peers to hold from 3D proximity and neighbour density — so a crowded world never
-      becomes a quadratic mesh.
+      which peers to hold by 3D proximity — the nearest inside your area of interest, plus one
+      per direction — so a crowded world never becomes a quadratic mesh.
     </p>
     <div class="copy">
       <code id="install-cmd">npm install mistlib</code>

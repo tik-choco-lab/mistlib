@@ -16,8 +16,9 @@ English · [日本語](README.ja.md) · [简体中文](README.zh.md)
 ---
 
 Peers talk directly over WebRTC data channels. Connecting everyone to everyone does not scale,
-so mistlib bounds each node's connection count and picks *which* peers to hold from 3D proximity
-and neighbour density per direction. Messages for peers outside that set are relayed across the
+so mistlib bounds each node's connection count and picks *which* peers to hold by 3D proximity:
+the nearest peers inside your area of interest, plus the nearest one in each direction so no
+direction is left uncovered. Messages for peers outside that set are relayed across the
 resulting overlay.
 
 Written in Rust. Ships as a native library for engines and desktop apps, and as WebAssembly for

@@ -145,6 +145,9 @@ fn default_ice_servers_are_usable_stun_only() {
     assert!(servers[0].is_usable());
     assert_eq!(servers[0].urls.len(), DEFAULT_STUN_URLS.len());
     for url in &servers[0].urls {
-        assert!(url.starts_with("stun:"), "unexpected default ICE URL: {url}");
+        assert!(
+            url.starts_with("stun:"),
+            "unexpected default ICE URL: {url}"
+        );
     }
 }
