@@ -4,7 +4,7 @@
 
 **Peer-to-peer networking for large shared 3D spaces.**
 
-[![npm](https://img.shields.io/npm/v/mistlib?logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/mistlib)
+[![npm](https://img.shields.io/npm/v/@tik-choco/mistlib?logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/@tik-choco/mistlib)
 [![release](https://img.shields.io/github/v/release/tik-choco-lab/mistlib?label=release&color=2f6feb)](https://github.com/tik-choco-lab/mistlib/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/tik-choco-lab/mistlib/ci.yml?branch=main&label=CI)](https://github.com/tik-choco-lab/mistlib/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
@@ -38,13 +38,13 @@ the browser.
 ## Install
 
 ```sh
-npm install mistlib
+npm install @tik-choco/mistlib
 ```
 
 No build step? Import a pinned version straight from a CDN:
 
 ```js
-import init, { init_with_config } from "https://cdn.jsdelivr.net/npm/mistlib@0.6.0/mistlib_wasm.js";
+import init, { init_with_config } from "https://cdn.jsdelivr.net/npm/@tik-choco/mistlib@0.6.0/mistlib_wasm.js";
 ```
 
 For engines and desktop apps, grab a native build from
@@ -70,7 +70,7 @@ Unity, Python and JavaScript wrappers with runnable samples live in
 import init, {
   init_with_config, join_room, update_position, send_message,
   register_event_callback, MistEvent, Delivery,
-} from "mistlib";
+} from "@tik-choco/mistlib";
 
 await init();
 

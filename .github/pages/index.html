@@ -260,7 +260,7 @@ footer p { margin: var(--space-2) 0; }
   </a>
   <nav class="app-header-links">
     <a href="https://github.com/tik-choco-lab/mistlib">GitHub</a>
-    <a href="https://www.npmjs.com/package/mistlib">npm</a>
+    <a href="https://www.npmjs.com/package/@tik-choco/mistlib">npm</a>
     <a href="https://github.com/tik-choco-lab/mistlib/releases">Releases</a>
     <button class="btn btn-icon" id="theme-toggle" type="button" aria-label="Toggle theme" title="Toggle theme">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
@@ -281,7 +281,7 @@ footer p { margin: var(--space-2) 0; }
       per direction — so a crowded world never becomes a quadratic mesh.
     </p>
     <div class="copy">
-      <code id="install-cmd">npm install mistlib</code>
+      <code id="install-cmd">npm install @tik-choco/mistlib</code>
       <button class="btn" id="copy-btn" type="button">Copy</button>
     </div>
     <div class="cta">
@@ -351,7 +351,7 @@ footer p { margin: var(--space-2) 0; }
 <pre><code>import init, {
   init_with_config, join_room, update_position, send_message,
   register_event_callback, MistEvent, Delivery,
-} from "mistlib";
+} from "@tik-choco/mistlib";
 
 await init();
 
@@ -386,8 +386,8 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable);</code></
       <table>
         <thead><tr><th>Target</th><th>How</th></tr></thead>
         <tbody>
-          <tr><td>Bundled web app</td><td><code>npm install mistlib</code></td></tr>
-          <tr><td>No build step</td><td><code>https://cdn.jsdelivr.net/npm/mistlib@__NPM_VERSION__/mistlib_wasm.js</code></td></tr>
+          <tr><td>Bundled web app</td><td><code>npm install @tik-choco/mistlib</code></td></tr>
+          <tr><td>No build step</td><td><code>https://cdn.jsdelivr.net/npm/@tik-choco/mistlib@__NPM_VERSION__/mistlib_wasm.js</code></td></tr>
           <tr><td>Latest build, this site</td><td><code>./pkg/mistlib_wasm.js</code></td></tr>
           <tr><td>Unity, C/C++, Python</td><td><a href="https://github.com/tik-choco-lab/mistlib/releases/latest">Native library from Releases</a></td></tr>
         </tbody>

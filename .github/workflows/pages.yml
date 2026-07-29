@@ -1,0 +1,79 @@
+# Publishes the landing page and the latest wasm build to GitHub Pages.
+#
+# Generated file. Edits here are overwritten the next time sources are synced
+# from the upstream development repository -- change it there instead.
+#
+# Triggered by main moving, not by the release tag. The `github-pages`
+# environment's protection rules only accept deployments from the default
+# branch, so a tag-triggered deploy is rejected outright with "Tag ... is not
+# allowed to deploy to github-pages due to environment protection rules". The
+# release tooling fast-forwards main and pushes it together with the tag, so
+# this fires at the same moment a tag-triggered job would have -- without
+# needing anyone to loosen an environment rule by hand.
+#
+# One-time setup: Settings > Pages > Source set to "GitHub Actions".
+#
+# Pages only ever holds the latest release. Anyone needing a version-pinned URL
+# is pointed at jsDelivr (the npm mirror), so no versions accumulate here.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  # Lets a failed or skipped deploy be retried without moving main.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pages deployments cannot overlap; let an in-flight one finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: build and deploy
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - run: wasm-pack build --target web --release
+        working-directory: mistlib-wasm
+
+      # There is no tag name on a branch push, so the version comes from the
+      # manifest -- which the release tooling keeps in step with the tag anyway.
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          version=$(sed -n '0,/^version = /s/^version = "\(.*\)"/\1/p' mistlib-core/Cargo.toml)
+          test -n "$version"
+          echo "publishing landing page for $version"
+
+          rm -rf site
+          mkdir -p site
+          cp -R mistlib-wasm/pkg site/pkg
+          cp .github/pages/index.html site/index.html
+          # Display carries the leading v; npm and jsDelivr take it bare.
+          sed -i "s/__VERSION__/v$version/g; s/__NPM_VERSION__/$version/g" site/index.html
+          ! grep -q '__[A-Z_]*__' site/index.html
+          # Stop Jekyll from dropping files whose names begin with an underscore.
+          touch site/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

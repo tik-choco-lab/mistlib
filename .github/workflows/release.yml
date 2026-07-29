@@ -8,15 +8,17 @@
 #   1. GitHub Release  — native binaries and the wasm zip
 #   2. npm             — mistlib; the primary route for bundled web apps
 #   3. jsDelivr        — an npm mirror, so version-pinned CDN URLs come for free
-#   4. GitHub Pages    — a direct-import URL for the latest build, and a landing page
+#   4. GitHub Pages    — deployed by pages.yml when main moves, not from here
 #
 # Language wrappers (Unity / Python / JS) are not shipped here. They live in
 # tik-choco-lab/mistlib-examples, which cuts its own releases.
 #
 # One-time setup this workflow depends on:
-#   * Settings > Pages > Source set to "GitHub Actions"
-#   * An NPM_TOKEN automation token in Settings > Secrets and variables > Actions,
-#     with permission to publish the unscoped `mistlib` package
+#   * A trusted publisher configured on npmjs.com for the `mistlib` package:
+#     Settings > Trusted Publisher > GitHub Actions, with organization
+#     `tik-choco-lab`, repository `mistlib`, and workflow filename `release.yml`
+#     (filename only, not a path). Leave the environment field empty -- this job
+#     does not declare one. No NPM_TOKEN secret is involved.
 
 name: Release
 
@@ -154,6 +156,14 @@ jobs:
     name: publish to npm
     needs: wasm
     runs-on: ubuntu-latest
+    # Trusted publishing: npm accepts a short-lived OIDC token minted by GitHub
+    # for this exact repository and workflow, so there is no long-lived NPM_TOKEN
+    # to leak, rotate, or accidentally scope wrong -- and no 2FA prompt that CI
+    # cannot answer. npm marks classic automation tokens as a security risk and
+    # points here instead. Provenance attestations are produced automatically.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -162,8 +172,18 @@ jobs:
           path: pkg
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1 and Node >= 22.14. Node 24 ships a
+      # new enough npm today, but pin the floor explicitly so a runner image
+      # change cannot silently drop back to token auth semantics.
+      - name: Ensure npm supports trusted publishing
+        run: |
+          set -euo pipefail
+          npm install -g npm@^11
+          npm --version
+          node --version
 
       # wasm-pack copies a crate-level README into pkg/ when one exists, and
       # mistlib-wasm has none -- without this the npmjs.com page would be blank.
@@ -179,17 +199,16 @@ jobs:
         working-directory: pkg
         run: |
           set -euo pipefail
-          npm pkg set name="mistlib"
+          npm pkg set name="@tik-choco/mistlib"
           npm pkg set version="${GITHUB_REF_NAME#v}"
           npm pkg set repository.type="git"
           npm pkg set repository.url="git+https://github.com/tik-choco-lab/mistlib.git"
           npm pkg set homepage="https://github.com/tik-choco-lab/mistlib"
           cat package.json
 
+      # No NODE_AUTH_TOKEN here on purpose -- the OIDC exchange replaces it.
       - name: Publish
         working-directory: pkg
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           # A prerelease such as v0.6.0-rc.1 must not move the `latest` dist-tag.
@@ -198,46 +217,3 @@ jobs:
           echo "dist-tag: $tag"
           # --access public is the default for an unscoped package; state it anyway.
           npm publish --access public --tag "$tag"
-
-  pages:
-    name: deploy GitHub Pages
-    needs: wasm
-    # Pages always reflects the latest stable release, never a prerelease.
-    if: ${{ !contains(github.ref_name, '-') }}
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    # Pages deployments cannot overlap; let an in-flight one finish.
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: wasm-pkg
-          path: site/pkg
-
-      # Pages only ever holds the latest release. Anyone needing a version-pinned
-      # URL is pointed at jsDelivr (the npm mirror), so no versions accumulate here.
-      - name: Assemble site
-        run: |
-          set -euo pipefail
-          cp .github/pages/index.html site/index.html
-          # Display uses the tag as-is (v0.6.0); npm/jsDelivr need it without the v.
-          sed -i "s/__VERSION__/${GITHUB_REF_NAME}/g;   s/__NPM_VERSION__/${GITHUB_REF_NAME#v}/g" site/index.html
-          ! grep -q '__VERSION__\|__NPM_VERSION__' site/index.html
-          # Stop Jekyll from dropping files whose names begin with an underscore.
-          touch site/.nojekyll
-          ls -R site | head -40
-
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-      - id: deploy
-        uses: actions/deploy-pages@v4

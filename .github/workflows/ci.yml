@@ -128,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
           cp ../README.md ../LICENSE .
-          npm pkg set name="mistlib"
+          npm pkg set name="@tik-choco/mistlib"
           npm pkg set version="0.0.0-ci"
           npm pkg set repository.type="git"
           npm pkg set repository.url="git+https://github.com/tik-choco-lab/mistlib.git"
@@ -154,6 +154,24 @@ jobs:
             grep -q "export .*\\b$sym\\b" pkg/mistlib_wasm.js \
               || { echo "::error::pkg/mistlib_wasm.js does not export $sym"; exit 1; }
           done
+
+      # npm publishes via trusted publishing (OIDC), which silently degrades if
+      # the job stops requesting an id-token -- the publish would then fail at
+      # release time with an auth error and no obvious cause. Assert the release
+      # workflow still asks for it, and that no token-based auth crept back in.
+      # Whether the trusted publisher is actually configured on npmjs.com cannot
+      # be checked from here; that stays a one-time manual step, documented in
+      # the release workflow's header.
+      - name: Release workflow can still obtain an OIDC token
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          grep -qE '^[[:space:]]*id-token:[[:space:]]*write' "$wf" \
+            || { echo "::error::$wf no longer requests id-token: write"; exit 1; }
+          if grep -vE '^[[:space:]]*#' "$wf" | grep -q 'NODE_AUTH_TOKEN'; then
+            echo "::error::$wf reintroduced token-based npm auth"; exit 1
+          fi
+          echo "release.yml is set up for trusted publishing"
 
       - name: Landing page renders without placeholders
         run: |
