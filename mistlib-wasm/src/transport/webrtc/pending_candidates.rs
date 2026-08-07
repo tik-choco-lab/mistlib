@@ -2,6 +2,7 @@ use mistlib_core::types::{ConnectionState, NodeId};
 use std::collections::HashMap;
 
 pub const MAX_PENDING_CANDIDATES_PER_NODE: usize = 64;
+pub const MAX_PENDING_CANDIDATE_NODES: usize = 256;
 
 #[derive(Default)]
 pub struct PendingCandidates {
@@ -18,6 +19,14 @@ impl PendingCandidates {
         } else {
             false
         }
+    }
+
+    pub(crate) fn contains_node(&self, node: &NodeId) -> bool {
+        self.inner.contains_key(node)
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.inner.len()
     }
 
     pub(crate) fn take(&mut self, node: &NodeId) -> Option<Vec<String>> {
@@ -45,4 +54,11 @@ pub(crate) fn is_active_for_pending(state: Option<&ConnectionState>) -> bool {
             | Some(ConnectionState::Connected)
             | Some(ConnectionState::Reconnecting)
     )
+}
+
+pub(crate) fn should_buffer_candidate(
+    state: Option<&ConnectionState>,
+    buffer_early_candidates: bool,
+) -> bool {
+    is_active_for_pending(state) || (buffer_early_candidates && state.is_none())
 }

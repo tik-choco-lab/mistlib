@@ -230,6 +230,19 @@ impl NostrSignaler {
 
 #[async_trait]
 impl Signaler for NostrSignaler {
+    /// Refreshes this peer's `DiscoveryTable` binding on live traffic from
+    /// *any* transport. Without it, a pair that finished its handshake and
+    /// moved to the overlay stops producing relay messages, the binding
+    /// lapses after `ttl_seconds`, and the next relay fallback (ICE restart,
+    /// reconnect after a blip) is rejected in one direction only. See
+    /// `Signaler::note_peer_alive`.
+    async fn note_peer_alive(&self, peer: &NodeId) {
+        self.discovery_table
+            .lock()
+            .await
+            .touch_node(peer, self.codec_config.ttl_seconds);
+    }
+
     async fn send_signaling(
         &self,
         to: &NodeId,

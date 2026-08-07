@@ -1,10 +1,17 @@
+use super::candidate_delivery::{
+    CandidateDelivery, TrackStatus, CANDIDATE_RETRY_DELAYS_MS, MAX_TRACKED_CANDIDATES_PER_NODE,
+};
+use super::negotiation_delivery::NegotiationDelivery;
 use super::send_queue::SendQueue;
 use super::{DisconnectGrace, GraceOrigin};
-use mistlib_core::signaling::{MessageContent, Signaler, SignalingData, SignalingType};
+use mistlib_core::signaling::{
+    CandidateEnvelope, MessageContent, Signaler, SignalingData, SignalingType,
+};
 use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEvent, NetworkEventHandler};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -12,6 +19,105 @@ use web_sys::{
     MediaStream, MessageEvent, RtcDataChannel, RtcPeerConnection, RtcPeerConnectionIceEvent,
     RtcTrackEvent,
 };
+
+async fn send_candidate_once(
+    signaler: Arc<dyn Signaler>,
+    local_id: NodeId,
+    remote_id: NodeId,
+    room_id: String,
+    payload: String,
+) {
+    if let Err(error) = signaler
+        .send_signaling(
+            &remote_id,
+            MessageContent::Data(SignalingData {
+                sender_id: local_id,
+                receiver_id: remote_id.clone(),
+                room_id,
+                data: payload,
+                signaling_type: SignalingType::Candidate,
+            }),
+        )
+        .await
+    {
+        tracing::warn!("Failed to send ICE candidate to {}: {}", remote_id.0, error);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_candidate_with_retries(
+    signaler: Arc<dyn Signaler>,
+    local_id: NodeId,
+    remote_id: NodeId,
+    room_id: String,
+    payload: String,
+    delivery: Arc<RwLock<CandidateDelivery>>,
+    generation: u32,
+    sequence: u8,
+    tracked: bool,
+) {
+    let sends = if tracked {
+        CANDIDATE_RETRY_DELAYS_MS.len() + 1
+    } else {
+        1
+    };
+    for attempt in 0..sends {
+        if attempt > 0 {
+            gloo_timers::future::TimeoutFuture::new(CANDIDATE_RETRY_DELAYS_MS[attempt - 1]).await;
+            if !delivery
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&remote_id, generation, sequence)
+            {
+                return;
+            }
+        }
+        let result = signaler
+            .send_signaling(
+                &remote_id,
+                MessageContent::Data(SignalingData {
+                    sender_id: local_id.clone(),
+                    receiver_id: remote_id.clone(),
+                    room_id: room_id.clone(),
+                    data: payload.clone(),
+                    signaling_type: SignalingType::Candidate,
+                }),
+            )
+            .await;
+        if attempt > 0 {
+            tracing::warn!(
+                "Retrying ICE candidate to {} generation={} sequence={} attempt={} result={}",
+                remote_id.0,
+                generation,
+                sequence,
+                attempt + 1,
+                if result.is_ok() { "sent" } else { "failed" }
+            );
+        } else if let Err(error) = result {
+            tracing::warn!(
+                "Failed to send ICE candidate to {} generation={} sequence={}: {}",
+                remote_id.0,
+                generation,
+                sequence,
+                error
+            );
+        }
+    }
+
+    if tracked
+        && delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .expire(&remote_id, generation, sequence)
+    {
+        tracing::warn!(
+            "ICE candidate ACK exhausted for {} generation={} sequence={}",
+            remote_id.0,
+            generation,
+            sequence
+        );
+    }
+}
 
 pub struct Peer {
     pub pc: RtcPeerConnection,
@@ -234,6 +340,9 @@ impl Peer {
         peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
         peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, web_sys::RtcRtpSender>>>>,
         pending_candidates: Arc<RwLock<crate::transport::webrtc::PendingCandidates>>,
+        candidate_delivery: Arc<RwLock<CandidateDelivery>>,
+        negotiation_delivery: Arc<RwLock<NegotiationDelivery>>,
+        candidate_generation: u32,
     ) {
         let conn_states = connection_states.clone();
         let remote_id_state = remote_id.clone();
@@ -242,11 +351,28 @@ impl Peer {
         let disconnected_since_state = disconnected_since.clone();
         let senders_state = peer_senders.clone();
         let pending_state = pending_candidates.clone();
+        let candidate_delivery_state = candidate_delivery.clone();
+        let negotiation_delivery_state = negotiation_delivery.clone();
         let room_id_state = room_id.clone();
         let signaler_ice_restart = signaler.clone();
         let local_id_ice_restart = local_id.clone();
+        let negotiation_delivery_ice_restart = negotiation_delivery.clone();
         let onstatechange = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
             let state = peer_state.pc.ice_connection_state();
+            let is_current = {
+                let peers = peers_state.read().unwrap_or_else(|e| e.into_inner());
+                peers
+                    .get(&remote_id_state)
+                    .is_some_and(|current| Arc::ptr_eq(current, &peer_state))
+            };
+            if !is_current {
+                tracing::debug!(
+                    "Ignoring stale ICE state callback from {} ({:?})",
+                    remote_id_state.0,
+                    state
+                );
+                return;
+            }
             tracing::info!(
                 "ICE Connection state to {} changed to: {:?}",
                 remote_id_state.0,
@@ -383,6 +509,7 @@ impl Peer {
                         let local_id = local_id_ice_restart.clone();
                         let remote_id = remote_id_state.clone();
                         let room_id = room_id_state.clone();
+                        let negotiation_delivery = negotiation_delivery_ice_restart.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             super::trigger_ice_restart(
                                 restart_peer,
@@ -390,6 +517,7 @@ impl Peer {
                                 local_id,
                                 remote_id,
                                 room_id,
+                                negotiation_delivery,
                             )
                             .await;
                         });
@@ -414,6 +542,16 @@ impl Peer {
                     {
                         let mut pending = pending_state.write().unwrap_or_else(|e| e.into_inner());
                         pending.remove(&remote_id_state);
+                    }
+                    {
+                        candidate_delivery_state
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove_node(&remote_id_state);
+                        negotiation_delivery_state
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove_node(&remote_id_state);
                     }
                     // Every other path that removes a peer for good routes
                     // through `Peer::close_all`, which drains `send_queue`
@@ -454,6 +592,8 @@ impl Peer {
         let local_id_cb = local_id.clone();
         let remote_id_cand = remote_id.clone();
         let room_id_cb = room_id.clone();
+        let candidate_delivery_cb = candidate_delivery.clone();
+        let next_candidate_sequence = Arc::new(AtomicU32::new(0));
 
         let onicecandidate = Closure::wrap(Box::new(move |ev: RtcPeerConnectionIceEvent| {
             if let Some(candidate) = ev.candidate() {
@@ -461,24 +601,54 @@ impl Peer {
                 let local_id = local_id_cb.clone();
                 let remote_id = remote_id_cand.clone();
                 let room_id = room_id_cb.clone();
+                let delivery = candidate_delivery_cb.clone();
+                let sequence = next_candidate_sequence.fetch_add(1, Ordering::Relaxed);
                 wasm_bindgen_futures::spawn_local(async move {
                     let cand_json = candidate.to_json();
                     let cand_str = js_sys::JSON::stringify(&cand_json)
                         .unwrap_or_default()
                         .as_string()
                         .unwrap_or_default();
-                    let _ = signaler
-                        .send_signaling(
-                            &remote_id,
-                            MessageContent::Data(SignalingData {
-                                sender_id: local_id,
-                                receiver_id: remote_id.clone(),
-                                room_id: room_id.clone(),
-                                data: cand_str,
-                                signaling_type: SignalingType::Candidate,
-                            }),
-                        )
-                        .await;
+
+                    if sequence >= MAX_TRACKED_CANDIDATES_PER_NODE as u32 {
+                        tracing::warn!(
+                            "ICE candidate count exceeded bitmap capacity for {} generation={}; sending once",
+                            remote_id.0,
+                            candidate_generation
+                        );
+                        send_candidate_once(signaler, local_id, remote_id, room_id, cand_str).await;
+                        return;
+                    }
+
+                    let sequence = sequence as u8;
+                    let envelope = CandidateEnvelope {
+                        generation: candidate_generation,
+                        sequence,
+                        candidate: cand_str,
+                    };
+                    let Ok(payload) = serde_json::to_string(&envelope) else {
+                        return;
+                    };
+                    let tracked = matches!(
+                        delivery.write().unwrap_or_else(|e| e.into_inner()).track(
+                            remote_id.clone(),
+                            candidate_generation,
+                            sequence
+                        ),
+                        TrackStatus::New
+                    );
+                    send_candidate_with_retries(
+                        signaler,
+                        local_id,
+                        remote_id,
+                        room_id,
+                        payload,
+                        delivery,
+                        candidate_generation,
+                        sequence,
+                        tracked,
+                    )
+                    .await;
                 });
             }
         }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
@@ -617,12 +787,29 @@ impl Peer {
         let disconnected_open = disconnected_since.clone();
         let room_id_open = room_id.clone();
         let peer_open = peer.clone();
+        let peers_open = peers.clone();
         let onopen = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
             tracing::info!("DataChannel {} to {} opened", label, from_msg.0);
-            // Scoped tightly so the write lock is released before the
-            // flush below runs -- flushing must happen outside any held
-            // lock (mind the WASM no_threads mutex re-entrancy note on
-            // `onmessage` further down).
+            // ReliableOrdered is the transport's required control/data path.
+            // Marking the peer Connected when either best-effort channel opens
+            // can suppress the connection watchdog while the required channel
+            // is still unusable.
+            if method != DeliveryMethod::ReliableOrdered {
+                return;
+            }
+            let is_current = {
+                let lock = peers_open.read().unwrap_or_else(|e| e.into_inner());
+                lock.get(&from_msg)
+                    .is_some_and(|current| Arc::ptr_eq(current, &peer_open))
+            };
+            if !is_current {
+                tracing::debug!(
+                    "Ignoring stale DataChannel open callback from {}",
+                    from_msg.0
+                );
+                return;
+            }
+
             let prev = {
                 let mut lock = states_open.write().unwrap_or_else(|e| e.into_inner());
                 lock.insert(from_msg.clone(), ConnectionState::Connected)
@@ -635,16 +822,7 @@ impl Peer {
             if prev != Some(ConnectionState::Connected) {
                 crate::app::emit_peer_connected(from_msg.clone(), room_id_open.clone());
             }
-
-            // Flush deferred reliable sends now that the channel that
-            // carries them is actually open. Only the ReliableOrdered
-            // channel's own `onopen` matters here -- `flush_send_queue`
-            // re-checks the channel's readiness itself, so firing this from
-            // the other two channels' `onopen` would just be a harmless
-            // no-op, but gating on `method` avoids the wasted lookup.
-            if method == DeliveryMethod::ReliableOrdered {
-                peer_open.flush_send_queue(&from_msg);
-            }
+            peer_open.flush_send_queue(&from_msg);
         }) as Box<dyn FnMut(web_sys::Event)>);
         dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -654,6 +832,7 @@ impl Peer {
         let states_close = connection_states.clone();
         let disconnected_close = disconnected_since.clone();
         let peers_close = peers.clone();
+        let peer_close_identity = peer.clone();
         let senders_close = peer_senders.clone();
         let pending_close = pending_candidates.clone();
         let room_id_close = room_id.clone();
@@ -665,7 +844,14 @@ impl Peer {
 
             let peer = {
                 let mut lock = peers_close.write().unwrap_or_else(|e| e.into_inner());
-                lock.remove(&from_close_for_cleanup)
+                let is_current = lock
+                    .get(&from_close_for_cleanup)
+                    .is_some_and(|current| Arc::ptr_eq(current, &peer_close_identity));
+                if is_current {
+                    lock.remove(&from_close_for_cleanup)
+                } else {
+                    None
+                }
             };
 
             let Some(peer) = peer else { return };

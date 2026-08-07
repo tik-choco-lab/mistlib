@@ -19,6 +19,48 @@ pub enum SignalingType {
     /// WebRTC peer still reports `readyState == Open` locally for tens of
     /// seconds.
     Rejoin,
+    /// End-to-end acknowledgement for trickled ICE candidates. Unlike a
+    /// relay `OK`, this proves that the intended peer received the payload.
+    /// Kept at the end to preserve existing binary enum discriminants.
+    CandidateAck,
+    /// End-to-end acknowledgement for an Offer/Answer transaction.
+    NegotiationAck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateEnvelope {
+    #[serde(rename = "g")]
+    pub generation: u32,
+    /// Zero-based within `generation`; values 0..=63 are ACK-trackable.
+    #[serde(rename = "s")]
+    pub sequence: u8,
+    #[serde(rename = "c")]
+    pub candidate: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateAck {
+    #[serde(rename = "g")]
+    pub generation: u32,
+    /// Bit N acknowledges candidate sequence N.
+    #[serde(rename = "m")]
+    pub mask: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NegotiationEnvelope {
+    #[serde(rename = "i")]
+    pub id: u64,
+    #[serde(rename = "s")]
+    pub sdp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NegotiationAck {
+    #[serde(rename = "i")]
+    pub id: u64,
 }
 
 impl SignalingType {
@@ -73,6 +115,8 @@ mod tests {
         assert!(!SignalingType::Answer.is_local_only());
         assert!(!SignalingType::Candidate.is_local_only());
         assert!(!SignalingType::Candidates.is_local_only());
+        assert!(!SignalingType::CandidateAck.is_local_only());
+        assert!(!SignalingType::NegotiationAck.is_local_only());
         assert!(!SignalingType::Request.is_local_only());
     }
 }

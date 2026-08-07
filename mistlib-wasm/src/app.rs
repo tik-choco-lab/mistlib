@@ -380,6 +380,18 @@ pub fn leave_room_id(room_id: String) -> Result<(), JsValue> {
     crate::layers::wasm_l0::leave_room_id(&room_id)
 }
 
+/// Awaitable room leave used when the caller intends to rebuild the same
+/// room/node identity. The reservation runs synchronously; the returned
+/// promise resolves after the old signaling and transport cleanup finishes.
+pub fn leave_room_id_async(room_id: String) -> js_sys::Promise {
+    let reservation = crate::layers::wasm_l0::reserve_leave(&room_id);
+    wasm_bindgen_futures::future_to_promise(async move {
+        crate::layers::wasm_l0::run_leave(room_id, reservation)
+            .await
+            .map(|_| JsValue::UNDEFINED)
+    })
+}
+
 pub fn set_config(data: String) -> bool {
     let Some(config) = config_from_json(&data) else {
         return false;

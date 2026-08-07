@@ -10,6 +10,7 @@ use std::sync::Mutex;
 struct RecordingSignaler {
     sent: Mutex<Vec<NodeId>>,
     resets: AtomicUsize,
+    alive: Mutex<Vec<NodeId>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -18,6 +19,10 @@ impl Signaler for RecordingSignaler {
     async fn send_signaling(&self, to: &NodeId, _msg: MessageContent) -> crate::error::Result<()> {
         self.sent.lock().unwrap().push(to.clone());
         Ok(())
+    }
+
+    async fn note_peer_alive(&self, peer: &NodeId) {
+        self.alive.lock().unwrap().push(peer.clone());
     }
 
     async fn reset_session(&self) -> crate::error::Result<()> {
@@ -278,4 +283,78 @@ fn reset_session_clears_recorded_routes_and_resets_bootstrap() {
 
     assert_eq!(relay.route_for(&peer), None);
     assert_eq!(bootstrap.resets.load(Ordering::SeqCst), 1);
+}
+
+/// Traffic arriving over the overlay must reach the bootstrap signaler's
+/// liveness hook. This is the ingress the refresh path used to miss: once a
+/// pair is connected `RoutedSignaler` prefers the overlay, so no relay
+/// message ever renews the peer's `DiscoveryTable` binding and it lapses
+/// while the peer is plainly alive.
+#[test]
+fn overlay_ingress_reports_the_peer_as_alive_to_the_bootstrap_signaler() {
+    let bootstrap = Arc::new(RecordingSignaler::default());
+    let (relay, _router) = make_relay(
+        Arc::new(RecordingActionHandler::default()),
+        bootstrap.clone(),
+    );
+    let inner = Arc::new(RecordingSignalingHandler::default());
+    let handler = RoutedSignalingHandler::new(relay, inner.clone(), SignalingRoute::Overlay);
+
+    futures::executor::block_on(handler.handle_message(signaling_msg("peer-a", "local"))).unwrap();
+
+    assert_eq!(
+        bootstrap.alive.lock().unwrap().as_slice(),
+        &[NodeId("peer-a".to_string())],
+        "overlay ingress must refresh the bootstrap signaler's per-peer state"
+    );
+    assert_eq!(
+        inner.handled.lock().unwrap().len(),
+        1,
+        "message still delivered"
+    );
+}
+
+/// The hook is deliberately unconditional: the WebSocket ingress reports too,
+/// even though the Nostr handler already refreshes there. Duplicating an
+/// idempotent `max()` refresh is cheaper than another per-ingress condition
+/// for a future transport to be forgotten in.
+#[test]
+fn websocket_ingress_reports_liveness_too() {
+    let bootstrap = Arc::new(RecordingSignaler::default());
+    let (relay, _router) = make_relay(
+        Arc::new(RecordingActionHandler::default()),
+        bootstrap.clone(),
+    );
+    let handler = RoutedSignalingHandler::new(
+        relay,
+        Arc::new(RecordingSignalingHandler::default()),
+        SignalingRoute::WebSocket,
+    );
+
+    futures::executor::block_on(handler.handle_message(signaling_msg("peer-b", "local"))).unwrap();
+
+    assert_eq!(
+        bootstrap.alive.lock().unwrap().as_slice(),
+        &[NodeId("peer-b".to_string())]
+    );
+}
+
+/// A non-`Data` message carries no sender to attribute liveness to.
+#[test]
+fn liveness_is_not_reported_for_messages_without_a_sender() {
+    let bootstrap = Arc::new(RecordingSignaler::default());
+    let (relay, _router) = make_relay(
+        Arc::new(RecordingActionHandler::default()),
+        bootstrap.clone(),
+    );
+    let handler = RoutedSignalingHandler::new(
+        relay,
+        Arc::new(RecordingSignalingHandler::default()),
+        SignalingRoute::Overlay,
+    );
+
+    futures::executor::block_on(handler.handle_message(MessageContent::from(vec![1u8, 2, 3])))
+        .unwrap();
+
+    assert!(bootstrap.alive.lock().unwrap().is_empty());
 }

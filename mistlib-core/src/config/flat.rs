@@ -15,6 +15,9 @@ pub(super) struct FlatConfig {
     /// its sections spelled out -- so there was no practical way for a host
     /// application to supply TURN credentials.
     ice_servers: Option<Vec<IceServer>>,
+    webrtc_connection_timeout_ms: Option<u32>,
+    webrtc_defer_connection_watchdog_until_negotiated: Option<bool>,
+    webrtc_buffer_early_ice_candidates: Option<bool>,
     max_connection_count: Option<u32>,
     connection_balancer_interval_seconds: Option<f32>,
     expire_seconds: Option<f32>,
@@ -46,6 +49,11 @@ impl FlatConfig {
             signaling_url: Some(c.signaling_url.clone()),
             signaling: Some(c.signaling.clone()),
             ice_servers: Some(c.webrtc.ice_servers.clone()),
+            webrtc_connection_timeout_ms: Some(c.webrtc.connection_timeout_ms),
+            webrtc_defer_connection_watchdog_until_negotiated: Some(
+                c.webrtc.defer_connection_watchdog_until_negotiated,
+            ),
+            webrtc_buffer_early_ice_candidates: Some(c.webrtc.buffer_early_ice_candidates),
             max_connection_count: Some(c.limits.max_connection_count),
             connection_balancer_interval_seconds: Some(c.intervals.connection_balancer),
             expire_seconds: Some(c.limits.expire_node_seconds),
@@ -81,6 +89,20 @@ impl FlatConfig {
         }
         if let Some(v) = self.ice_servers {
             c.webrtc.ice_servers = v;
+        }
+        if let Some(v) = self.webrtc_connection_timeout_ms {
+            if v == 0 {
+                return Err(MistError::Config(
+                    "webrtcConnectionTimeoutMs must be greater than zero".to_string(),
+                ));
+            }
+            c.webrtc.connection_timeout_ms = v;
+        }
+        if let Some(v) = self.webrtc_defer_connection_watchdog_until_negotiated {
+            c.webrtc.defer_connection_watchdog_until_negotiated = v;
+        }
+        if let Some(v) = self.webrtc_buffer_early_ice_candidates {
+            c.webrtc.buffer_early_ice_candidates = v;
         }
         if let Some(v) = self.max_connection_count {
             c.limits.max_connection_count = v;

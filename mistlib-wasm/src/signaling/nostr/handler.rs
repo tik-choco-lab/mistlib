@@ -162,6 +162,13 @@ impl WasmNostrSignaler {
             &incoming,
             decoded.sender_joined_at,
         ) {
+            tracing::warn!(
+                "Nostr signaling drop: reason=sender_admission sender_node={} sender_pubkey={} type={:?} sender_epoch={:?}",
+                incoming.sender_id.0,
+                decoded.sender_pubkey,
+                incoming.signaling_type,
+                decoded.sender_joined_at
+            );
             return Ok(());
         }
         if !self.accept_message_order(
@@ -316,14 +323,21 @@ impl WasmNostrSignaler {
             .incoming_sequences
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        accept_nostr_message_order(
+        let acceptance = accept_nostr_message_order(
             &mut dedupe,
             &mut sequences,
             sender_pubkey,
             message_id,
             sequence,
-        )
-        .is_accepted()
+        );
+        if !acceptance.is_accepted() {
+            tracing::warn!(
+                "Nostr signaling drop: reason=message_order sender_pubkey={} acceptance={:?}",
+                sender_pubkey,
+                acceptance
+            );
+        }
+        acceptance.is_accepted()
     }
 
     fn mark_seen_if_current(&self, event_id: &str, room_id: &str) -> bool {

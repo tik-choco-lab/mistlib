@@ -257,7 +257,7 @@ pub(crate) async fn run_join(room_id: String, reservation: JoinReservation) -> R
                             "WASM join_room({}) was cancelled by an intervening leave; discarding the freshly built session",
                             room_id
                         );
-                        teardown_session(&session);
+                        teardown_session_and_wait(&session).await;
                         let reason = "join cancelled by leave".to_string();
                         crate::app::drain_join_waiters(&room_id, Err(reason.clone()));
                         crate::app::emit_room_join_failed(room_id, reason.clone());
@@ -286,41 +286,75 @@ pub(crate) async fn run_join(room_id: String, reservation: JoinReservation) -> R
     }
 }
 
-/// New export backing `leave_room_id`: tears down exactly one room's
-/// session, leaving every other joined room untouched. Not part of
-/// `L0Engine` (its signature is fixed by mistlib-core and shared with
-/// mistlib-native), so it's a free function called directly from
-/// `crate::app::leave_room_id`.
-pub(crate) fn leave_room_id(room_id: &str) -> Result<(), JsValue> {
+/// Result of the synchronous half of a per-room leave operation. Removing an
+/// active session (or cancelling a pending join) happens before an async
+/// `Promise` is returned, so a same-tick join cannot observe the old session.
+pub(crate) enum LeaveReservation {
+    Active(Session),
+    PendingJoin,
+    Missing,
+}
+
+pub(crate) fn reserve_leave(room_id: &str) -> LeaveReservation {
     if let Some(session) = crate::app::remove_session(room_id) {
-        teardown_session(&session);
-        crate::app::emit_room_left(room_id.to_string());
-        return Ok(());
+        return LeaveReservation::Active(session);
     }
 
     if crate::app::cancel_pending_join(room_id) {
-        // No session exists yet, but a join_room(room_id) build is still in
-        // flight; mark it cancelled so build completion tears it down
-        // instead of inserting it. The leave is accepted immediately rather
-        // than erroring, even though the session it's cancelling doesn't
-        // exist yet.
         tracing::debug!(
             "WASM leave_room_id({}) cancelled an in-flight join",
             room_id
         );
-        return Ok(());
+        return LeaveReservation::PendingJoin;
     }
 
-    Err(JsValue::from_str(&format!("Room not joined: {}", room_id)))
+    LeaveReservation::Missing
+}
+
+/// Synchronous compatibility API. The active session disappears from the
+/// registry immediately and its network cleanup continues in the background.
+pub(crate) fn leave_room_id(room_id: &str) -> Result<(), JsValue> {
+    match reserve_leave(room_id) {
+        LeaveReservation::Active(session) => {
+            teardown_session(&session);
+            crate::app::emit_room_left(room_id.to_string());
+            Ok(())
+        }
+        LeaveReservation::PendingJoin => Ok(()),
+        LeaveReservation::Missing => {
+            Err(JsValue::from_str(&format!("Room not joined: {}", room_id)))
+        }
+    }
+}
+
+/// Awaitable teardown barrier used before rebuilding the same room/node
+/// identity. It does not resolve until the old signaling socket and known
+/// transport connections have completed cleanup.
+pub(crate) async fn run_leave(
+    room_id: String,
+    reservation: LeaveReservation,
+) -> Result<(), JsValue> {
+    match reservation {
+        LeaveReservation::Active(session) => {
+            teardown_session_and_wait(&session).await;
+            crate::app::emit_room_left(room_id);
+            Ok(())
+        }
+        LeaveReservation::PendingJoin => Ok(()),
+        LeaveReservation::Missing => {
+            Err(JsValue::from_str(&format!("Room not joined: {}", room_id)))
+        }
+    }
 }
 
 fn teardown_session(session: &Session) {
     session.webrtc.close_all_peer_connections();
-    // Schedules the async disconnects/websocket close and returns state to
-    // Idle; the spawned cleanup task holds its own clones of what it needs,
-    // so it keeps running after `session` (and this engine handle) is
-    // dropped.
     session.engine.leave_room();
+}
+
+async fn teardown_session_and_wait(session: &Session) {
+    session.webrtc.close_all_peer_connections();
+    session.engine.leave_room_and_wait().await;
 }
 
 /// Builds and starts a brand new per-room session: its own signaler
@@ -382,6 +416,11 @@ async fn build_session(
     webrtc.set_max_connections(config.limits.max_connection_count);
     webrtc.set_max_message_bytes(config.limits.max_message_bytes);
     webrtc.set_ice_servers(config.webrtc.ice_servers.clone());
+    webrtc.set_connection_experiment(
+        config.webrtc.connection_timeout_ms,
+        config.webrtc.defer_connection_watchdog_until_negotiated,
+        config.webrtc.buffer_early_ice_candidates,
+    );
     let ws_signaling_handler = Arc::new(RoutedSignalingHandler::new(
         routed_signaler.clone(),
         webrtc.clone() as Arc<dyn SignalingHandler>,

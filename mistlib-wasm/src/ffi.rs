@@ -164,6 +164,11 @@ pub fn leave_room_id(room_id: String) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn leave_room_id_async(room_id: String) -> js_sys::Promise {
+    crate::app::leave_room_id_async(room_id)
+}
+
+#[wasm_bindgen]
 pub fn set_config(data: String) -> bool {
     crate::app::set_config(data)
 }

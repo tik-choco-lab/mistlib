@@ -135,6 +135,33 @@ fn ice_servers_survive_a_flat_json_round_trip() {
     assert_eq!(reloaded.webrtc.ice_servers, config.webrtc.ice_servers);
 }
 
+#[test]
+fn flat_config_can_select_browser_webrtc_ab_profile() {
+    let mut config = Config::new_default();
+    config
+        .update_from_json(
+            r#"{
+                "webrtcConnectionTimeoutMs": 6000,
+                "webrtcDeferConnectionWatchdogUntilNegotiated": false,
+                "webrtcBufferEarlyIceCandidates": false
+            }"#,
+        )
+        .unwrap();
+
+    assert_eq!(config.webrtc.connection_timeout_ms, 6000);
+    assert!(!config.webrtc.defer_connection_watchdog_until_negotiated);
+    assert!(!config.webrtc.buffer_early_ice_candidates);
+}
+
+#[test]
+fn browser_webrtc_connection_timeout_must_be_positive() {
+    let mut config = Config::new_default();
+    let err = config
+        .update_from_json(r#"{"webrtcConnectionTimeoutMs":0}"#)
+        .expect_err("zero timeout must be rejected");
+    assert!(err.to_string().contains("greater than zero"));
+}
+
 /// Every default STUN entry must be a bare `stun:` URL: a `turn:` default would
 /// need credentials, and `IceServer::is_usable` would drop the whole entry at
 /// construction time, leaving peers with no reflexive candidate at all.

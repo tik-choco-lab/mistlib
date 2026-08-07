@@ -91,6 +91,27 @@ fn default_ping_interval() -> f32 {
 #[serde(rename_all = "camelCase")]
 pub struct WebRtcConfig {
     pub ice_servers: Vec<IceServer>,
+    /// Per-phase timeout for browser WebRTC connection establishment.
+    #[serde(default = "default_webrtc_connection_timeout_ms")]
+    pub connection_timeout_ms: u32,
+    /// Delay the browser ICE/DataChannel watchdog until negotiation settles.
+    #[serde(default = "default_defer_connection_watchdog_until_negotiated")]
+    pub defer_connection_watchdog_until_negotiated: bool,
+    /// Preserve ICE candidates that arrive before the browser peer exists.
+    #[serde(default = "default_buffer_early_ice_candidates")]
+    pub buffer_early_ice_candidates: bool,
+}
+
+fn default_webrtc_connection_timeout_ms() -> u32 {
+    15_000
+}
+
+fn default_defer_connection_watchdog_until_negotiated() -> bool {
+    true
+}
+
+fn default_buffer_early_ice_candidates() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -242,6 +263,10 @@ impl Config {
             },
             webrtc: WebRtcConfig {
                 ice_servers: default_ice_servers(),
+                connection_timeout_ms: default_webrtc_connection_timeout_ms(),
+                defer_connection_watchdog_until_negotiated:
+                    default_defer_connection_watchdog_until_negotiated(),
+                buffer_early_ice_candidates: default_buffer_early_ice_candidates(),
             },
             storage: StorageConfig::default(),
         }

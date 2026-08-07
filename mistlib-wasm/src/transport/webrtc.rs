@@ -3,7 +3,8 @@ use bytes::Bytes;
 use js_sys::Reflect;
 use mistlib_core::config::IceServer;
 use mistlib_core::signaling::{
-    MessageContent, Signaler, SignalingData, SignalingHandler, SignalingType,
+    CandidateAck, CandidateEnvelope, MessageContent, NegotiationAck, NegotiationEnvelope, Signaler,
+    SignalingData, SignalingHandler, SignalingType,
 };
 use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEventHandler, Transport};
@@ -20,12 +21,126 @@ use web_sys::{
 };
 use web_time::Instant;
 
-const CONNECTION_TIMEOUT_MS: u32 = 6000;
+#[allow(clippy::too_many_arguments)]
+async fn send_negotiation_reliably(
+    signaler: Arc<dyn Signaler>,
+    local_id: NodeId,
+    remote_id: NodeId,
+    room_id: String,
+    delivery: Arc<RwLock<NegotiationDelivery>>,
+    signaling_type: SignalingType,
+    sdp: String,
+) {
+    let id = rand::random::<u64>();
+    let Ok(payload) = serde_json::to_string(&NegotiationEnvelope { id, sdp }) else {
+        tracing::error!(
+            "Failed to serialize {:?} transaction for {}",
+            signaling_type,
+            remote_id.0
+        );
+        return;
+    };
+    let tracked = matches!(
+        delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .track(remote_id.clone(), id),
+        NegotiationTrackStatus::New
+    );
+
+    let initial_result = signaler
+        .send_signaling(
+            &remote_id,
+            MessageContent::Data(SignalingData {
+                sender_id: local_id.clone(),
+                receiver_id: remote_id.clone(),
+                room_id: room_id.clone(),
+                data: payload.clone(),
+                signaling_type: signaling_type.clone(),
+            }),
+        )
+        .await;
+    if let Err(error) = initial_result {
+        tracing::warn!(
+            "Negotiation signal {:?} to {} id={:016x} attempt=1 failed: {}",
+            signaling_type,
+            remote_id.0,
+            id,
+            error
+        );
+    }
+    if !tracked {
+        return;
+    }
+
+    wasm_bindgen_futures::spawn_local(async move {
+        for (index, delay_ms) in NEGOTIATION_RETRY_DELAYS_MS.iter().copied().enumerate() {
+            gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+            if !delivery
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&remote_id, id)
+            {
+                return;
+            }
+            let result = signaler
+                .send_signaling(
+                    &remote_id,
+                    MessageContent::Data(SignalingData {
+                        sender_id: local_id.clone(),
+                        receiver_id: remote_id.clone(),
+                        room_id: room_id.clone(),
+                        data: payload.clone(),
+                        signaling_type: signaling_type.clone(),
+                    }),
+                )
+                .await;
+            tracing::warn!(
+                "Negotiation signal {:?} to {} id={:016x} attempt={} result={}",
+                signaling_type,
+                remote_id.0,
+                id,
+                index + 2,
+                if result.is_ok() { "sent" } else { "failed" }
+            );
+        }
+        if delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .expire(&remote_id, id)
+        {
+            tracing::warn!(
+                "Negotiation ACK exhausted for {:?} to {} id={:016x}",
+                signaling_type,
+                remote_id.0,
+                id
+            );
+        }
+    });
+}
+
 const ISOLATION_RECOVERY_DELAY_MS: u32 = 3000;
 #[cfg(test)]
 const DISCONNECTED_GRACE_MS: u64 = 50;
 #[cfg(not(test))]
 const DISCONNECTED_GRACE_MS: u64 = 5000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionWatchdogPhase {
+    Legacy,
+    Negotiation,
+    Connectivity,
+}
+
+impl ConnectionWatchdogPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Negotiation => "negotiation",
+            Self::Connectivity => "connectivity",
+        }
+    }
+}
 
 /// What triggered a peer's current reconnect-grace period. `clear_suspect` may
 /// only cancel a `LivenessSuspect`-origin grace: an `Ice`-origin one is left
@@ -69,11 +184,13 @@ pub enum IsolationRecovery {
     Skip,
 }
 pub mod backpressure;
+pub mod candidate_delivery;
 pub mod ice_config;
 pub mod ice_restart;
 pub mod isolation;
 mod media;
 pub mod message_guard;
+pub mod negotiation_delivery;
 pub mod offer_guard;
 pub mod peer;
 pub mod pending_candidates;
@@ -82,16 +199,22 @@ pub mod request_guard;
 pub mod sdp_lines;
 pub mod send_queue;
 use backpressure::{backpressure_action, BackpressureAction};
+use candidate_delivery::{CandidateDelivery, CANDIDATE_ACK_DEBOUNCE_MS};
 use ice_config::{build_ice_server_plans, ice_server_plans_to_js};
 use isolation::is_isolated;
 use message_guard::{check_message_size, SizeCheck};
+use negotiation_delivery::{
+    NegotiationDelivery, TrackStatus as NegotiationTrackStatus, NEGOTIATION_RETRY_DELAYS_MS,
+};
 use offer_guard::{
     active_connection_count, create_failure_rollback, offer_action_for_snapshot, OfferAction,
     OfferCreateFailureRollback, SignalingSnapshot,
 };
 pub use peer::Peer;
 pub use pending_candidates::PendingCandidates;
-use pending_candidates::{is_active_for_pending, MAX_PENDING_CANDIDATES_PER_NODE};
+use pending_candidates::{
+    should_buffer_candidate, MAX_PENDING_CANDIDATES_PER_NODE, MAX_PENDING_CANDIDATE_NODES,
+};
 pub use request_guard::RequestAction;
 use request_guard::{request_action_for_snapshot, RequestState};
 use sdp_lines::mline_signature;
@@ -124,6 +247,8 @@ pub struct WasmWebRtcTransport {
     pub connection_states: Arc<RwLock<HashMap<NodeId, ConnectionState>>>,
     pub connection_attempt_ids: Arc<RwLock<HashMap<NodeId, u32>>>,
     pub pending_candidates: Arc<RwLock<PendingCandidates>>,
+    pub candidate_delivery: Arc<RwLock<CandidateDelivery>>,
+    pub negotiation_delivery: Arc<RwLock<NegotiationDelivery>>,
     pub disconnected_since: Arc<RwLock<HashMap<NodeId, DisconnectGrace>>>,
     pub room_id: Arc<RwLock<String>>,
     pub ice_servers: RwLock<Vec<IceServer>>,
@@ -132,7 +257,14 @@ pub struct WasmWebRtcTransport {
     /// `build_session` the same way `max_connections`/`ice_servers` are --
     /// see `set_max_message_bytes`.
     pub max_message_bytes: AtomicU32,
+    /// Per-phase watchdog budget. Set from `Config::webrtc` at session build.
+    pub connection_timeout_ms: AtomicU32,
+    /// A/B knob: false reproduces the legacy eager one-shot watchdog.
+    pub defer_connection_watchdog_until_negotiated: AtomicBool,
+    /// A/B knob: true preserves candidates that beat their Offer to dispatch.
+    pub buffer_early_ice_candidates: AtomicBool,
     pub next_connection_attempt_id: AtomicU32,
+    pub next_candidate_generation: AtomicU32,
     pub sweeper_started: AtomicBool,
     pub sweeper_generation: Arc<AtomicU32>,
     pub isolation_recovery_epoch: Arc<AtomicU32>,
@@ -188,6 +320,8 @@ impl WasmWebRtcTransport {
             connection_states: Arc::new(RwLock::new(HashMap::new())),
             connection_attempt_ids: Arc::new(RwLock::new(HashMap::new())),
             pending_candidates: Arc::new(RwLock::new(PendingCandidates::default())),
+            candidate_delivery: Arc::new(RwLock::new(CandidateDelivery::default())),
+            negotiation_delivery: Arc::new(RwLock::new(NegotiationDelivery::default())),
             disconnected_since: Arc::new(RwLock::new(HashMap::new())),
             room_id: Arc::new(RwLock::new("lobby".to_string())),
             // Mirrors `Config::new_default()`'s `webrtc.ice_servers`, same as
@@ -201,7 +335,11 @@ impl WasmWebRtcTransport {
             // `build_session` overwrites this via `set_max_message_bytes`,
             // same caveat as `ice_servers`/`max_connections` above.
             max_message_bytes: AtomicU32::new(65536),
+            connection_timeout_ms: AtomicU32::new(15_000),
+            defer_connection_watchdog_until_negotiated: AtomicBool::new(true),
+            buffer_early_ice_candidates: AtomicBool::new(true),
             next_connection_attempt_id: AtomicU32::new(1),
+            next_candidate_generation: AtomicU32::new(rand::random()),
             sweeper_started: AtomicBool::new(false),
             sweeper_generation: Arc::new(AtomicU32::new(0)),
             isolation_recovery_epoch: Arc::new(AtomicU32::new(0)),
@@ -225,6 +363,8 @@ impl WasmWebRtcTransport {
         let states = self.connection_states.clone();
         let attempts = self.connection_attempt_ids.clone();
         let pending_candidates = self.pending_candidates.clone();
+        let candidate_delivery = self.candidate_delivery.clone();
+        let negotiation_delivery = self.negotiation_delivery.clone();
         let disconnected_since = self.disconnected_since.clone();
         let senders = self.peer_senders.clone();
         let restarted_peers = self.restarted_peers.clone();
@@ -262,6 +402,14 @@ impl WasmWebRtcTransport {
                             .write()
                             .unwrap_or_else(|e| e.into_inner())
                             .remove(&node);
+                        candidate_delivery
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove_node(&node);
+                        negotiation_delivery
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove_node(&node);
                         restarted_peers
                             .write()
                             .unwrap_or_else(|e| e.into_inner())
@@ -331,6 +479,14 @@ impl WasmWebRtcTransport {
                                 .unwrap_or_else(|e| e.into_inner());
                             lock.remove(&node);
                         }
+                        candidate_delivery
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove_node(&node);
+                        negotiation_delivery
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove_node(&node);
                         {
                             let mut lock = states.write().unwrap_or_else(|e| e.into_inner());
                             lock.insert(node.clone(), ConnectionState::Disconnected);
@@ -378,6 +534,26 @@ impl WasmWebRtcTransport {
 
     pub fn set_max_connections(&self, max: u32) {
         self.max_connections.store(max, Ordering::Relaxed);
+    }
+
+    pub fn set_connection_experiment(
+        &self,
+        timeout_ms: u32,
+        defer_until_negotiated: bool,
+        buffer_early_candidates: bool,
+    ) {
+        self.connection_timeout_ms
+            .store(timeout_ms.max(1), Ordering::Relaxed);
+        self.defer_connection_watchdog_until_negotiated
+            .store(defer_until_negotiated, Ordering::Relaxed);
+        self.buffer_early_ice_candidates
+            .store(buffer_early_candidates, Ordering::Relaxed);
+        tracing::info!(
+            "WebRTC connection profile: timeout_ms={}, defer_until_negotiated={}, buffer_early_candidates={}",
+            timeout_ms.max(1),
+            defer_until_negotiated,
+            buffer_early_candidates
+        );
     }
 
     /// Sets the SPEC-13 payload size cap enforced by `Transport::send`.
@@ -431,19 +607,22 @@ impl WasmWebRtcTransport {
         }
     }
 
-    fn buffer_candidate_if_active(&self, node: &NodeId, cand_json: String) {
-        let should_buffer = {
+    fn buffer_candidate_if_allowed(&self, node: &NodeId, cand_json: String) {
+        let buffer_early = self.buffer_early_ice_candidates.load(Ordering::Relaxed);
+        let state = {
             let states = self
                 .connection_states
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            is_active_for_pending(states.get(node))
+            states.get(node).copied()
         };
 
-        if !should_buffer {
+        if !should_buffer_candidate(state.as_ref(), buffer_early) {
             tracing::debug!(
-                "dropping ICE candidate for {} without active connection state",
-                node.0
+                "dropping ICE candidate for {} (state={:?}, buffer_early={})",
+                node.0,
+                state,
+                buffer_early
             );
             return;
         }
@@ -453,9 +632,24 @@ impl WasmWebRtcTransport {
                 .pending_candidates
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            let is_new_node = !pending.contains_node(node);
+            if is_new_node && pending.node_count() >= MAX_PENDING_CANDIDATE_NODES {
+                tracing::warn!(
+                    "refusing early ICE candidate for {}: pending node cap {} reached",
+                    node.0,
+                    MAX_PENDING_CANDIDATE_NODES
+                );
+                return;
+            }
             pending.push(node.clone(), cand_json)
         };
 
+        tracing::debug!(
+            "queued ICE candidate for {} (state={:?}, early={})",
+            node.0,
+            state,
+            state.is_none()
+        );
         if dropped_oldest {
             tracing::warn!(
                 "pending ICE candidates for {} exceeded {}; dropped oldest",
@@ -480,7 +674,157 @@ impl WasmWebRtcTransport {
             }
         }
 
-        self.buffer_candidate_if_active(node, cand_json);
+        self.buffer_candidate_if_allowed(node, cand_json);
+    }
+
+    async fn send_negotiation(
+        &self,
+        remote_id: &NodeId,
+        signaling_type: SignalingType,
+        sdp: String,
+    ) {
+        let room_id = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        send_negotiation_reliably(
+            self.signaler.clone(),
+            self.local_node_id.clone(),
+            remote_id.clone(),
+            room_id,
+            self.negotiation_delivery.clone(),
+            signaling_type,
+            sdp,
+        )
+        .await;
+    }
+
+    fn negotiation_payload(
+        &self,
+        remote_id: &NodeId,
+        payload: String,
+    ) -> (String, Option<u64>, bool) {
+        let Ok(envelope) = serde_json::from_str::<NegotiationEnvelope>(&payload) else {
+            return (payload, None, false);
+        };
+        let duplicate = self
+            .negotiation_delivery
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_received(remote_id, envelope.id);
+        (envelope.sdp, Some(envelope.id), duplicate)
+    }
+
+    fn acknowledge_negotiation(&self, remote_id: NodeId, id: u64) {
+        let delivery = self.negotiation_delivery.clone();
+        delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remember_received(remote_id.clone(), id);
+        let signaler = self.signaler.clone();
+        let local_id = self.local_node_id.clone();
+        let room_id = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(payload) = serde_json::to_string(&NegotiationAck { id }) else {
+                return;
+            };
+            if let Err(error) = signaler
+                .send_signaling(
+                    &remote_id,
+                    MessageContent::Data(SignalingData {
+                        sender_id: local_id,
+                        receiver_id: remote_id.clone(),
+                        room_id,
+                        data: payload,
+                        signaling_type: SignalingType::NegotiationAck,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send negotiation ACK to {} id={:016x}: {}",
+                    remote_id.0,
+                    id,
+                    error
+                );
+            }
+        });
+    }
+
+    fn handle_candidate_signal(&self, node: &NodeId, payload: String) {
+        let Ok(envelope) = serde_json::from_str::<CandidateEnvelope>(&payload) else {
+            // Compatibility with peers that still send the raw RTC candidate JSON.
+            self.handle_candidate_payload(node, payload);
+            return;
+        };
+
+        let status = self
+            .candidate_delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remember_received(node.clone(), envelope.generation, envelope.sequence);
+        if status.is_new {
+            self.handle_candidate_payload(node, envelope.candidate);
+        } else {
+            tracing::debug!(
+                "Ignoring duplicate ICE candidate from {} generation={} sequence={}",
+                node.0,
+                envelope.generation,
+                envelope.sequence
+            );
+        }
+        if status.schedule_ack {
+            self.schedule_candidate_ack(node.clone(), envelope.generation);
+        }
+    }
+
+    fn schedule_candidate_ack(&self, remote_id: NodeId, generation: u32) {
+        let delivery = self.candidate_delivery.clone();
+        let signaler = self.signaler.clone();
+        let local_id = self.local_node_id.clone();
+        let room_id = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(CANDIDATE_ACK_DEBOUNCE_MS).await;
+            let ack = delivery
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_ack(&remote_id, generation);
+            let Some(ack) = ack else {
+                return;
+            };
+            let Ok(payload) = serde_json::to_string(&ack) else {
+                return;
+            };
+            if let Err(error) = signaler
+                .send_signaling(
+                    &remote_id,
+                    MessageContent::Data(SignalingData {
+                        sender_id: local_id,
+                        receiver_id: remote_id.clone(),
+                        room_id,
+                        data: payload,
+                        signaling_type: SignalingType::CandidateAck,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send candidate ACK to {} generation={}: {}",
+                    remote_id.0,
+                    generation,
+                    error
+                );
+            }
+        });
     }
 
     fn create_pc(&self, remote_id: NodeId) -> Result<Arc<Peer>, JsValue> {
@@ -493,6 +837,9 @@ impl WasmWebRtcTransport {
 
         let pc = RtcPeerConnection::new_with_configuration(&config)?;
         let peer = Arc::new(Peer::new(pc));
+        let candidate_generation = self
+            .next_candidate_generation
+            .fetch_add(1, Ordering::Relaxed);
 
         peer.setup_handlers(
             remote_id.clone(),
@@ -508,6 +855,9 @@ impl WasmWebRtcTransport {
             self.peers.clone(),
             self.peer_senders.clone(),
             self.pending_candidates.clone(),
+            self.candidate_delivery.clone(),
+            self.negotiation_delivery.clone(),
+            candidate_generation,
         );
 
         let _ = self.attach_published_tracks_to_peer(&remote_id, &peer)?;
@@ -589,6 +939,17 @@ impl WasmWebRtcTransport {
                 .unwrap_or_else(|e| e.into_inner());
             pending.remove(node);
         }
+
+        {
+            self.candidate_delivery
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove_node(node);
+        }
+        self.negotiation_delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_node(node);
 
         // Matches every other per-peer map cleared above: usually already a
         // no-op here (both call sites that route through a restart --
@@ -696,24 +1057,99 @@ impl WasmWebRtcTransport {
         attempt_id
     }
 
-    fn spawn_connection_watchdog(&self, node: NodeId, attempt_id: u32, peer: Arc<Peer>) {
+    fn spawn_initial_connection_watchdog(&self, node: NodeId, attempt_id: u32, peer: Arc<Peer>) {
+        let phase = if self
+            .defer_connection_watchdog_until_negotiated
+            .load(Ordering::Relaxed)
+        {
+            ConnectionWatchdogPhase::Negotiation
+        } else {
+            ConnectionWatchdogPhase::Legacy
+        };
+        self.spawn_connection_watchdog(node, attempt_id, peer, phase);
+    }
+
+    fn spawn_connectivity_watchdog_if_needed(&self, node: &NodeId, peer: &Arc<Peer>) {
+        if !self
+            .defer_connection_watchdog_until_negotiated
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let still_connecting = {
+            let states = self
+                .connection_states
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            states.get(node) == Some(&ConnectionState::Connecting)
+        };
+        if !still_connecting {
+            return;
+        }
+        let attempt_id = {
+            let attempts = self
+                .connection_attempt_ids
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            attempts.get(node).copied()
+        };
+        if let Some(attempt_id) = attempt_id {
+            self.spawn_connection_watchdog(
+                node.clone(),
+                attempt_id,
+                peer.clone(),
+                ConnectionWatchdogPhase::Connectivity,
+            );
+        }
+    }
+
+    fn spawn_connection_watchdog(
+        &self,
+        node: NodeId,
+        attempt_id: u32,
+        peer: Arc<Peer>,
+        phase: ConnectionWatchdogPhase,
+    ) {
         let conn_states = self.connection_states.clone();
         let attempt_ids = self.connection_attempt_ids.clone();
         let peers = self.peers.clone();
         let senders = self.peer_senders.clone();
         let pending_candidates = self.pending_candidates.clone();
+        let candidate_delivery = self.candidate_delivery.clone();
+        let negotiation_delivery = self.negotiation_delivery.clone();
         let signaler = self.signaler.clone();
         let isolation_recovery_epoch = self.isolation_recovery_epoch.clone();
+        let timeout_ms = self.connection_timeout_ms.load(Ordering::Relaxed);
 
+        tracing::info!(
+            "Connection watchdog armed: peer={}, attempt_id={}, phase={}, timeout_ms={}",
+            node.0,
+            attempt_id,
+            phase.as_str(),
+            timeout_ms
+        );
         wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(CONNECTION_TIMEOUT_MS).await;
+            gloo_timers::future::TimeoutFuture::new(timeout_ms).await;
             let is_current_attempt = {
                 let attempts = attempt_ids.read().unwrap_or_else(|e| e.into_inner());
                 matches!(attempts.get(&node), Some(id) if *id == attempt_id)
             };
-            let still_connecting = {
+            let is_current_peer = {
+                let peers = peers.read().unwrap_or_else(|e| e.into_inner());
+                peers
+                    .get(&node)
+                    .is_some_and(|current| Arc::ptr_eq(current, &peer))
+            };
+            if !is_current_attempt || !is_current_peer {
+                return;
+            }
+
+            let state = {
                 let states = conn_states.read().unwrap_or_else(|e| e.into_inner());
-                matches!(states.get(&node), Some(ConnectionState::Connecting))
+                states
+                    .get(&node)
+                    .copied()
+                    .unwrap_or(ConnectionState::Disconnected)
             };
             let ice_state = peer.pc.ice_connection_state();
             let ice_alive = matches!(
@@ -721,74 +1157,98 @@ impl WasmWebRtcTransport {
                 web_sys::RtcIceConnectionState::Connected
                     | web_sys::RtcIceConnectionState::Completed
             );
-            let channel_count = {
+            let (channel_count, dc_alive, reliable_open) = {
                 let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-                channels.len()
+                (
+                    channels.len(),
+                    channels.values().any(|dc| {
+                        matches!(
+                            dc.ready_state(),
+                            web_sys::RtcDataChannelState::Open
+                                | web_sys::RtcDataChannelState::Connecting
+                        )
+                    }),
+                    channels
+                        .get(&DeliveryMethod::ReliableOrdered)
+                        .is_some_and(|dc| dc.ready_state() == web_sys::RtcDataChannelState::Open),
+                )
             };
-            let dc_alive = {
-                let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-                channels.values().any(|dc| {
-                    matches!(
-                        dc.ready_state(),
-                        web_sys::RtcDataChannelState::Open
-                            | web_sys::RtcDataChannelState::Connecting
-                    )
-                })
-            };
+            let remote_description_set = peer.pc.remote_description().is_some();
 
-            if is_current_attempt && still_connecting && (!ice_alive || !dc_alive) {
-                {
-                    let mut peers_lock = peers.write().unwrap_or_else(|e| e.into_inner());
-                    peers_lock.remove(&node);
+            let should_timeout = match phase {
+                ConnectionWatchdogPhase::Legacy => {
+                    state == ConnectionState::Connecting && (!ice_alive || !dc_alive)
                 }
-                {
-                    let mut senders_lock = senders.write().unwrap_or_else(|e| e.into_inner());
-                    senders_lock.remove(&node);
+                ConnectionWatchdogPhase::Negotiation => {
+                    state == ConnectionState::Connecting && !remote_description_set
                 }
-                {
-                    let mut states = conn_states.write().unwrap_or_else(|e| e.into_inner());
-                    states.insert(node.clone(), ConnectionState::Disconnected);
+                ConnectionWatchdogPhase::Connectivity => {
+                    state != ConnectionState::Connected || !reliable_open
                 }
-                {
-                    let mut attempts = attempt_ids.write().unwrap_or_else(|e| e.into_inner());
-                    attempts.remove(&node);
-                }
-                {
-                    let mut pending = pending_candidates
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner());
-                    pending.remove(&node);
-                }
-                // Captured before `close_all()` below, which itself changes
-                // `connection_state()` -- Fix 4 wants the state that produced
-                // the timeout, not the state after we tore it down.
-                let pc_state = peer.pc.connection_state();
-                peer.close_all(&node);
-                schedule_isolation_recovery(
-                    signaler,
-                    conn_states,
-                    attempt_ids,
-                    isolation_recovery_epoch,
-                );
-                // Fix 4: report enough state here to tell, on the next
-                // recurrence, whether this stalled at ICE, DTLS, or SCTP
-                // without needing to reproduce it live -- `ice_state` is the
-                // ICE layer, `pc_state` folds in DTLS (and ICE), and
-                // `channel_count` (vs. `dc_alive` above being false) tells us
-                // whether the DataChannels were ever created on this peer at
-                // all (offerer side, always > 0 by construction) or never
-                // arrived via `ondatachannel` (answerer side stalled at SCTP
-                // -- the "ICE Connected but still times out" case this whole
-                // restart mechanism's livelock produced).
-                tracing::warn!(
-                    "Connection timeout to {}. fail-fast cleanup (attempt_id={}, ice_state={:?}, pc_state={:?}, channels={}).",
+            };
+            if !should_timeout {
+                tracing::debug!(
+                    "Connection watchdog satisfied: peer={}, attempt_id={}, phase={}, state={:?}, ice_state={:?}, reliable_open={}",
                     node.0,
                     attempt_id,
+                    phase.as_str(),
+                    state,
                     ice_state,
-                    pc_state,
-                    channel_count
+                    reliable_open
                 );
+                return;
             }
+
+            {
+                let mut peers_lock = peers.write().unwrap_or_else(|e| e.into_inner());
+                peers_lock.remove(&node);
+            }
+            {
+                let mut senders_lock = senders.write().unwrap_or_else(|e| e.into_inner());
+                senders_lock.remove(&node);
+            }
+            {
+                let mut states = conn_states.write().unwrap_or_else(|e| e.into_inner());
+                states.insert(node.clone(), ConnectionState::Disconnected);
+            }
+            {
+                let mut attempts = attempt_ids.write().unwrap_or_else(|e| e.into_inner());
+                attempts.remove(&node);
+            }
+            {
+                let mut pending = pending_candidates
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                pending.remove(&node);
+            }
+            candidate_delivery
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove_node(&node);
+            negotiation_delivery
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove_node(&node);
+            let pc_state = peer.pc.connection_state();
+            peer.close_all(&node);
+            schedule_isolation_recovery(
+                signaler,
+                conn_states,
+                attempt_ids,
+                isolation_recovery_epoch,
+            );
+            tracing::warn!(
+                "Connection timeout to {}. fail-fast cleanup (attempt_id={}, phase={}, timeout_ms={}, remote_description_set={}, ice_state={:?}, pc_state={:?}, channels={}, reliable_open={}).",
+                node.0,
+                attempt_id,
+                phase.as_str(),
+                timeout_ms,
+                remote_description_set,
+                ice_state,
+                pc_state,
+                channel_count,
+                reliable_open
+            );
         });
     }
 
@@ -819,6 +1279,14 @@ impl WasmWebRtcTransport {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.pending_candidates
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.candidate_delivery
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.negotiation_delivery
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -935,30 +1403,16 @@ impl WasmWebRtcTransport {
             return Err(mistlib_core::error::MistError::Internal(format!("{:?}", e)));
         }
 
-        let room_id = self
-            .room_id
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        self.signaler
-            .send_signaling(
-                remote_id,
-                MessageContent::Data(SignalingData {
-                    sender_id: self.local_node_id.clone(),
-                    receiver_id: remote_id.clone(),
-                    room_id,
-                    data: sdp,
-                    signaling_type: SignalingType::Offer,
-                }),
-            )
-            .await
+        self.send_negotiation(remote_id, SignalingType::Offer, sdp)
+            .await;
+        Ok(())
     }
 
     async fn handle_offer(
         &self,
         remote_id: NodeId,
         payload: String,
-    ) -> mistlib_core::error::Result<()> {
+    ) -> mistlib_core::error::Result<bool> {
         let existing_peer = {
             let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
             peers.get(&remote_id).cloned()
@@ -1028,7 +1482,10 @@ impl WasmWebRtcTransport {
                 );
                 let peer = existing_peer
                     .expect("YieldAndApply is only returned when an existing peer was found");
-                return self.apply_offer_in_place(remote_id, payload, peer).await;
+                return self
+                    .apply_offer_in_place(remote_id, payload, peer)
+                    .await
+                    .map(|_| true);
             }
             OfferAction::ReplacePeer => {
                 // The existing `RTCPeerConnection` belongs to a session of
@@ -1078,12 +1535,15 @@ impl WasmWebRtcTransport {
                     "Ignoring offer from {} because max_connections is reached",
                     remote_id.0
                 );
-                return Ok(());
+                return Ok(false);
             }
             OfferAction::ApplyInPlace => {
                 let peer = existing_peer
                     .expect("ApplyInPlace is only returned when an existing peer was found");
-                return self.apply_offer_in_place(remote_id, payload, peer).await;
+                return self
+                    .apply_offer_in_place(remote_id, payload, peer)
+                    .await
+                    .map(|_| true);
             }
             OfferAction::DeferTransient => {
                 // A transient signaling state on a *live* peer (e.g. the
@@ -1097,7 +1557,7 @@ impl WasmWebRtcTransport {
                     "Deferring offer from {} because the existing peer's signaling state is transient",
                     remote_id.0
                 );
-                return Ok(());
+                return Ok(false);
             }
             OfferAction::Accept { newly_reserved } => newly_reserved,
         };
@@ -1130,7 +1590,7 @@ impl WasmWebRtcTransport {
         }
 
         let attempt_id = self.reserve_connection_attempt(&remote_id);
-        self.spawn_connection_watchdog(remote_id.clone(), attempt_id, peer.clone());
+        self.spawn_initial_connection_watchdog(remote_id.clone(), attempt_id, peer.clone());
 
         let result = async {
             // Guards against the same race `renegotiate_peer`/
@@ -1177,23 +1637,9 @@ impl WasmWebRtcTransport {
 
             self.apply_pending_candidates(&remote_id, &peer);
 
-            let room_id = self
-                .room_id
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            self.signaler
-                .send_signaling(
-                    &remote_id,
-                    MessageContent::Data(SignalingData {
-                        sender_id: self.local_node_id.clone(),
-                        receiver_id: remote_id.clone(),
-                        room_id,
-                        data: answer_sdp,
-                        signaling_type: SignalingType::Answer,
-                    }),
-                )
-                .await?;
+            self.send_negotiation(&remote_id, SignalingType::Answer, answer_sdp)
+                .await;
+            self.spawn_connectivity_watchdog_if_needed(&remote_id, &peer);
 
             Ok(())
         }
@@ -1245,7 +1691,7 @@ impl WasmWebRtcTransport {
             }
         }
 
-        result
+        result.map(|_| true)
     }
 
     /// Applies an inbound offer directly to an existing `RTCPeerConnection`
@@ -1374,18 +1820,8 @@ impl WasmWebRtcTransport {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        self.signaler
-            .send_signaling(
-                &remote_id,
-                MessageContent::Data(SignalingData {
-                    sender_id: self.local_node_id.clone(),
-                    receiver_id: remote_id.clone(),
-                    room_id: room_id.clone(),
-                    data: answer_sdp,
-                    signaling_type: SignalingType::Answer,
-                }),
-            )
-            .await?;
+        self.send_negotiation(&remote_id, SignalingType::Answer, answer_sdp)
+            .await;
 
         // Signaling just settled back to Stable -- if a publish/unpublish
         // deferred its renegotiation on this peer (`needs_track_reconcile`),
@@ -1627,6 +2063,7 @@ async fn trigger_ice_restart(
     local_id: NodeId,
     remote_id: NodeId,
     room_id: String,
+    negotiation_delivery: Arc<RwLock<NegotiationDelivery>>,
 ) {
     let _negotiating = peer.negotiating.lock().await;
     let pc = &peer.pc;
@@ -1675,25 +2112,16 @@ async fn trigger_ice_restart(
     }
 
     tracing::info!("Sending ICE restart offer to {}", remote_id.0);
-    if let Err(err) = signaler
-        .send_signaling(
-            &remote_id,
-            MessageContent::Data(SignalingData {
-                sender_id: local_id,
-                receiver_id: remote_id.clone(),
-                room_id,
-                data: sdp,
-                signaling_type: SignalingType::Offer,
-            }),
-        )
-        .await
-    {
-        tracing::warn!(
-            "ICE restart offer signaling failed for {}: {:?}",
-            remote_id.0,
-            err
-        );
-    }
+    send_negotiation_reliably(
+        signaler,
+        local_id,
+        remote_id,
+        room_id,
+        negotiation_delivery,
+        SignalingType::Offer,
+        sdp,
+    )
+    .await;
 }
 
 /// Best-effort recovery for a failed renegotiation on `pc`: if the failure
@@ -1825,9 +2253,27 @@ fn parse_and_add_candidate(node: &NodeId, peer: &Peer, cand_json: &str) -> Resul
         .pc
         .add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&cand_init));
     let node = node.clone();
+    let candidate_type = candidate_str
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|parts| parts[0] == "typ")
+        .map(|parts| parts[1])
+        .unwrap_or("unknown")
+        .to_string();
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(err) = JsFuture::from(promise).await {
-            tracing::warn!("addIceCandidate rejected for {}: {:?}", node.0, err);
+        match JsFuture::from(promise).await {
+            Ok(_) => tracing::debug!(
+                "addIceCandidate succeeded for {} (type={})",
+                node.0,
+                candidate_type
+            ),
+            Err(err) => tracing::warn!(
+                "addIceCandidate rejected for {} (type={}): {:?}",
+                node.0,
+                candidate_type,
+                err
+            ),
         }
     });
 
@@ -2217,7 +2663,7 @@ impl Transport for WasmWebRtcTransport {
             old_peer.close_all(node);
         }
 
-        self.spawn_connection_watchdog(node.clone(), attempt_id, peer.clone());
+        self.spawn_initial_connection_watchdog(node.clone(), attempt_id, peer.clone());
 
         if let Err(e) = self.renegotiate_peer(node, &peer).await {
             self.cleanup_peer_connection(node, true, IsolationRecovery::Schedule);
@@ -2291,10 +2737,32 @@ impl SignalingHandler for WasmWebRtcTransport {
         match data.signaling_type {
             SignalingType::Offer => {
                 tracing::info!("Received Offer from: {}", data.sender_id.0);
-                self.handle_offer(data.sender_id.clone(), data.data).await?;
+                let (payload, transaction_id, duplicate) =
+                    self.negotiation_payload(&data.sender_id, data.data);
+                if duplicate {
+                    if let Some(id) = transaction_id {
+                        self.acknowledge_negotiation(data.sender_id.clone(), id);
+                    }
+                    return Ok(());
+                }
+                let applied = self.handle_offer(data.sender_id.clone(), payload).await?;
+                if applied {
+                    if let Some(id) = transaction_id {
+                        self.acknowledge_negotiation(data.sender_id.clone(), id);
+                    }
+                }
             }
             SignalingType::Answer => {
                 tracing::info!("Received Answer from: {}", data.sender_id.0);
+                let (answer_payload, transaction_id, duplicate) =
+                    self.negotiation_payload(&data.sender_id, data.data);
+                if duplicate {
+                    if let Some(id) = transaction_id {
+                        self.acknowledge_negotiation(data.sender_id.clone(), id);
+                    }
+                    return Ok(());
+                }
+                let mut answer_applied = false;
                 let peer = {
                     let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
                     peers.get(&data.sender_id).cloned()
@@ -2307,7 +2775,7 @@ impl SignalingHandler for WasmWebRtcTransport {
                         )));
                     }
 
-                    let sdp = sdp_from_signaling_payload(&data.data);
+                    let sdp = sdp_from_signaling_payload(&answer_payload);
 
                     // Stale-answer guard: a duplicate/late answer for a
                     // *previous* local offer can still arrive after we've
@@ -2360,7 +2828,9 @@ impl SignalingHandler for WasmWebRtcTransport {
                             .await;
                         return Err(mistlib_core::error::MistError::Internal(format!("{:?}", e)));
                     }
+                    answer_applied = true;
                     self.apply_pending_candidates(&data.sender_id, &peer);
+                    self.spawn_connectivity_watchdog_if_needed(&data.sender_id, &peer);
 
                     // Offerer-side settle-point: applying the remote's answer
                     // just returned signaling to `Stable`, completing the
@@ -2395,17 +2865,63 @@ impl SignalingHandler for WasmWebRtcTransport {
                         });
                     }
                 }
+                if answer_applied {
+                    if let Some(id) = transaction_id {
+                        self.acknowledge_negotiation(data.sender_id.clone(), id);
+                    }
+                }
             }
             SignalingType::Candidate => {
                 tracing::info!("Received Candidate from: {}", data.sender_id.0);
-                self.handle_candidate_payload(&data.sender_id, data.data);
+                self.handle_candidate_signal(&data.sender_id, data.data);
             }
             SignalingType::Candidates => {
                 tracing::info!("Received Candidates from: {}", data.sender_id.0);
                 if let Ok(candidates) = serde_json::from_str::<Vec<String>>(&data.data) {
-                    for cand in candidates {
-                        self.handle_candidate_payload(&data.sender_id, cand);
+                    for candidate in candidates {
+                        self.handle_candidate_signal(&data.sender_id, candidate);
                     }
+                }
+            }
+            SignalingType::CandidateAck => match serde_json::from_str::<CandidateAck>(&data.data) {
+                Ok(ack) => {
+                    let removed = self
+                        .candidate_delivery
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .acknowledge(&data.sender_id, &ack);
+                    tracing::debug!(
+                        "Received candidate ACK from {} generation={} mask={:#018x} removed={}",
+                        data.sender_id.0,
+                        ack.generation,
+                        ack.mask,
+                        removed
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!("Invalid candidate ACK from {}: {}", data.sender_id.0, error)
+                }
+            },
+            SignalingType::NegotiationAck => {
+                match serde_json::from_str::<NegotiationAck>(&data.data) {
+                    Ok(ack) => {
+                        let removed = self
+                            .negotiation_delivery
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .acknowledge(&data.sender_id, ack.id);
+                        tracing::debug!(
+                            "Received negotiation ACK from {} id={:016x} removed={}",
+                            data.sender_id.0,
+                            ack.id,
+                            removed
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        "Invalid negotiation ACK from {}: {}",
+                        data.sender_id.0,
+                        error
+                    ),
                 }
             }
             SignalingType::Request => {
@@ -2513,14 +3029,18 @@ impl SignalingHandler for WasmWebRtcTransport {
                     epoch
                 );
 
-                // Record the restart before tearing anything down: if the
-                // real Offer/Request that follows on this same stream is
-                // itself delayed or reordered relative to some other event,
-                // `request_action_for`/`handle_offer` still have this to
-                // consult (and consume) via `take_remote_restarted`. A
-                // `Rejoin` for a peer that already has an entry -- e.g. two
-                // rapid reloads -- keeps the newer of the two epochs rather
-                // than stacking.
+                // Tear down the stale peer synchronously (no `.await` in
+                // `cleanup_peer_connection`) so the real Offer/Request right
+                // behind this on the same ordered stream sees a clean slate.
+                // The common cleanup deliberately clears every old per-peer
+                // epoch/latch, so the new restart latch must be recorded
+                // AFTER it returns rather than immediately erased by it.
+                self.cleanup_peer_connection(&data.sender_id, true, IsolationRecovery::Skip);
+
+                // Keep the restart until the next real Offer/Request consumes
+                // it via `take_remote_restarted`. This forces replacement even
+                // if browser/relay timing makes stale connection state appear
+                // active again between the synthetic Rejoin and that message.
                 {
                     let mut restarted = self
                         .restarted_peers
@@ -2531,18 +3051,6 @@ impl SignalingHandler for WasmWebRtcTransport {
                         .and_modify(|existing| *existing = (*existing).max(epoch))
                         .or_insert(epoch);
                 }
-
-                // Tear down the stale peer synchronously (no `.await` in
-                // `cleanup_peer_connection`) so the real Offer/Request right
-                // behind this on the same ordered stream sees a clean slate
-                // instead of racing a still-registered (if already-doomed)
-                // peer connection. Same helper and `close_pc = true` as
-                // `RequestAction::CleanupAndConnect` above. `IsolationRecovery::Skip`:
-                // the peer's real Offer/Request is next on this same ordered
-                // stream and will rebuild the connection, so this is not a
-                // genuine isolation -- see `IsolationRecovery`'s doc for why
-                // scheduling recovery here used to cause the livelock.
-                self.cleanup_peer_connection(&data.sender_id, true, IsolationRecovery::Skip);
 
                 // No SDP to apply and no connection to initiate here -- the
                 // peer's actual Offer/Request, arriving next, does that.

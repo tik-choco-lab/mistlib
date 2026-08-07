@@ -14,6 +14,13 @@ const CLEANUP_WAIT_TIMEOUT_MS: u64 = 5000;
 
 struct NetworkEventSender(mpsc::UnboundedSender<NetworkEvent>);
 
+struct LeaveCleanup {
+    transport: Arc<dyn crate::transport::Transport>,
+    network_transport: Option<Arc<dyn crate::transport::Transport>>,
+    websocket_signaler: Option<Arc<dyn crate::signaling::Signaler>>,
+    nodes: HashSet<crate::types::NodeId>,
+}
+
 impl NetworkEventHandler for NetworkEventSender {
     fn on_event(&self, event: NetworkEvent) {
         let _ = self.0.send(event);
@@ -22,9 +29,41 @@ impl NetworkEventHandler for NetworkEventSender {
 
 impl MistEngine {
     pub fn leave_room(&self) {
+        let Some(cleanup) = self.prepare_leave() else {
+            return;
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        *self
+            .cleanup_done
+            .lock()
+            .expect("cleanup_done lock poisoned") = Some(done_rx);
+
+        self.runtime.spawn(Box::pin(async move {
+            Self::perform_leave_cleanup(cleanup).await;
+            // Best-effort: a rejoin that already timed out its wait may
+            // have dropped the receiver, in which case this is ignored.
+            let _ = done_tx.send(());
+        }));
+    }
+
+    /// Leaves the current room and resolves only after the signaling socket
+    /// and every known transport peer have completed their cleanup.
+    ///
+    /// Browser hosts use this as a teardown barrier before constructing a
+    /// fresh session with the same room/node identity. The synchronous
+    /// [`leave_room`](Self::leave_room) remains available for callers that
+    /// cannot await and keeps its existing background-cleanup behavior.
+    pub async fn leave_room_and_wait(&self) {
+        if let Some(cleanup) = self.prepare_leave() {
+            Self::perform_leave_cleanup(cleanup).await;
+        }
+    }
+
+    fn prepare_leave(&self) -> Option<LeaveCleanup> {
         self.run_generation.fetch_add(1, AtomicOrdering::Relaxed);
 
-        let (transport_opt, network_transport_opt, websocket_signaler_opt, to_disconnect) = {
+        let cleanup = {
             let state = self.state.lock().expect("state lock poisoned");
             if let EngineState::Running(ctx) = &*state {
                 let mut nodes: HashSet<_> =
@@ -32,49 +71,16 @@ impl MistEngine {
                 if let Some(nt) = &ctx.network_transport {
                     nodes.extend(nt.get_connected_nodes());
                 }
-                (
-                    Some(ctx.transport.clone()),
-                    ctx.network_transport.clone(),
-                    ctx.websocket_signaler.clone(),
+                Some(LeaveCleanup {
+                    transport: ctx.transport.clone(),
+                    network_transport: ctx.network_transport.clone(),
+                    websocket_signaler: ctx.websocket_signaler.clone(),
                     nodes,
-                )
+                })
             } else {
-                (None, None, None, HashSet::new())
+                None
             }
         };
-
-        if let Some(transport) = transport_opt {
-            let (done_tx, done_rx) = oneshot::channel();
-            *self
-                .cleanup_done
-                .lock()
-                .expect("cleanup_done lock poisoned") = Some(done_rx);
-
-            self.runtime.spawn(Box::pin(async move {
-                if let Some(ws) = websocket_signaler_opt {
-                    if let Err(err) = ws.close().await {
-                        tracing::warn!("leave_room: websocket close failed: {:?}", err);
-                    }
-                }
-                for node in to_disconnect {
-                    if let Err(e) = transport.disconnect(&node).await {
-                        tracing::warn!("leave_room: disconnect failed for {}: {:?}", node.0, e);
-                    }
-                    if let Some(nt) = &network_transport_opt {
-                        if let Err(e) = nt.disconnect(&node).await {
-                            tracing::warn!(
-                                "leave_room: network disconnect failed for {}: {:?}",
-                                node.0,
-                                e
-                            );
-                        }
-                    }
-                }
-                // Best-effort: a rejoin that already timed out its wait may
-                // have dropped the receiver, in which case this is ignored.
-                let _ = done_tx.send(());
-            }));
-        }
 
         *self.state.lock().expect("state lock poisoned") = EngineState::Idle;
 
@@ -85,6 +91,30 @@ impl MistEngine {
             .lock()
             .expect("aoi_nodes lock poisoned")
             .clear();
+
+        cleanup
+    }
+
+    async fn perform_leave_cleanup(cleanup: LeaveCleanup) {
+        if let Some(ws) = cleanup.websocket_signaler {
+            if let Err(err) = ws.close().await {
+                tracing::warn!("leave_room: websocket close failed: {:?}", err);
+            }
+        }
+        for node in cleanup.nodes {
+            if let Err(e) = cleanup.transport.disconnect(&node).await {
+                tracing::warn!("leave_room: disconnect failed for {}: {:?}", node.0, e);
+            }
+            if let Some(nt) = &cleanup.network_transport {
+                if let Err(e) = nt.disconnect(&node).await {
+                    tracing::warn!(
+                        "leave_room: network disconnect failed for {}: {:?}",
+                        node.0,
+                        e
+                    );
+                }
+            }
+        }
     }
 
     pub async fn run(
@@ -415,6 +445,32 @@ mod tests {
                 "run() should not wait when there is no previous cleanup pending"
             );
             assert_eq!(log.snapshot(), vec!["second_session_transport_start"]);
+        });
+    }
+
+    #[test]
+    fn awaited_leave_resolves_only_after_signaling_cleanup() {
+        futures::executor::block_on(async {
+            let log = Arc::new(CallLog::default());
+            let engine = MistEngine::new(Arc::new(TestRuntime));
+            let ctx = make_ctx(
+                Arc::new(NoopTransport),
+                Some(Arc::new(SlowClosingSignaler(log.clone()))),
+            );
+            *engine.state.lock().expect("state lock poisoned") =
+                EngineState::Running(Arc::new(ctx));
+
+            engine.leave_room_and_wait().await;
+
+            assert_eq!(
+                log.snapshot(),
+                vec!["previous_session_cleanup_done"],
+                "the awaitable leave must not resolve before signaler.close() completes"
+            );
+            assert!(matches!(
+                *engine.state.lock().expect("state lock poisoned"),
+                EngineState::Idle
+            ));
         });
     }
 }

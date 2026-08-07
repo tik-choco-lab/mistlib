@@ -90,6 +90,13 @@ impl Signaler for RoutedSignaler {
         }
     }
 
+    /// Forwarded to the bootstrap signaler, which is the one holding expiring
+    /// per-peer state. The overlay keeps none, so there is nothing to refresh
+    /// on that side.
+    async fn note_peer_alive(&self, peer: &NodeId) {
+        self.bootstrap.note_peer_alive(peer).await;
+    }
+
     async fn reset_session(&self) -> crate::error::Result<()> {
         self.peer_routes
             .lock()
@@ -129,6 +136,14 @@ impl SignalingHandler for RoutedSignalingHandler {
     async fn handle_message(&self, msg: MessageContent) -> crate::error::Result<()> {
         if let MessageContent::Data(data) = &msg {
             self.routes.remember_route(&data.sender_id, self.ingress);
+            // Deliberately unconditional, not `if self.ingress == Overlay`.
+            // This is the one place both ingresses meet, and the bug this
+            // fixes was itself an ingress the refresh path had missed; adding
+            // another "this branch only" condition here would invite the same
+            // omission for the next transport. On the WebSocket ingress it
+            // duplicates the refresh the Nostr handler already does, which is
+            // harmless -- `touch_node` takes a `max()` of the existing expiry.
+            self.routes.note_peer_alive(&data.sender_id).await;
         }
         self.inner.handle_message(msg).await
     }

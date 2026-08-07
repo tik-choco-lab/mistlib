@@ -144,6 +144,7 @@ pub fn accept_message_order(
 mod tests {
     use super::*;
     use crate::config::NostrSignalingConfig;
+    use crate::signaling::nostr::util::now_unix_seconds;
     use crate::signaling::nostr::{DedupeCache, DiscoveryTable};
     use crate::signaling::{SignalingData, SignalingType};
     use crate::types::NodeId;
@@ -202,6 +203,78 @@ mod tests {
             "unknown-pubkey",
             &data("unknown", SignalingType::Candidate),
         ));
+    }
+
+    /// Reproduces the one-directional, silent failure `note_peer_alive`
+    /// exists to prevent.
+    ///
+    /// A and B finish their handshake over the relay and then move to the
+    /// overlay, so no more relay messages pass between them. B keeps
+    /// accepting A's messages regardless -- B sent the original `Request`, and
+    /// `sender_was_requested` is remembered for the whole session. A has only
+    /// the `DiscoveryTable` binding, and with no periodic discovery to renew
+    /// it, it lapses. The moment signaling has to fall back to the relay (ICE
+    /// restart, reconnect after a blip) B -> A is rejected while A -> B still
+    /// works.
+    #[test]
+    fn a_lapsed_binding_rejects_the_peer_that_never_sent_the_request() {
+        let mut table = DiscoveryTable::default();
+        // A's binding for B, as the handshake left it.
+        table.bind_node(
+            NodeId("peer-b".to_string()),
+            "b-pubkey".to_string(),
+            now_unix_seconds() + 1,
+        );
+        // B's side of the same pair: durable, because B sent the `Request`.
+        assert!(accept_sender_for_payload(
+            &mut DiscoveryTable::default(),
+            true,
+            "a-pubkey",
+            &data("peer-a", SignalingType::Offer),
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        assert!(
+            !accept_sender_for_payload(
+                &mut table,
+                false,
+                "b-pubkey",
+                &data("peer-b", SignalingType::Answer),
+            ),
+            "a lapsed binding is exactly the asymmetric failure: B -> A drops \
+             while A -> B still succeeds"
+        );
+    }
+
+    /// The fix: live traffic over any transport reaches
+    /// `Signaler::note_peer_alive`, which renews the binding, so the relay
+    /// fallback above is accepted in both directions.
+    #[test]
+    fn liveness_refresh_keeps_the_relay_fallback_working_in_both_directions() {
+        let mut table = DiscoveryTable::default();
+        table.bind_node(
+            NodeId("peer-b".to_string()),
+            "b-pubkey".to_string(),
+            now_unix_seconds() + 1,
+        );
+
+        // Overlay traffic from B arrives; `RoutedSignalingHandler` reports it
+        // and the Nostr signaler renews the binding.
+        table.touch_node(&NodeId("peer-b".to_string()), 60);
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        assert!(
+            accept_sender_for_payload(
+                &mut table,
+                false,
+                "b-pubkey",
+                &data("peer-b", SignalingType::Answer),
+            ),
+            "a peer kept alive over the overlay must still be admitted when \
+             signaling falls back to the relay"
+        );
     }
 
     #[test]

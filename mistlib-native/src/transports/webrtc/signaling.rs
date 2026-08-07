@@ -4,7 +4,10 @@ use super::{
     CONNECT_REQUEST_RETRY_MULTIPLIER, DEFAULT_CONNECT_REQUEST_RETRIES,
 };
 use async_trait::async_trait;
-use mistlib_core::signaling::{MessageContent, SignalingData, SignalingHandler, SignalingType};
+use mistlib_core::signaling::{
+    CandidateAck, CandidateEnvelope, MessageContent, NegotiationAck, NegotiationEnvelope,
+    SignalingData, SignalingHandler, SignalingType,
+};
 use mistlib_core::transport::Transport;
 use mistlib_core::types::{ConnectionState, NodeId};
 use std::sync::atomic::Ordering;
@@ -17,6 +20,33 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
 impl WebRtcTransport {
+    async fn send_negotiation_ack(&self, remote_id: &NodeId, room_id: &str, id: u64) {
+        let Ok(payload) = serde_json::to_string(&NegotiationAck { id }) else {
+            return;
+        };
+        if let Err(error) = self
+            .signaler
+            .send_signaling(
+                remote_id,
+                MessageContent::Data(SignalingData {
+                    sender_id: self.local_node_id.clone(),
+                    receiver_id: remote_id.clone(),
+                    room_id: room_id.to_string(),
+                    data: payload,
+                    signaling_type: SignalingType::NegotiationAck,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to send negotiation ACK to {} id={:016x}: {}",
+                remote_id,
+                id,
+                error
+            );
+        }
+    }
+
     fn connect_request_retry_limit() -> u32 {
         std::env::var("MIST_WEBRTC_CONNECT_REQUEST_RETRIES")
             .ok()
@@ -1007,18 +1037,70 @@ impl SignalingHandler for WebRtcTransport {
         }
 
         match data.signaling_type {
-            SignalingType::Offer => self
-                .handle_offer(data.sender_id.clone(), data.data)
-                .await
-                .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string())),
-            SignalingType::Answer => self
-                .handle_answer(data.sender_id.clone(), data.data)
-                .await
-                .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string())),
-            SignalingType::Candidate => self
-                .handle_candidate(data.sender_id.clone(), data.data)
-                .await
-                .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string())),
+            SignalingType::Offer => {
+                let envelope = serde_json::from_str::<NegotiationEnvelope>(&data.data).ok();
+                let payload = envelope
+                    .as_ref()
+                    .map_or_else(|| data.data.clone(), |item| item.sdp.clone());
+                self.handle_offer(data.sender_id.clone(), payload)
+                    .await
+                    .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
+                if let Some(envelope) = envelope {
+                    self.send_negotiation_ack(&data.sender_id, &current_room_id, envelope.id)
+                        .await;
+                }
+                Ok(())
+            }
+            SignalingType::Answer => {
+                let envelope = serde_json::from_str::<NegotiationEnvelope>(&data.data).ok();
+                let payload = envelope
+                    .as_ref()
+                    .map_or_else(|| data.data.clone(), |item| item.sdp.clone());
+                self.handle_answer(data.sender_id.clone(), payload)
+                    .await
+                    .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
+                if let Some(envelope) = envelope {
+                    self.send_negotiation_ack(&data.sender_id, &current_room_id, envelope.id)
+                        .await;
+                }
+                Ok(())
+            }
+            SignalingType::Candidate => {
+                let envelope = serde_json::from_str::<CandidateEnvelope>(&data.data).ok();
+                let candidate = envelope
+                    .as_ref()
+                    .map_or_else(|| data.data.clone(), |item| item.candidate.clone());
+                self.handle_candidate(data.sender_id.clone(), candidate)
+                    .await
+                    .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
+
+                if let Some((envelope, mask)) = envelope.and_then(|envelope| {
+                    1_u64
+                        .checked_shl(u32::from(envelope.sequence))
+                        .map(|mask| (envelope, mask))
+                }) {
+                    let ack = CandidateAck {
+                        generation: envelope.generation,
+                        mask,
+                    };
+                    if let Ok(payload) = serde_json::to_string(&ack) {
+                        let _ = self
+                            .signaler
+                            .send_signaling(
+                                &data.sender_id,
+                                MessageContent::Data(SignalingData {
+                                    sender_id: self.local_node_id.clone(),
+                                    receiver_id: data.sender_id.clone(),
+                                    room_id: current_room_id.clone(),
+                                    data: payload,
+                                    signaling_type: SignalingType::CandidateAck,
+                                }),
+                            )
+                            .await;
+                    }
+                }
+                Ok(())
+            }
             SignalingType::Candidates => {
                 let candidates: Vec<String> =
                     serde_json::from_str(&data.data).map_err(|e: serde_json::Error| {
@@ -1062,6 +1144,11 @@ impl SignalingHandler for WebRtcTransport {
                 }
                 Ok(())
             }
+            // Native currently emits legacy raw candidates, so it has no
+            // retry state to retire when an ACK arrives.
+            SignalingType::CandidateAck => Ok(()),
+            // Native still emits legacy one-shot Offer/Answer payloads.
+            SignalingType::NegotiationAck => Ok(()),
             SignalingType::Rejoin => {
                 // Locally-synthesized-only notification (see
                 // `SignalingType::Rejoin`'s doc comment): the signaling layer
