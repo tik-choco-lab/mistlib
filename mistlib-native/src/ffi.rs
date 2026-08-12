@@ -5,6 +5,45 @@ pub const DELIVERY_RELIABLE: u32 = crate::app::DELIVERY_RELIABLE;
 pub const DELIVERY_UNRELIABLE_ORDERED: u32 = crate::app::DELIVERY_UNRELIABLE_ORDERED;
 pub const DELIVERY_UNRELIABLE: u32 = crate::app::DELIVERY_UNRELIABLE;
 
+unsafe fn copy_build_string(value: &str, buffer: *mut u8, buffer_len: usize) -> u32 {
+    let bytes = value.as_bytes();
+    if bytes.len() > buffer_len {
+        return bytes.len() as u32;
+    }
+
+    // SAFETY: the caller guarantees that buffer is valid for buffer_len bytes,
+    // and the length check above proves the copy fits.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+    }
+    bytes.len() as u32
+}
+
+#[no_mangle]
+/// Writes the MistLib package version embedded in this native library.
+///
+/// Returns the required byte length without copying when `buffer` is too
+/// small, allowing callers to query the size with a zero-length buffer.
+///
+/// # Safety
+/// `buffer` must be valid for `buffer_len` bytes.
+pub unsafe extern "C" fn get_version(buffer: *mut u8, buffer_len: usize) -> u32 {
+    unsafe { copy_build_string(crate::build_info::get_version(), buffer, buffer_len) }
+}
+
+#[no_mangle]
+/// Writes JSON describing the exact MistLib native build that was loaded.
+///
+/// Returns the required byte length without copying when `buffer` is too
+/// small, allowing callers to query the size with a zero-length buffer.
+///
+/// # Safety
+/// `buffer` must be valid for `buffer_len` bytes.
+pub unsafe extern "C" fn get_build_info(buffer: *mut u8, buffer_len: usize) -> u32 {
+    let info = crate::build_info::get_build_info();
+    unsafe { copy_build_string(&info, buffer, buffer_len) }
+}
+
 #[no_mangle]
 /// # Safety
 /// `room_ptr` must be valid for `room_len` bytes.

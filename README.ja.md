@@ -69,10 +69,11 @@ Unity・Python・JavaScript のラッパーと動作するサンプルは
 ```js
 import init, {
   init_with_config, join_room, update_position, send_message,
-  register_event_callback, MistEvent, Delivery,
+  register_event_callback, get_version, get_build_info, MistEvent, Delivery,
 } from "@tik-choco/mistlib";
 
 await init();
+console.log("MistLib", get_version(), JSON.parse(get_build_info()));
 
 init_with_config("alice", JSON.stringify({
   signaling: {
@@ -108,6 +109,10 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 | `get_neighbors()` / `get_all_nodes()` | 現在のルームの見え方を JSON で取得 |
 | `storage_add(name, bytes)` / `storage_get(cid)` | コンテンツアドレス指定ストレージ |
 | `register_event_callback(fn)` | ピア・AOI・ルームのイベント |
+| `get_version()` / `get_build_info()` | リリース版と、実際にロードしたビルドの情報を取得 |
+
+`get_build_info()` は `version`、`commit`、`dirty`、`profile`、`target` を含む JSON 文字列を返す。
+同じリリース版でも、基準になったコミットとローカル変更の有無を確認できる。
 
 ルームを指定しない版は、参加中の全ルームに対して働く。`send_message("", …)` は全ルームへ
 ブロードキャストし、`get_neighbors()` は全ルームの見え方を統合して返す。複数ルームを扱う
@@ -117,6 +122,9 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 2 点異なる: `get_neighbors` / `get_all_nodes` は存在せず（その情報はイベントで届く）、
 `*_in_room` 版があるのは `update_position` と `send_message` だけ。詳細は
 `mistlib-native/src/ffi.rs` を参照。
+
+Native の `get_version` / `get_build_info` は呼び出し側バッファへ書き込み、バッファが
+小さい場合はコピーせず必要なバイト長を返す。長さ0で必要長だけを問い合わせられる。
 
 **配送モード** — `Delivery.Reliable`（`0`）は到達し順序も保つ。
 `Delivery.UnreliableOrdered`（`1`）は欠落しうるが順序は乱れない。

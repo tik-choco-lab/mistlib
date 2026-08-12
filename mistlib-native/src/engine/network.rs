@@ -119,15 +119,9 @@ impl super::MistEngine {
             }
             MessageContent::Data(signaling_data) => {
                 ctx.ensure_node_registered(&signaling_data.sender_id);
-                if let Some(handler) = ctx.p2p_signaling_handler.clone() {
-                    self.runtime.handle().spawn(async move {
-                        if let Err(err) = handler
-                            .handle_message(MessageContent::Data(signaling_data))
-                            .await
-                        {
-                            tracing::warn!("NativeEngine: p2p signaling handler failed: {:?}", err);
-                        }
-                    });
+                if let Some(dispatcher) = &ctx.p2p_signaling_dispatcher {
+                    dispatcher
+                        .dispatch(self.runtime.handle(), MessageContent::Data(signaling_data));
                 } else {
                     tracing::debug!(
                         "NativeEngine: p2p signaling relay not configured, dropping message"
@@ -251,6 +245,12 @@ mod tests {
     impl SignalingHandler for RecordingSignalingHandler {
         async fn handle_message(&self, msg: MessageContent) -> CoreResult<()> {
             if let MessageContent::Data(data) = msg {
+                // Make the old one-spawn-per-message implementation fail
+                // deterministically: m2 would complete while m1 was sleeping.
+                // The ordered dispatcher must not start m2 until m1 completes.
+                if data.data == "m1" {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 let mut seen = self.state.lock().unwrap();
                 seen.push(data.data);
                 self.cvar.notify_all();
@@ -287,7 +287,7 @@ mod tests {
 
     /// Builds a fake session with the given overlay router and returns both
     /// the ctx and the concrete recording handler installed as its
-    /// `p2p_signaling_handler`, so tests can assert on delivery order without
+    /// `p2p_signaling_dispatcher`, so tests can assert on delivery order without
     /// any trait downcasting.
     fn fake_ctx_with_handler(
         overlay: Arc<OverlayRouter>,
@@ -298,7 +298,9 @@ mod tests {
             transport: Arc::new(NoopTransport),
             webrtc_transport: None,
             ws_signaling_handler: Arc::new(NoopSignalingHandler),
-            p2p_signaling_handler: Some(handler.clone()),
+            p2p_signaling_dispatcher: Some(Arc::new(super::super::P2pSignalingDispatcher::new(
+                handler.clone(),
+            ))),
             signaling_dispatch: None,
             bootstrap_signaler: None,
             l1_transport: None,

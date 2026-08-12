@@ -26,6 +26,14 @@ pub trait Transport: HostSendSync {
     async fn connect(&self, node: &NodeId) -> Result<()>;
     async fn disconnect(&self, node: &NodeId) -> Result<()>;
 
+    /// Best-effort hint for the largest payload this transport can currently
+    /// deliver to `node` in one `send`. `None` leaves callers to use their own
+    /// conservative default; transports should surface the ceiling already
+    /// enforced by their send path when it is known.
+    fn message_size_limit(&self, _node: &NodeId) -> Option<u32> {
+        None
+    }
+
     /// Called when overlay-level PING/PONG liveness suspects `node` may be
     /// disconnected. Transports that track a reconnect-grace period (e.g. for
     /// ICE Disconnected) should fold this into the same flow, recording that

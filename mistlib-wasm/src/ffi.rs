@@ -88,6 +88,18 @@ const _: () = {
     assert!(Delivery::Unreliable as u32 == DELIVERY_UNRELIABLE);
 };
 
+/// Returns the MistLib package version embedded in this WASM binary.
+#[wasm_bindgen]
+pub fn get_version() -> String {
+    crate::build_info::get_version().to_owned()
+}
+
+/// Returns JSON describing the exact MistLib build loaded by the browser.
+#[wasm_bindgen]
+pub fn get_build_info() -> String {
+    crate::build_info::get_build_info()
+}
+
 #[wasm_bindgen]
 pub fn register_event_callback(callback: &js_sys::Function) {
     crate::app::register_event_callback(callback);

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod build_info;
 pub mod config;
 pub mod engine;
 pub mod error;

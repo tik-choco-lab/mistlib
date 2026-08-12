@@ -67,10 +67,11 @@ Unity、Python 和 JavaScript 的封装以及可运行的示例位于
 ```js
 import init, {
   init_with_config, join_room, update_position, send_message,
-  register_event_callback, MistEvent, Delivery,
+  register_event_callback, get_version, get_build_info, MistEvent, Delivery,
 } from "@tik-choco/mistlib";
 
 await init();
+console.log("MistLib", get_version(), JSON.parse(get_build_info()));
 
 init_with_config("alice", JSON.stringify({
   signaling: {
@@ -106,6 +107,10 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 | `get_neighbors()` / `get_all_nodes()` | 以 JSON 获取当前房间的视图 |
 | `storage_add(name, bytes)` / `storage_get(cid)` | 内容寻址存储 |
 | `register_event_callback(fn)` | 节点、兴趣区域与房间事件 |
+| `get_version()` / `get_build_info()` | 获取发布版本及实际加载的构建信息 |
+
+`get_build_info()` 返回包含 `version`、`commit`、`dirty`、`profile` 和 `target` 的 JSON 字符串。
+即使发布版本相同，也可以确认其对应的源代码提交以及是否包含本地修改。
 
 不指定房间的版本会作用于你加入的所有房间：`send_message("", …)` 会向全部房间广播，
 `get_neighbors()` 会合并所有房间的视图。使用多个房间的应用请改用带房间 ID 的
@@ -114,6 +119,9 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 原生库通过 C ABI 提供相同的操作（字符串以 `(指针, 长度)` 的形式传递），但有两点不同：
 没有 `get_neighbors` / `get_all_nodes`（这些信息通过事件送达），且只有 `update_position`
 和 `send_message` 提供 `*_in_room` 变体。详见 `mistlib-native/src/ffi.rs`。
+
+原生版 `get_version` / `get_build_info` 写入调用方提供的缓冲区；缓冲区不足时不复制，
+而是返回所需字节数，因此可先以长度0调用来查询大小。
 
 **投递模式** —— `Delivery.Reliable`（`0`）必达且保持顺序；`Delivery.UnreliableOrdered`
 （`1`）可能丢失但绝不乱序；`Delivery.Unreliable`（`2`）可能丢失或乱序，延迟最低。

@@ -7,7 +7,7 @@ use crate::storage::fs::NativeBlockStore;
 use crate::storage::resolver::{NativePeerResolver, TransportSource, WantRegistry};
 use async_trait::async_trait;
 use mistlib_core::config::StorageConfig;
-use mistlib_core::storage::protocol::{build_have_payload, have_chunk_count};
+use mistlib_core::storage::protocol::{build_have_payload, chunk_size_for_limit, have_chunk_count};
 use mistlib_core::storage::{P2PStorage, SelfPositionSource, SpatialPolicy};
 use mistlib_core::transport::Transport;
 use mistlib_core::types::Vector3;
@@ -183,18 +183,23 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
         let block = storage.get_block(&cid).await.ok().flatten();
 
         if let Some(data) = block {
-            let Some(total_chunks) = have_chunk_count(data.len()) else {
+            let limit = ctx
+                .webrtc_transport
+                .as_ref()
+                .and_then(|transport| transport.message_size_limit(&from));
+            let chunk_size = chunk_size_for_limit(&cid, limit);
+            let Some(total_chunks) = have_chunk_count(data.len(), chunk_size) else {
                 tracing::warn!(
                     "Storage: refusing to serve oversized block {} ({} bytes, {} chunks)",
                     cid,
                     data.len(),
-                    data.len().div_ceil(resolver::HAVE_CHUNK_SIZE)
+                    data.len().div_ceil(chunk_size)
                 );
                 return;
             };
 
             if total_chunks <= 1 {
-                let msg = build_have_payload(&cid, &data, 0, total_chunks);
+                let msg = build_have_payload(&cid, &data, 0, total_chunks, chunk_size);
                 let _ = ctx
                     .transport
                     .send(
@@ -205,7 +210,8 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
                     .await;
             } else {
                 for chunk_index in 0..total_chunks {
-                    let msg = build_have_payload(&cid, &data, chunk_index, total_chunks);
+                    let msg =
+                        build_have_payload(&cid, &data, chunk_index, total_chunks, chunk_size);
 
                     let _ = ctx
                         .transport
@@ -305,8 +311,9 @@ mod tests {
     #[test]
     fn small_have_payload_uses_single_message() {
         let data = b"small";
-        let total = have_chunk_count(data.len()).expect("small block should fit");
-        let msg = build_have_payload("cid-small", data, 0, total);
+        let total = have_chunk_count(data.len(), resolver::HAVE_CHUNK_SIZE)
+            .expect("small block should fit");
+        let msg = build_have_payload("cid-small", data, 0, total, resolver::HAVE_CHUNK_SIZE);
         let parsed = resolver::parse_have_message(&msg).expect("single HAVE should parse");
 
         assert_eq!(total, 1);
@@ -317,7 +324,8 @@ mod tests {
     #[test]
     fn one_mib_have_payload_is_split_into_datachannel_safe_chunks() {
         let data = vec![7u8; 1024 * 1024];
-        let total = have_chunk_count(data.len()).expect("1MiB block should fit");
+        let total =
+            have_chunk_count(data.len(), resolver::HAVE_CHUNK_SIZE).expect("1MiB block should fit");
 
         assert_eq!(
             total as usize,
@@ -327,7 +335,13 @@ mod tests {
 
         let mut reassembled = Vec::with_capacity(data.len());
         for chunk_index in 0..total {
-            let msg = build_have_payload("cid-large", &data, chunk_index, total);
+            let msg = build_have_payload(
+                "cid-large",
+                &data,
+                chunk_index,
+                total,
+                resolver::HAVE_CHUNK_SIZE,
+            );
             assert_ne!(msg[0], resolver::MSG_HAVE);
 
             let (cid, parsed_index, parsed_total, payload) =

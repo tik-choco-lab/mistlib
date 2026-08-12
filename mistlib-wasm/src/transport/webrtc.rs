@@ -196,6 +196,7 @@ pub mod peer;
 pub mod pending_candidates;
 pub mod recovery;
 pub mod request_guard;
+pub mod sctp_limit;
 pub mod sdp_lines;
 pub mod send_queue;
 use backpressure::{backpressure_action, BackpressureAction};
@@ -217,6 +218,7 @@ use pending_candidates::{
 };
 pub use request_guard::RequestAction;
 use request_guard::{request_action_for_snapshot, RequestState};
+use sctp_limit::effective_message_limit;
 use sdp_lines::mline_signature;
 use send_queue::{should_queue_reliable_send, MAX_QUEUED_BYTES, MAX_QUEUED_MESSAGES};
 
@@ -564,6 +566,23 @@ impl WasmWebRtcTransport {
         self.max_message_bytes.store(max, Ordering::Relaxed);
     }
 
+    /// Resolves the peer and the same configured/negotiated ceiling enforced
+    /// by `send` together, so the send path does not race a second peer lookup
+    /// merely to reuse the negotiated limit.
+    fn resolve_peer_and_effective_limit(&self, node: &NodeId) -> (Option<Arc<Peer>>, u32) {
+        let peer = {
+            let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+            peers.get(node).cloned()
+        };
+        let config_limit = self.max_message_bytes.load(Ordering::Relaxed);
+        let negotiated = peer
+            .as_ref()
+            .map(|peer| peer.negotiated_max_message_bytes.load(Ordering::Relaxed))
+            .filter(|limit| *limit > 0);
+        let limit = effective_message_limit(config_limit, negotiated);
+        (peer, limit)
+    }
+
     /// Sets the ICE (STUN/TURN) servers used by every peer connection created
     /// afterwards via `create_pc`. Called once from `build_session` with
     /// `config.webrtc.ice_servers`, mirroring `set_max_connections` above --
@@ -858,6 +877,7 @@ impl WasmWebRtcTransport {
             self.candidate_delivery.clone(),
             self.negotiation_delivery.clone(),
             candidate_generation,
+            self.max_message_bytes.load(Ordering::Relaxed),
         );
 
         let _ = self.attach_published_tracks_to_peer(&remote_id, &peer)?;
@@ -2014,6 +2034,7 @@ fn schedule_isolation_recovery(
 /// `.await` below.
 async fn wait_for_buffered_amount_low(
     waiters: &Arc<RwLock<HashMap<DeliveryMethod, Vec<tokio::sync::oneshot::Sender<()>>>>>,
+    dc: &web_sys::RtcDataChannel,
     method: DeliveryMethod,
 ) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -2025,6 +2046,15 @@ async fn wait_for_buffered_amount_low(
         // accumulate until the next `onbufferedamountlow` fire drains them.
         queue.retain(|tx| !tx.is_closed());
         queue.push(tx);
+    }
+
+    // The channel can cross the low watermark between the caller's
+    // bufferedAmount check and registering this waiter. In that case the
+    // browser may already have emitted the only edge event we were waiting
+    // for, so do not sleep until the timeout. The sender left in waiters is
+    // closed when rx is dropped and is pruned by the next waiter/event.
+    if dc.buffered_amount() <= BUFFERED_AMOUNT_LOW_THRESHOLD {
+        return true;
     }
 
     let timeout = gloo_timers::future::TimeoutFuture::new(BUFFERED_AMOUNT_WAIT_TIMEOUT_MS);
@@ -2314,16 +2344,30 @@ impl Transport for WasmWebRtcTransport {
         data: Bytes,
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
-        let limit = self.max_message_bytes.load(Ordering::Relaxed);
+        // Resolve the peer once for both the negotiated limit and the later
+        // queue/channel path. The size check still runs even when this is
+        // `None`, preserving the pre-lookup rejection behavior from SPEC-13.
+        let (peer, limit) = self.resolve_peer_and_effective_limit(node);
+        let config_limit = self.max_message_bytes.load(Ordering::Relaxed);
         match check_message_size(data.len(), limit) {
             Err(err) => return Err(err),
             Ok(SizeCheck::NearLimit) => {
-                tracing::warn!(
-                    "Message to {} is {}B, at or above 80% of max_message_bytes ({}B)",
-                    node.0,
-                    data.len(),
-                    limit
-                );
+                if limit < config_limit {
+                    tracing::warn!(
+                        "Message to {} is {}B, at or above 80% of the effective per-peer SCTP message limit ({}B; configured max_message_bytes={}B)",
+                        node.0,
+                        data.len(),
+                        limit,
+                        config_limit
+                    );
+                } else {
+                    tracing::warn!(
+                        "Message to {} is {}B, at or above 80% of configured max_message_bytes ({}B)",
+                        node.0,
+                        data.len(),
+                        limit
+                    );
+                }
             }
             Ok(SizeCheck::Ok) => {}
         }
@@ -2340,11 +2384,6 @@ impl Transport for WasmWebRtcTransport {
             // around one ICE-restart recovery). Unreliable methods keep the
             // existing fail-fast behavior -- see
             // `send_queue::should_queue_reliable_send`'s doc comment for why.
-            let peer = {
-                let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-                peers.get(node).cloned()
-            };
-
             if let Some(peer) = &peer {
                 if should_queue_reliable_send(method, true, node_state) {
                     let dropped_oldest = {
@@ -2373,67 +2412,86 @@ impl Transport for WasmWebRtcTransport {
             ));
         }
 
-        let dc_opt = {
-            let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-            peers.get(node).cloned().and_then(|peer| {
-                let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-                channels
-                    .get(&method)
-                    .cloned()
-                    .or_else(|| {
-                        if method == DeliveryMethod::UnreliableOrdered {
-                            channels.get(&DeliveryMethod::Unreliable).cloned()
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|dc| (dc, peer.buffered_amount_waiters.clone()))
-            })
+        // A Reliable DataChannel is one shared browser send queue even when
+        // several storage/control tasks call send concurrently. Serialize the
+        // complete check -> optional drain wait -> write sequence so only one
+        // task can wait on onbufferedamountlow. Queued tasks acquire Tokio's
+        // FIFO gate one by one and observe the latest bufferedAmount.
+        let _reliable_send_guard = match (&peer, method) {
+            (Some(peer), DeliveryMethod::ReliableOrdered) => {
+                Some(peer.reliable_send_gate.lock().await)
+            }
+            _ => None,
         };
+
+        let dc_opt = peer.as_ref().and_then(|peer| {
+            let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
+            channels
+                .get(&method)
+                .cloned()
+                .or_else(|| {
+                    if method == DeliveryMethod::UnreliableOrdered {
+                        channels.get(&DeliveryMethod::Unreliable).cloned()
+                    } else {
+                        None
+                    }
+                })
+                .map(|dc| (dc, peer.buffered_amount_waiters.clone()))
+        });
 
         if let Some((dc, buffered_amount_waiters)) = dc_opt {
             let ready_state = dc.ready_state();
             if ready_state == web_sys::RtcDataChannelState::Open {
-                match backpressure_action(
-                    dc.buffered_amount(),
-                    BUFFERED_AMOUNT_HIGH_WATERMARK,
-                    method,
-                ) {
-                    BackpressureAction::SendNow => {}
-                    BackpressureAction::WaitThenSend => {
-                        tracing::warn!(
-                            "DataChannel to {} congested (bufferedAmount over {}B); waiting for drain",
-                            node.0,
-                            BUFFERED_AMOUNT_HIGH_WATERMARK
-                        );
-                        // WaitThenSend is only reachable for ReliableOrdered
-                        // (see `backpressure_action`), and ReliableOrdered has
-                        // no channel-fallback substitution above -- so
-                        // `method` here always matches the channel actually
-                        // in hand, which is exactly how its permanent
-                        // `onbufferedamountlow` handler was keyed in
-                        // `Peer::setup_dc_handlers`.
-                        if !wait_for_buffered_amount_low(&buffered_amount_waiters, method).await {
+                loop {
+                    match backpressure_action(
+                        dc.buffered_amount(),
+                        BUFFERED_AMOUNT_HIGH_WATERMARK,
+                        method,
+                    ) {
+                        BackpressureAction::SendNow => break,
+                        BackpressureAction::WaitThenSend => {
                             tracing::warn!(
-                                "DataChannel to {} still congested after {}ms; dropping reliable message",
+                                "DataChannel to {} congested (bufferedAmount over {}B); waiting for drain",
                                 node.0,
-                                BUFFERED_AMOUNT_WAIT_TIMEOUT_MS
+                                BUFFERED_AMOUNT_HIGH_WATERMARK
+                            );
+                            // Only ReliableOrdered waits here. The send gate
+                            // ensures this is the channel's sole event waiter.
+                            if !wait_for_buffered_amount_low(&buffered_amount_waiters, &dc, method)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "DataChannel to {} still congested after {}ms; dropping reliable message",
+                                    node.0,
+                                    BUFFERED_AMOUNT_WAIT_TIMEOUT_MS
+                                );
+                                return Err(mistlib_core::error::MistError::Internal(
+                                    "Backpressure: bufferedAmount drain timed out".to_string(),
+                                ));
+                            }
+
+                            // A low event is an edge notification, not a send
+                            // permit. Re-check state and bufferedAmount before
+                            // writing; the gate prevents sibling refills.
+                            if dc.ready_state() != web_sys::RtcDataChannelState::Open {
+                                return Err(mistlib_core::error::MistError::Internal(
+                                    "DataChannel closed while waiting for backpressure drain"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        BackpressureAction::Drop => {
+                            tracing::warn!(
+                                "Dropping {:?} message to {} (bufferedAmount over {}B)",
+                                method,
+                                node.0,
+                                BUFFERED_AMOUNT_HIGH_WATERMARK
                             );
                             return Err(mistlib_core::error::MistError::Internal(
-                                "Backpressure: bufferedAmount drain timed out".to_string(),
+                                "Backpressure: dropped unreliable message under congestion"
+                                    .to_string(),
                             ));
                         }
-                    }
-                    BackpressureAction::Drop => {
-                        tracing::warn!(
-                            "Dropping {:?} message to {} (bufferedAmount over {}B)",
-                            method,
-                            node.0,
-                            BUFFERED_AMOUNT_HIGH_WATERMARK
-                        );
-                        return Err(mistlib_core::error::MistError::Internal(
-                            "Backpressure: dropped unreliable message under congestion".to_string(),
-                        ));
                     }
                 }
 
@@ -2478,6 +2536,10 @@ impl Transport for WasmWebRtcTransport {
         Err(mistlib_core::error::MistError::Internal(
             "Not connected".to_string(),
         ))
+    }
+
+    fn message_size_limit(&self, node: &NodeId) -> Option<u32> {
+        Some(self.resolve_peer_and_effective_limit(node).1)
     }
 
     async fn broadcast(
@@ -2614,6 +2676,7 @@ impl Transport for WasmWebRtcTransport {
             self.peers.clone(),
             self.peer_senders.clone(),
             self.pending_candidates.clone(),
+            self.max_message_bytes.load(Ordering::Relaxed),
         );
 
         Peer::setup_dc_handlers(
@@ -2628,6 +2691,7 @@ impl Transport for WasmWebRtcTransport {
             self.peers.clone(),
             self.peer_senders.clone(),
             self.pending_candidates.clone(),
+            self.max_message_bytes.load(Ordering::Relaxed),
         );
 
         Peer::setup_dc_handlers(
@@ -2642,6 +2706,7 @@ impl Transport for WasmWebRtcTransport {
             self.peers.clone(),
             self.peer_senders.clone(),
             self.pending_candidates.clone(),
+            self.max_message_bytes.load(Ordering::Relaxed),
         );
 
         // Close any peer this displaces, same as `handle_offer` does at its

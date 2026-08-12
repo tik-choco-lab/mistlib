@@ -4,6 +4,7 @@ use super::candidate_delivery::{
 use super::negotiation_delivery::NegotiationDelivery;
 use super::send_queue::SendQueue;
 use super::{DisconnectGrace, GraceOrigin};
+use js_sys::Reflect;
 use mistlib_core::signaling::{
     CandidateEnvelope, MessageContent, Signaler, SignalingData, SignalingType,
 };
@@ -133,6 +134,16 @@ pub struct Peer {
     /// the clobbered waiter to time out even though the channel drained).
     pub buffered_amount_waiters:
         Arc<RwLock<HashMap<DeliveryMethod, Vec<tokio::sync::oneshot::Sender<()>>>>>,
+    /// Serializes ReliableOrdered writes to this peer's DataChannel, including
+    /// the bufferedAmount check and any wait for onbufferedamountlow.
+    ///
+    /// StorageEngine::get can request several blocks concurrently, causing
+    /// independent handle_want tasks to serve them over the same channel.
+    /// Without this gate those tasks all register as low-watermark waiters and
+    /// are woken together, immediately refilling the browser queue as a herd.
+    /// Tokio's FIFO mutex leaves at most one task waiting on the browser event;
+    /// the others wait here and re-check bufferedAmount when their turn starts.
+    pub reliable_send_gate: tokio::sync::Mutex<()>,
     /// Serializes every operation that advances this peer's
     /// `RTCPeerConnection` signaling state via `createOffer`/`createAnswer`
     /// + `setLocalDescription`/`setRemoteDescription` --
@@ -165,6 +176,12 @@ pub struct Peer {
     /// re-handshake builds a fresh `Peer` whose `create_pc` attaches every
     /// published track before first negotiation.
     pub needs_track_reconcile: std::sync::atomic::AtomicBool,
+    /// SCTP's negotiated `maxMessageSize` for this peer, or zero when the
+    /// browser did not expose a usable value yet. It lives on `Peer` so it is
+    /// discarded automatically with the connection during teardown, without
+    /// a separate `NodeId`-keyed cache whose cleanup must mirror every peer
+    /// removal path.
+    pub negotiated_max_message_bytes: AtomicU32,
     /// Bounded FIFO of `ReliableOrdered` sends deferred by
     /// `WasmWebRtcTransport::send` while this peer exists but isn't
     /// `Connected` yet/still (fresh connection pre-`onopen`, or mid
@@ -185,8 +202,10 @@ impl Peer {
             pc,
             channels: Arc::new(RwLock::new(HashMap::new())),
             buffered_amount_waiters: Arc::new(RwLock::new(HashMap::new())),
+            reliable_send_gate: tokio::sync::Mutex::new(()),
             negotiating: tokio::sync::Mutex::new(()),
             needs_track_reconcile: std::sync::atomic::AtomicBool::new(false),
+            negotiated_max_message_bytes: AtomicU32::new(0),
             send_queue: Mutex::new(SendQueue::default()),
         }
     }
@@ -343,6 +362,7 @@ impl Peer {
         candidate_delivery: Arc<RwLock<CandidateDelivery>>,
         negotiation_delivery: Arc<RwLock<NegotiationDelivery>>,
         candidate_generation: u32,
+        config_max_message_bytes: u32,
     ) {
         let conn_states = connection_states.clone();
         let remote_id_state = remote_id.clone();
@@ -688,6 +708,7 @@ impl Peer {
                 peers_dc.clone(),
                 peer_senders_dc.clone(),
                 pending_candidates.clone(),
+                config_max_message_bytes,
             );
         })
             as Box<dyn FnMut(web_sys::RtcDataChannelEvent)>);
@@ -740,6 +761,7 @@ impl Peer {
         peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
         peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, web_sys::RtcRtpSender>>>>,
         pending_candidates: Arc<RwLock<crate::transport::webrtc::PendingCandidates>>,
+        config_max_message_bytes: u32,
     ) {
         // Takes the whole `Arc<Peer>` (rather than just its
         // `buffered_amount_waiters`, as before) so `onopen` below can flush
@@ -808,6 +830,38 @@ impl Peer {
                     from_msg.0
                 );
                 return;
+            }
+
+            if peer_open
+                .negotiated_max_message_bytes
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                match read_negotiated_max_message_size(&peer_open.pc) {
+                    Some(negotiated) => {
+                        peer_open
+                            .negotiated_max_message_bytes
+                            .store(negotiated, Ordering::Relaxed);
+                        tracing::info!(
+                            "Negotiated SCTP maxMessageSize for {} is {}B",
+                            from_msg.0,
+                            negotiated
+                        );
+                        if negotiated < config_max_message_bytes {
+                            tracing::warn!(
+                                "SCTP maxMessageSize for {} is {}B, below configured max_message_bytes={}B; per-peer sends will be clamped",
+                                from_msg.0,
+                                negotiated,
+                                config_max_message_bytes
+                            );
+                        }
+                    }
+                    None => tracing::debug!(
+                        "Could not read a finite positive SCTP maxMessageSize for {}; using configured max_message_bytes={}B",
+                        from_msg.0,
+                        config_max_message_bytes
+                    ),
+                }
             }
 
             let prev = {
@@ -918,4 +972,25 @@ impl Peer {
         dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
     }
+}
+
+/// Reads `RTCPeerConnection.sctp.maxMessageSize` without relying on web-sys
+/// bindings, which are absent for this API in the version used by MistLib.
+/// Browsers may expose no SCTP transport yet, no numeric value, or `Infinity`
+/// for an unlimited association; all of those intentionally map to `None` so
+/// the caller retains the configured application limit.
+fn read_negotiated_max_message_size(pc: &RtcPeerConnection) -> Option<u32> {
+    let sctp = Reflect::get(pc.as_ref(), &JsValue::from_str("sctp")).ok()?;
+    if sctp.is_null() || sctp.is_undefined() {
+        return None;
+    }
+
+    let value = Reflect::get(&sctp, &JsValue::from_str("maxMessageSize"))
+        .ok()?
+        .as_f64()?;
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+
+    Some(value.min(u32::MAX as f64) as u32)
 }

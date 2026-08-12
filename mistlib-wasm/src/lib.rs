@@ -1,6 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 pub mod app;
+pub mod build_info;
 pub mod ffi;
 pub mod kv;
 pub mod layers;

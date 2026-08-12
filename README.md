@@ -69,10 +69,11 @@ Unity, Python and JavaScript wrappers with runnable samples live in
 ```js
 import init, {
   init_with_config, join_room, update_position, send_message,
-  register_event_callback, MistEvent, Delivery,
+  register_event_callback, get_version, get_build_info, MistEvent, Delivery,
 } from "@tik-choco/mistlib";
 
 await init();
+console.log("MistLib", get_version(), JSON.parse(get_build_info()));
 
 init_with_config("alice", JSON.stringify({
   signaling: {
@@ -108,6 +109,10 @@ Call `update_position` as your avatar moves — it is what drives topology and a
 | `get_neighbors()` / `get_all_nodes()` | Current view of the room, as JSON |
 | `storage_add(name, bytes)` / `storage_get(cid)` | Content-addressed storage |
 | `register_event_callback(fn)` | Peer, area-of-interest and room events |
+| `get_version()` / `get_build_info()` | Get the release version and the exact loaded build |
+
+`get_build_info()` returns a JSON string containing `version`, `commit`, `dirty`, `profile`, and
+`target`. It identifies the source commit and whether tracked local changes were present.
 
 Without an explicit room, these act across every room you have joined: `send_message("", …)`
 broadcasts to all of them and `get_neighbors()` merges their views. Multi-room applications
@@ -117,6 +122,9 @@ The native library offers the same operations over a C ABI with `(pointer, lengt
 two differences: there is no `get_neighbors` / `get_all_nodes` (that data arrives as events
 instead), and only `update_position` and `send_message` have `*_in_room` variants. See
 `mistlib-native/src/ffi.rs`.
+
+Native `get_version` / `get_build_info` write into caller-owned buffers. If a buffer is too small,
+they copy nothing and return the required byte length, so a zero-length call can query the size.
 
 **Delivery modes** — `Delivery.Reliable` (`0`) arrives in order; `Delivery.UnreliableOrdered`
 (`1`) may drop but never reorders; `Delivery.Unreliable` (`2`) may drop or reorder, for the

@@ -1165,6 +1165,13 @@ impl WebRtcTransport {
     /// so `broadcast` (which forwards to `send` per target) inherits it for
     /// free. Does not apply to the signaling (offer/answer/candidate) path,
     /// which never calls this.
+    ///
+    /// Native cannot currently clamp this against a per-peer negotiated SCTP
+    /// value: webrtc-rs 0.13's `RTCSctpTransport::get_capabilities()` returns
+    /// a stubbed `max_message_size: 0`, while the transport's real field is
+    /// private and has no accessor. The WASM transport is intentionally
+    /// asymmetric here and lowers this configured ceiling per peer when the
+    /// browser exposes `RTCSctpTransport.maxMessageSize`.
     fn check_message_size(&self, size: usize) -> mistlib_core::error::Result<()> {
         let limit = self.max_message_bytes.load(Ordering::Relaxed);
         if size > limit as usize {
@@ -1411,6 +1418,10 @@ impl Transport for WebRtcTransport {
         })?;
 
         Self::enqueue_on_peer(node, &peer.send_tx, data, method)
+    }
+
+    fn message_size_limit(&self, _node: &NodeId) -> Option<u32> {
+        Some(self.max_message_bytes.load(Ordering::Relaxed))
     }
 
     async fn broadcast(

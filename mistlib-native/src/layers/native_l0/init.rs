@@ -71,7 +71,9 @@ pub(super) async fn build_session_context(room_id: String, local_id: NodeId) -> 
         transport: overlay_transport.clone(),
         webrtc_transport: Some(webrtc_transport),
         ws_signaling_handler,
-        p2p_signaling_handler: Some(p2p_signaling_handler),
+        p2p_signaling_dispatcher: Some(Arc::new(crate::engine::P2pSignalingDispatcher::new(
+            p2p_signaling_handler,
+        ))),
         signaling_dispatch: Some(overlay_transport as Arc<dyn Signaler>),
         bootstrap_signaler: Some(signaler),
         l1_transport: Some(l1.clone() as Arc<dyn mistlib_core::layers::L1Transport>),

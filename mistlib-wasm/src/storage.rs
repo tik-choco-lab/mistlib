@@ -10,7 +10,7 @@ use std::sync::Arc;
 use js_sys::Uint8Array;
 use mistlib_core::config::StorageConfig;
 use mistlib_core::layers::l2::L2Storage;
-use mistlib_core::storage::protocol::{build_have_payload, have_chunk_count};
+use mistlib_core::storage::protocol::{build_have_payload, chunk_size_for_limit, have_chunk_count};
 use mistlib_core::storage::{P2PStorage, SpatialPolicy};
 use mistlib_core::types::Vector3;
 use wasm_bindgen::prelude::*;
@@ -121,18 +121,20 @@ pub fn handle_want(room_id: String, from: mistlib_core::types::NodeId, cid: Stri
             let ctx = crate::app::session_running_ctx(&room_id);
 
             if let Some(ctx) = ctx {
-                let Some(total_chunks) = have_chunk_count(data.len()) else {
+                let limit = ctx.preferred_transport().message_size_limit(&from);
+                let chunk_size = chunk_size_for_limit(&cid, limit);
+                let Some(total_chunks) = have_chunk_count(data.len(), chunk_size) else {
                     tracing::warn!(
                         "Storage: refusing to serve oversized block {} ({} bytes, {} chunks)",
                         cid,
                         data.len(),
-                        data.len().div_ceil(resolver::HAVE_CHUNK_SIZE)
+                        data.len().div_ceil(chunk_size)
                     );
                     return;
                 };
 
                 if total_chunks <= 1 {
-                    let msg = build_have_payload(&cid, &data, 0, total_chunks);
+                    let msg = build_have_payload(&cid, &data, 0, total_chunks, chunk_size);
                     let _ = ctx
                         .transport
                         .send(
@@ -143,7 +145,8 @@ pub fn handle_want(room_id: String, from: mistlib_core::types::NodeId, cid: Stri
                         .await;
                 } else {
                     for chunk_index in 0..total_chunks {
-                        let msg = build_have_payload(&cid, &data, chunk_index, total_chunks);
+                        let msg =
+                            build_have_payload(&cid, &data, chunk_index, total_chunks, chunk_size);
 
                         let _ = ctx
                             .transport
@@ -346,7 +349,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn one_mib_have_payload_is_split_into_datachannel_safe_chunks() {
         let data = vec![7u8; 1024 * 1024];
-        let total = have_chunk_count(data.len()).expect("1MiB block should fit");
+        let total =
+            have_chunk_count(data.len(), resolver::HAVE_CHUNK_SIZE).expect("1MiB block should fit");
 
         assert_eq!(
             total as usize,
@@ -356,7 +360,13 @@ mod tests {
 
         let mut reassembled = Vec::with_capacity(data.len());
         for chunk_index in 0..total {
-            let msg = build_have_payload("cid-large", &data, chunk_index, total);
+            let msg = build_have_payload(
+                "cid-large",
+                &data,
+                chunk_index,
+                total,
+                resolver::HAVE_CHUNK_SIZE,
+            );
             assert_ne!(msg[0], resolver::MSG_HAVE);
 
             let (cid, parsed_index, parsed_total, payload) =
@@ -382,7 +392,7 @@ mod tests {
     fn oversized_block_is_refused_rather_than_wrapped() {
         let oversized_len = (u16::MAX as usize + 1) * resolver::HAVE_CHUNK_SIZE;
         assert!(
-            have_chunk_count(oversized_len).is_none(),
+            have_chunk_count(oversized_len, resolver::HAVE_CHUNK_SIZE).is_none(),
             "oversized block must be refused, not silently wrapped"
         );
     }

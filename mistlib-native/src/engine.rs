@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -37,8 +37,8 @@ pub struct SessionCtx {
     pub(crate) webrtc_transport: Option<Arc<WebRtcTransport>>,
     /// WebSocket経由で届いたシグナリング（SDP/ICE）の処理先
     pub(crate) ws_signaling_handler: Arc<dyn SignalingHandler>,
-    /// WebRTC P2P中継で届いたシグナリングの処理先（中継不使用時はNone）
-    pub(crate) p2p_signaling_handler: Option<Arc<dyn SignalingHandler>>,
+    /// WebRTC P2P中継で届いたシグナリングの順序付き処理先（中継不使用時はNone）
+    pub(crate) p2p_signaling_dispatcher: Option<Arc<P2pSignalingDispatcher>>,
     pub(crate) signaling_dispatch: Option<Arc<dyn Signaler>>,
     pub(crate) bootstrap_signaler: Option<Arc<BootstrapSignaler>>,
     pub(crate) l1_transport: Option<Arc<dyn L1Transport>>,
@@ -52,6 +52,74 @@ pub struct SessionCtx {
     /// the network event pump, and the signaling loop) without touching any
     /// other active session. Cancelled once, from `leave_room`/`leave_room_id`.
     pub(crate) cancel: CancellationToken,
+}
+
+struct P2pSignalingDispatchState {
+    queue: VecDeque<mistlib_core::signaling::MessageContent>,
+    draining: bool,
+}
+
+/// Serializes P2P signaling delivery without blocking the network event pump.
+///
+/// Overlay reordering restores message order synchronously. Enqueuing into this
+/// dispatcher is synchronous too, so the single drain task preserves that order
+/// even on the engine's multi-threaded Tokio runtime.
+pub(crate) struct P2pSignalingDispatcher {
+    handler: Arc<dyn SignalingHandler>,
+    state: StdMutex<P2pSignalingDispatchState>,
+}
+
+impl P2pSignalingDispatcher {
+    pub(crate) fn new(handler: Arc<dyn SignalingHandler>) -> Self {
+        Self {
+            handler,
+            state: StdMutex::new(P2pSignalingDispatchState {
+                queue: VecDeque::new(),
+                draining: false,
+            }),
+        }
+    }
+
+    pub(crate) fn dispatch(
+        self: &Arc<Self>,
+        runtime: &tokio::runtime::Handle,
+        message: mistlib_core::signaling::MessageContent,
+    ) {
+        let should_start = {
+            let mut state = self.state.lock().unwrap();
+            state.queue.push_back(message);
+            if state.draining {
+                false
+            } else {
+                state.draining = true;
+                true
+            }
+        };
+
+        if should_start {
+            let dispatcher = self.clone();
+            runtime.spawn(async move { dispatcher.drain().await });
+        }
+    }
+
+    async fn drain(&self) {
+        loop {
+            let message = {
+                let mut state = self.state.lock().unwrap();
+                match state.queue.pop_front() {
+                    Some(message) => message,
+                    None => {
+                        state.draining = false;
+                        return;
+                    }
+                }
+            };
+
+            if let Err(err) = self.handler.handle_message(message).await {
+                tracing::warn!("NativeEngine: p2p signaling handler failed: {:?}", err);
+            }
+        }
+    }
 }
 
 impl SessionCtx {
