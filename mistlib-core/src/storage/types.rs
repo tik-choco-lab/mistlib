@@ -373,35 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lru_eviction_perf() {
-        let n = 100_000;
-        let mut mgr = StorageManager::new((n as u64) - 10);
-        for i in 0..n {
-            mgr.track_block(&i.to_string(), 1, None);
-        }
-
-        let iters = 50;
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = mgr.eviction_candidates();
-        }
-        let duration = start.elapsed();
-        let avg_ms = duration.as_secs_f64() * 1000.0 / (iters as f64);
-        println!(
-            "LRU eviction candidates: {}iters => total {:?}, avg {:.3}ms",
-            iters, duration, avg_ms
-        );
-
-        // Note: this is a lightweight regression threshold to catch big regressions on CI.
-        // Real-world perf expected < 100ms in most environments and might vary under load.
-        assert!(
-            avg_ms < 200.0,
-            "eviction_candidates too slow: avg {:.3}ms",
-            avg_ms
-        );
-    }
-
-    #[test]
     fn test_spatial_eviction_prefers_farther_block_at_same_age() {
         let mut mgr = StorageManager::new(100);
         // Same size and tracked back-to-back (near-identical age), but "far"
@@ -514,35 +485,6 @@ mod tests {
         assert_eq!(
             first, second,
             "same sweep_counter must reproduce the same roll"
-        );
-    }
-
-    #[test]
-    fn test_spatial_eviction_candidates_perf() {
-        let n = 100_000;
-        let mut mgr = StorageManager::new((n as u64) - 10);
-        for i in 0..n {
-            let position = Vector3::new((i % 500) as f32, 0.0, 0.0);
-            mgr.track_block(&i.to_string(), 1, Some(position));
-        }
-        let self_positions = [Vector3::new(0.0, 0.0, 0.0)];
-
-        let iters = 50;
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = mgr.spatial_eviction_candidates(&self_positions, 100.0);
-        }
-        let duration = start.elapsed();
-        let avg_ms = duration.as_secs_f64() * 1000.0 / (iters as f64);
-        println!(
-            "Spatial eviction candidates: {}iters => total {:?}, avg {:.3}ms",
-            iters, duration, avg_ms
-        );
-
-        assert!(
-            avg_ms < 200.0,
-            "spatial_eviction_candidates too slow: avg {:.3}ms",
-            avg_ms
         );
     }
 

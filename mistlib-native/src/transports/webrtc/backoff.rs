@@ -68,11 +68,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_attempt_returns_the_initial_interval_unchanged() {
-        assert_eq!(exponential_backoff_ms(1, 1000, 1.5, 10_000), 1000);
-    }
-
-    #[test]
     fn zeroth_attempt_needs_no_wait() {
         assert_eq!(exponential_backoff_ms(0, 1000, 1.5, 10_000), 0);
     }

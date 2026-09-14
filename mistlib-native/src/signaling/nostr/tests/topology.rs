@@ -220,7 +220,7 @@ fn has_cross_edge(
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_six_nodes_secret_rank_topology() {
     let room_id = format!("nostr-six-room-{}", random_subscription_id());
     let ids: Vec<NodeId> = (b'A'..=b'F')
@@ -300,7 +300,7 @@ async fn discover_rounds(
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_six_nodes_reconnect_one_peer_keeps_graph_connected() {
     let room_id = format!("nostr-six-reconnect-room-{}", random_subscription_id());
     let ids: Vec<NodeId> = (b'A'..=b'F')
@@ -368,7 +368,7 @@ async fn live_go_relay_six_nodes_reconnect_one_peer_keeps_graph_connected() {
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_peer_reconnects_after_disconnect() {
     let room_id = format!("nostr-reconnect-room-{}", random_subscription_id());
     let alice_id = NodeId(format!("reconnect-alice-{room_id}"));
@@ -412,7 +412,7 @@ async fn live_go_relay_peer_reconnects_after_disconnect() {
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_mixed_six_native_nodes_connect_to_wasm_nodes() {
     let room_id = env_string("MIST_NOSTR_ROOM_ID")
         .unwrap_or_else(|| format!("nostr-mixed-six-room-{}", random_subscription_id()));

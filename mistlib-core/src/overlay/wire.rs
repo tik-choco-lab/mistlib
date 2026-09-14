@@ -117,54 +117,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "measurement only; run with --ignored --nocapture"]
-    fn measure_wire_savings() {
-        use crate::overlay::message::{OVERLAY_MSG_HEARTBEAT, OVERLAY_MSG_PING};
-        let uuid = || NodeId("550e8400-e29b-41d4-a716-446655440000".to_string());
-        let cases: Vec<(&str, OverlayEnvelope)> = vec![
-            ("position-sync (Vector3 broadcast)", sample_position_sync()),
-            (
-                "ping (empty overlay unicast)",
-                OverlayEnvelope::new(
-                    uuid(),
-                    uuid(),
-                    0,
-                    MessageContent::Overlay(OverlayMessage {
-                        message_type: OVERLAY_MSG_PING,
-                        payload: vec![],
-                    }),
-                ),
-            ),
-            (
-                "heartbeat (32B payload broadcast)",
-                OverlayEnvelope::new(
-                    uuid(),
-                    NodeId::broadcast(),
-                    0,
-                    MessageContent::Overlay(OverlayMessage {
-                        message_type: OVERLAY_MSG_HEARTBEAT,
-                        payload: vec![0u8; 32],
-                    }),
-                ),
-            ),
-            (
-                "raw chat (16B unicast, seq=5)",
-                OverlayEnvelope::new(uuid(), uuid(), 0, MessageContent::Raw(vec![0u8; 16].into()))
-                    .with_seq(5),
-            ),
-        ];
-        for (name, env) in cases {
-            let v4 = serialize(&env).unwrap().len();
-            let legacy = bincode::serialize(&env).unwrap().len();
-            println!(
-                "{name}: legacy={legacy}B  v4={v4}B  saved={}B ({:.0}%)",
-                legacy - v4,
-                100.0 * (legacy - v4) as f64 / legacy as f64
-            );
-        }
-    }
-
-    #[test]
     fn deserialize_rejects_trailing_bytes() {
         let env = sample_position_sync();
         let mut bytes = serialize(&env).expect("serialize");

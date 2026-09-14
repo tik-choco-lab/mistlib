@@ -7,63 +7,57 @@ use mistlib_core::types::DeliveryMethod;
 const HIGH_WATERMARK: u32 = 1024 * 1024;
 
 #[test]
-fn below_watermark_sends_now_regardless_of_method() {
-    for method in [
-        DeliveryMethod::ReliableOrdered,
-        DeliveryMethod::UnreliableOrdered,
-        DeliveryMethod::Unreliable,
-    ] {
+fn chooses_action_at_and_around_the_watermark() {
+    let cases = [
+        (
+            "reliable below",
+            HIGH_WATERMARK - 1,
+            DeliveryMethod::ReliableOrdered,
+            BackpressureAction::SendNow,
+        ),
+        (
+            "unreliable ordered below",
+            HIGH_WATERMARK - 1,
+            DeliveryMethod::UnreliableOrdered,
+            BackpressureAction::SendNow,
+        ),
+        (
+            "unreliable below",
+            HIGH_WATERMARK - 1,
+            DeliveryMethod::Unreliable,
+            BackpressureAction::SendNow,
+        ),
+        (
+            "exactly at watermark",
+            HIGH_WATERMARK,
+            DeliveryMethod::ReliableOrdered,
+            BackpressureAction::SendNow,
+        ),
+        (
+            "reliable above",
+            HIGH_WATERMARK + 1,
+            DeliveryMethod::ReliableOrdered,
+            BackpressureAction::WaitThenSend,
+        ),
+        (
+            "unreliable ordered above",
+            HIGH_WATERMARK + 1,
+            DeliveryMethod::UnreliableOrdered,
+            BackpressureAction::Drop,
+        ),
+        (
+            "unreliable above",
+            HIGH_WATERMARK + 1,
+            DeliveryMethod::Unreliable,
+            BackpressureAction::Drop,
+        ),
+    ];
+
+    for (name, buffered_amount, method, expected) in cases {
         assert_eq!(
-            backpressure_action(HIGH_WATERMARK - 1, HIGH_WATERMARK, method),
-            BackpressureAction::SendNow
+            backpressure_action(buffered_amount, HIGH_WATERMARK, method),
+            expected,
+            "case: {name}"
         );
     }
-}
-
-#[test]
-fn exactly_at_watermark_sends_now() {
-    assert_eq!(
-        backpressure_action(
-            HIGH_WATERMARK,
-            HIGH_WATERMARK,
-            DeliveryMethod::ReliableOrdered
-        ),
-        BackpressureAction::SendNow
-    );
-}
-
-#[test]
-fn over_watermark_reliable_waits_then_sends() {
-    assert_eq!(
-        backpressure_action(
-            HIGH_WATERMARK + 1,
-            HIGH_WATERMARK,
-            DeliveryMethod::ReliableOrdered
-        ),
-        BackpressureAction::WaitThenSend
-    );
-}
-
-#[test]
-fn over_watermark_unreliable_ordered_drops() {
-    assert_eq!(
-        backpressure_action(
-            HIGH_WATERMARK + 1,
-            HIGH_WATERMARK,
-            DeliveryMethod::UnreliableOrdered
-        ),
-        BackpressureAction::Drop
-    );
-}
-
-#[test]
-fn over_watermark_unreliable_drops() {
-    assert_eq!(
-        backpressure_action(
-            HIGH_WATERMARK + 1,
-            HIGH_WATERMARK,
-            DeliveryMethod::Unreliable
-        ),
-        BackpressureAction::Drop
-    );
 }

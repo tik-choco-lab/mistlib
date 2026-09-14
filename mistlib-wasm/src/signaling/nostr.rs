@@ -457,6 +457,9 @@ impl Signaler for WasmNostrSignaler {
             .unwrap_or_else(|e| e.into_inner()) = Some(TemporarySignalingIdentity::generate());
         self.clear_session_state();
         self.mark_local_joined();
+        // Replace the `#p`-filtered relay subscription immediately after
+        // identity rotation so direct signaling to the new pubkey is visible.
+        self.subscribe_room(&room_id)?;
         self.spawn_discovery_refresh(room_id.clone());
         self.publish_discovery(&room_id)
     }

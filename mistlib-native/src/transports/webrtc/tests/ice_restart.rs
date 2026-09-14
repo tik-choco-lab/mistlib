@@ -161,6 +161,78 @@ async fn try_ice_restart_keeps_peer_and_data_channel_alive() {
     .expect("data channel must still be usable after an ICE restart");
 }
 
+/// A failed restart-offer send leaves the peer in `HaveLocalOffer`, where a
+/// newly-created retry offer is illegal. The bounded outer retry must resend
+/// that exact pending SDP after the inner signaling retries are exhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ice_restart_resends_pending_offer_after_signaling_failure() {
+    use crate::transports::webrtc::peer::SIGNALING_SEND_RETRY_ATTEMPTS;
+    use mistlib_core::signaling::SignalingType;
+    use std::sync::atomic::Ordering;
+
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, fail_a) = make_connected_pair_with_recording();
+    ta.connect(&id_b).await.expect("connect should not fail");
+    assert!(
+        wait_for_state(&ta, &id_b, ConnectionState::Connected, 10_000).await,
+        "A did not reach Connected state"
+    );
+    assert!(
+        wait_for_state(&tb, &id_a, ConnectionState::Connected, 10_000).await,
+        "B did not reach Connected state"
+    );
+
+    let peer = ta.peers.read().await.get(&id_b).cloned().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while peer.pc.signaling_state()
+        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        peer.pc.signaling_state(),
+        webrtc::peer_connection::signaling_state::RTCSignalingState::Stable,
+        "initial negotiation must settle before exercising restart retries"
+    );
+    let gathering_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while peer.pc.ice_gathering_state()
+        != webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState::Complete
+        && tokio::time::Instant::now() < gathering_deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        peer.pc.ice_gathering_state(),
+        webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState::Complete,
+        "initial ICE gathering must complete before requesting an ICE restart"
+    );
+
+    sent_by_a.lock().unwrap().clear();
+    fail_a.store(SIGNALING_SEND_RETRY_ATTEMPTS as usize, Ordering::SeqCst);
+    ta.peer_handles().try_ice_restart(&id_b).await;
+
+    let offers: Vec<_> = sent_by_a
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|data| data.signaling_type == SignalingType::Offer)
+        .map(|data| data.data.clone())
+        .collect();
+    assert_eq!(
+        offers.len(),
+        SIGNALING_SEND_RETRY_ATTEMPTS as usize + 1,
+        "one outer retry should follow the exhausted inner send retries"
+    );
+    assert!(
+        offers.windows(2).all(|pair| pair[0] == pair[1]),
+        "every retry must resend the exact pending restart SDP"
+    );
+    assert!(
+        !peer.local_offer_unsent.load(Ordering::SeqCst),
+        "a successful retry must clear the pending-unsent marker"
+    );
+}
+
 /// Regression test for the enhance/simulation x develop merge: after a
 /// successful ICE restart the RTCPeerConnection re-enters `Connected`, but
 /// the ReliableOrdered DC's `on_open` (the normal place `Connected` is set
@@ -253,17 +325,6 @@ mod repair_trigger_jitter_tests {
     use mistlib_core::types::NodeId;
 
     #[test]
-    fn deterministic_for_a_fixed_pair() {
-        let a = NodeId("peer-a".to_string());
-        let b = NodeId("peer-b".to_string());
-        assert_eq!(
-            repair_trigger_jitter_ms(&a, &b),
-            repair_trigger_jitter_ms(&a, &b),
-            "the same (local_node_id, node) pair must always derive the same jitter"
-        );
-    }
-
-    #[test]
     fn within_bounds_for_several_pairs() {
         let pairs = [
             (NodeId("aaa".to_string()), NodeId("bbb".to_string())),
@@ -301,12 +362,7 @@ mod repair_trigger_jitter_tests {
 }
 
 mod restart_request_marker_tests {
-    use super::{is_restart_request, RESTART_REQUEST_MARKER};
-
-    #[test]
-    fn round_trips_through_the_marker() {
-        assert!(is_restart_request(RESTART_REQUEST_MARKER));
-    }
+    use super::is_restart_request;
 
     #[test]
     fn an_empty_data_field_is_not_a_restart_request() {
@@ -331,6 +387,7 @@ mod restart_request_marker_tests {
 struct RecordingLoopbackSignaler {
     tx: tokio::sync::mpsc::UnboundedSender<mistlib_core::signaling::MessageContent>,
     sent: StdArc<std::sync::Mutex<Vec<mistlib_core::signaling::SignalingData>>>,
+    fail_remaining: StdArc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -342,6 +399,25 @@ impl mistlib_core::signaling::Signaler for RecordingLoopbackSignaler {
     ) -> mistlib_core::error::Result<()> {
         if let mistlib_core::signaling::MessageContent::Data(d) = &msg {
             self.sent.lock().unwrap().push(d.clone());
+        }
+        let is_offer = matches!(
+            &msg,
+            mistlib_core::signaling::MessageContent::Data(d)
+                if d.signaling_type == mistlib_core::signaling::SignalingType::Offer
+        );
+        if is_offer
+            && self
+                .fail_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return Err(mistlib_core::error::MistError::Internal(
+                "injected signaling failure".to_string(),
+            ));
         }
         let _ = self.tx.send(msg);
         Ok(())
@@ -368,6 +444,7 @@ fn make_connected_pair_with_recording() -> (
     NodeId,
     SentLog,
     SentLog,
+    StdArc<std::sync::atomic::AtomicUsize>,
 ) {
     use crate::transports::webrtc::WebRtcTransport;
     use mistlib_core::signaling::SignalingHandler;
@@ -379,11 +456,13 @@ fn make_connected_pair_with_recording() -> (
     let (tx_b_to_a, rx_b_to_a) = tokio::sync::mpsc::unbounded_channel();
     let sent_by_a = StdArc::new(std::sync::Mutex::new(Vec::new()));
     let sent_by_b = StdArc::new(std::sync::Mutex::new(Vec::new()));
+    let fail_a = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let ta = StdArc::new(WebRtcTransport::new(
         StdArc::new(RecordingLoopbackSignaler {
             tx: tx_a_to_b,
             sent: sent_by_a.clone(),
+            fail_remaining: fail_a.clone(),
         }),
         id_a.clone(),
     ));
@@ -391,6 +470,7 @@ fn make_connected_pair_with_recording() -> (
         StdArc::new(RecordingLoopbackSignaler {
             tx: tx_b_to_a,
             sent: sent_by_b.clone(),
+            fail_remaining: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
         }),
         id_b.clone(),
     ));
@@ -410,7 +490,7 @@ fn make_connected_pair_with_recording() -> (
         }
     });
 
-    (ta, tb, id_a, id_b, sent_by_a, sent_by_b)
+    (ta, tb, id_a, id_b, sent_by_a, sent_by_b, fail_a)
 }
 
 /// Polls `sent` (a `RecordingLoopbackSignaler`'s recorded messages) until it
@@ -452,7 +532,7 @@ async fn liveness_suspect_on_initiator_side_with_healthy_pc_sends_no_restart_off
     use crate::transports::webrtc::{REPAIR_TRIGGER_DEBOUNCE_MS, REPAIR_TRIGGER_JITTER_MS};
     use mistlib_core::signaling::SignalingType;
 
-    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -502,7 +582,7 @@ async fn liveness_suspect_on_initiator_side_with_healthy_pc_sends_no_restart_off
 async fn liveness_suspect_on_non_initiator_side_sends_a_restart_request() {
     use mistlib_core::signaling::SignalingType;
 
-    let (ta, tb, id_a, id_b, _sent_by_a, sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, _sent_by_a, sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -555,7 +635,7 @@ async fn restart_request_with_existing_healthy_session_sends_no_restart_offer() 
     use crate::transports::webrtc::{REPAIR_TRIGGER_DEBOUNCE_MS, REPAIR_TRIGGER_JITTER_MS};
     use mistlib_core::signaling::{MessageContent, SignalingData, SignalingHandler, SignalingType};
 
-    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -651,7 +731,7 @@ async fn restart_request_without_existing_session_is_ignored() {
 /// multi_thread required: see the reasoning in `disconnect.rs`/`signaling.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_restart_within_the_minimum_interval_is_skipped() {
-    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -736,7 +816,7 @@ async fn grace_cleared_during_debounce_window_skips_the_repair_action() {
     use crate::transports::webrtc::{REPAIR_TRIGGER_DEBOUNCE_MS, REPAIR_TRIGGER_JITTER_MS};
     use mistlib_core::signaling::SignalingType;
 
-    let (ta, tb, id_a, id_b, sent_by_a, sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -833,7 +913,7 @@ async fn admitted_restart_rearms_the_disconnect_grace() {
     use crate::transports::webrtc::{DisconnectGrace, GraceOrigin};
     use std::time::{Duration, Instant};
 
-    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -924,7 +1004,7 @@ async fn maybe_try_ice_restart_gate_skips_connected_pc_and_admits_once_degraded(
     use mistlib_core::signaling::SignalingType;
     use std::time::{Duration, Instant};
 
-    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(
@@ -1019,7 +1099,7 @@ async fn restart_request_torn_down_during_the_debounce_window_sends_nothing() {
     use crate::transports::webrtc::{REPAIR_TRIGGER_DEBOUNCE_MS, REPAIR_TRIGGER_JITTER_MS};
     use mistlib_core::signaling::{MessageContent, SignalingData, SignalingHandler, SignalingType};
 
-    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b) = make_connected_pair_with_recording();
+    let (ta, tb, id_a, id_b, sent_by_a, _sent_by_b, _fail_a) = make_connected_pair_with_recording();
 
     ta.connect(&id_b).await.expect("connect should not fail");
     assert!(

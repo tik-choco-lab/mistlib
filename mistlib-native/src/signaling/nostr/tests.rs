@@ -121,7 +121,7 @@ async fn room_switch_clears_discovery_and_dedupe() {
 }
 
 #[tokio::test]
-async fn reset_session_rotates_identity_clears_state_and_republishes_discovery() {
+async fn reset_session_rotates_identity_resubscribes_and_republishes_discovery() {
     let signaler = NostrSignaler::new(NodeId("alice".to_string()), config());
     let (relay_tx, mut relay_rx) = mpsc::channel(8);
     signaler.senders.lock().await.push(relay_tx);
@@ -147,6 +147,39 @@ async fn reset_session_rotates_identity_clears_state_and_republishes_discovery()
         .active_pubkeys()
         .is_empty());
     assert!(signaler.dedupe.lock().await.check_and_insert("event-id"));
+
+    let discovery_req = relay_rx
+        .recv()
+        .await
+        .expect("reset refreshes the discovery subscription");
+    let message_req = relay_rx
+        .recv()
+        .await
+        .expect("reset refreshes the directed-message subscription");
+    let discovery_req_value: serde_json::Value = serde_json::from_str(&discovery_req).unwrap();
+    let message_req_value: serde_json::Value = serde_json::from_str(&message_req).unwrap();
+    assert_eq!(
+        discovery_req_value.as_array().unwrap()[0].as_str(),
+        Some("REQ")
+    );
+    assert_eq!(
+        message_req_value.as_array().unwrap()[0].as_str(),
+        Some("REQ")
+    );
+    let directed_pubkeys = message_req_value.as_array().unwrap()[2]["#p"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        directed_pubkeys.contains(&new_pubkey.as_str()),
+        "the replacement message filter must subscribe to the rotated pubkey"
+    );
+    assert!(
+        !directed_pubkeys.contains(&old_pubkey.as_str()),
+        "the replacement message filter must stop subscribing to the dead pubkey"
+    );
 
     let frame = relay_rx.recv().await.expect("reset publishes discovery");
     let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
@@ -568,6 +601,56 @@ async fn reconnect_resubscribes_active_room_after_relay_disconnect() {
     signaler.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn reconnect_survives_failed_handshakes_and_restores_subscriptions() {
+    use futures_util::StreamExt;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        // Receiving the initial subscription ensures connect has completed.
+        ws.next().await.unwrap().unwrap();
+        ws.close(None).await.unwrap();
+        drop(ws);
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream); // Fail the WebSocket handshake, not just a live socket.
+        }
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.push(
+                ws.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        frames
+    });
+    let mut cfg = config();
+    cfg.relays = vec![format!("ws://{addr}")];
+    let signaler = NostrSignaler::new(NodeId("retry-audit".into()), cfg);
+    signaler.set_room_id("retry-room").await.unwrap();
+    let (tx, _rx) = mpsc::channel(8);
+    signaler.connect(tx).await.unwrap();
+    let result = timeout(Duration::from_secs(10), server).await;
+    signaler.close().await.unwrap();
+    let frames = result
+        .expect("relay reconnect must survive repeated handshake failures")
+        .unwrap();
+    assert!(frames[0].starts_with("[\"REQ\""));
+    assert!(frames[1].starts_with("[\"REQ\""));
+    assert!(frames[2].starts_with("[\"EVENT\""));
+}
+
 /// Extracts the subscription id (second array element) from a raw
 /// `["REQ", "<id>", ...]` / `["CLOSED", "<id>", ...]` relay frame.
 fn extract_sub_id(frame: &str) -> String {
@@ -844,7 +927,7 @@ mod security;
 mod topology;
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_relay_accepts_signed_discovery_event() {
     use futures_util::{SinkExt, StreamExt};
     use mistlib_core::signaling::nostr::{
@@ -906,7 +989,7 @@ async fn live_relay_accepts_signed_discovery_event() {
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_exchanges_nostr_signaling() {
     let ids = LiveIds::generate();
     let alice = NostrSignaler::new(ids.alice.clone(), config());
@@ -1005,7 +1088,7 @@ async fn wait_any_discovery_binding(
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_reconnects_rejoined_node_with_same_id() {
     let ids = LiveIds::generate();
     let alice = NostrSignaler::new(ids.alice.clone(), config());
@@ -1118,7 +1201,7 @@ async fn live_go_relay_reconnects_rejoined_node_with_same_id() {
 }
 
 #[tokio::test]
-#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
+#[ignore = "requires `just nostr relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_reconnects_rejoined_node_with_same_id_among_four_nodes() {
     let run_id = random_subscription_id();
     let room_id = format!("nostr-live-four-rejoin-room-{run_id}");

@@ -573,24 +573,13 @@ impl Peer {
                             .unwrap_or_else(|e| e.into_inner())
                             .remove_node(&remote_id_state);
                     }
-                    // Every other path that removes a peer for good routes
-                    // through `Peer::close_all`, which drains `send_queue`
-                    // itself -- this arm is the one exception (the ICE
-                    // transport is already Failed/Closed, so there's nothing
-                    // left worth calling `.close()` on). `peer_state` is
-                    // this closure's own clone of the same `Arc<Peer>` just
-                    // removed from `peers_state` above, so clear its queue
-                    // explicitly here instead of relying on an eventual
-                    // `Drop` to free it silently.
-                    let dropped = peer_state.clear_send_queue();
-                    if dropped > 0 {
-                        tracing::warn!(
-                            "Dropping {} queued reliable message(s) for {} (ICE {:?})",
-                            dropped,
-                            remote_id_state.0,
-                            state
-                        );
-                    }
+                    // Detach every forgotten browser callback and close the
+                    // DataChannels even though ICE itself is already terminal.
+                    // Besides draining the send queue, this breaks the
+                    // Peer -> RTCPeerConnection -> callback -> Peer reference
+                    // cycle and prevents terminal peers from continuing to
+                    // emit candidates or media events after removal.
+                    peer_state.close_all(&remote_id_state);
                     // The Sweeper skips isolation-recovery when the peer is already
                     // gone from the map, so we trigger it here directly.
                     crate::app::emit_peer_disconnected(
@@ -613,15 +602,32 @@ impl Peer {
         let remote_id_cand = remote_id.clone();
         let room_id_cb = room_id.clone();
         let candidate_delivery_cb = candidate_delivery.clone();
+        let peers_candidate = peers.clone();
+        let peer_candidate = self.clone();
         let next_candidate_sequence = Arc::new(AtomicU32::new(0));
 
         let onicecandidate = Closure::wrap(Box::new(move |ev: RtcPeerConnectionIceEvent| {
+            let is_current = {
+                let peers = peers_candidate.read().unwrap_or_else(|e| e.into_inner());
+                peers
+                    .get(&remote_id_cand)
+                    .is_some_and(|current| Arc::ptr_eq(current, &peer_candidate))
+            };
+            if !is_current {
+                tracing::debug!(
+                    "Ignoring stale ICE candidate callback from {}",
+                    remote_id_cand.0
+                );
+                return;
+            }
             if let Some(candidate) = ev.candidate() {
                 let signaler = signaler_cb.clone();
                 let local_id = local_id_cb.clone();
                 let remote_id = remote_id_cand.clone();
                 let room_id = room_id_cb.clone();
                 let delivery = candidate_delivery_cb.clone();
+                let peers = peers_candidate.clone();
+                let peer = peer_candidate.clone();
                 let sequence = next_candidate_sequence.fetch_add(1, Ordering::Relaxed);
                 wasm_bindgen_futures::spawn_local(async move {
                     let cand_json = candidate.to_json();
@@ -629,6 +635,25 @@ impl Peer {
                         .unwrap_or_default()
                         .as_string()
                         .unwrap_or_default();
+
+                    // The peer can be replaced after the synchronous event
+                    // handler queued this future. Do not let work already in
+                    // the executor re-create delivery state and signal an ICE
+                    // candidate belonging to the old generation.
+                    let is_current = {
+                        let peers = peers.read().unwrap_or_else(|e| e.into_inner());
+                        peers
+                            .get(&remote_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &peer))
+                    };
+                    if !is_current {
+                        tracing::debug!(
+                            "Ignoring queued stale ICE candidate from {} generation={}",
+                            remote_id.0,
+                            candidate_generation
+                        );
+                        return;
+                    }
 
                     if sequence >= MAX_TRACKED_CANDIDATES_PER_NODE as u32 {
                         tracing::warn!(

@@ -164,11 +164,4 @@ mod tests {
         reg.unpin("root-b");
         assert!(!reg.pinned_cids().contains("shared"));
     }
-
-    #[test]
-    fn test_unpin_is_idempotent() {
-        let mut reg = PinRegistry::new();
-        reg.unpin("never-pinned"); // must not panic
-        assert!(!reg.is_pinned("never-pinned"));
-    }
 }

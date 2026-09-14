@@ -191,6 +191,10 @@ pub mod isolation;
 mod media;
 pub mod message_guard;
 pub mod negotiation_delivery;
+mod offer_failure;
+#[cfg(test)]
+#[path = "webrtc/offer_failure_tests.rs"]
+mod offer_failure_tests;
 pub mod offer_guard;
 pub mod peer;
 pub mod pending_candidates;
@@ -207,6 +211,7 @@ use message_guard::{check_message_size, SizeCheck};
 use negotiation_delivery::{
     NegotiationDelivery, TrackStatus as NegotiationTrackStatus, NEGOTIATION_RETRY_DELAYS_MS,
 };
+use offer_failure::{should_rebuild_after_offer_failure, OfferApplyOutcome};
 use offer_guard::{
     active_connection_count, create_failure_rollback, offer_action_for_snapshot, OfferAction,
     OfferCreateFailureRollback, SignalingSnapshot,
@@ -1444,7 +1449,7 @@ impl WasmWebRtcTransport {
         // The epoch itself is kept (not just the bool) so it can be stamped
         // into `peer_epochs` below once the resulting peer is actually built
         // -- see `peer_epochs`' field doc.
-        let remote_restarted_epoch = self.take_remote_restarted(&remote_id);
+        let mut remote_restarted_epoch = self.take_remote_restarted(&remote_id);
         let signaling_snapshot = existing_peer
             .as_ref()
             .map(|peer| match peer.pc.signaling_state() {
@@ -1480,41 +1485,64 @@ impl WasmWebRtcTransport {
             action
         };
 
+        // Retry this same offer once on a fresh PC only if the known transport
+        // role error also prevented rollback. All ordinary failures propagate.
+        let mut retained_candidates = None;
+        let action = if matches!(
+            action,
+            OfferAction::YieldAndApply | OfferAction::ApplyInPlace
+        ) {
+            let peer = existing_peer
+                .as_ref()
+                .expect("in-place offer requires a peer");
+            match self
+                .apply_offer_in_place(remote_id.clone(), payload.clone(), peer.clone())
+                .await?
+            {
+                OfferApplyOutcome::Applied => return Ok(true),
+                OfferApplyOutcome::Rebuild => {
+                    // An awaited browser operation may have overlapped a rejoin.
+                    // Never tear down the replacement installed by that rejoin.
+                    let is_current = self
+                        .peers
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&remote_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, peer));
+                    if !is_current {
+                        return Ok(false);
+                    }
+                    remote_restarted_epoch = self
+                        .peer_epochs
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&remote_id)
+                        .copied();
+                    // Preserve queued candidates for the offer we are retrying,
+                    // unlike a detected remote-session restart.
+                    retained_candidates = self
+                        .pending_candidates
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take(&remote_id);
+                    tracing::warn!("Rebuilding peer {} after offer transport-role failure and unsuccessful rollback", remote_id.0);
+                    OfferAction::ReplacePeer
+                }
+            }
+        } else {
+            action
+        };
+
         let newly_reserved = match action {
-            OfferAction::YieldAndApply => {
-                // Perfect negotiation: we have our own offer in flight on
-                // this peer (HaveLocalOffer) and an inbound offer just
-                // crossed it. wasm is unconditionally polite -- yield rather
-                // than ignore (see `offer_guard::OfferAction::YieldAndApply`
-                // for the full reasoning, including why this can't be
-                // conditioned on peer id the way textbook perfect
-                // negotiation is: the native peer we're most likely racing
-                // against can never roll back its own offer). Routed through
-                // `apply_offer_in_place`, which now accepts `HaveLocalOffer`
-                // as well as `Stable`: `set_remote_description` with an
-                // offer while `HaveLocalOffer` is Chrome's spec-mandated
-                // implicit rollback, so the same
-                // set_remote_description -> create_answer ->
-                // set_local_description sequence applies unmodified.
-                tracing::info!(
-                    "[Perfect negotiation] yielding our in-flight offer to {}'s crossed offer",
-                    remote_id.0
-                );
-                let peer = existing_peer
-                    .expect("YieldAndApply is only returned when an existing peer was found");
-                return self
-                    .apply_offer_in_place(remote_id, payload, peer)
-                    .await
-                    .map(|_| true);
+            OfferAction::YieldAndApply | OfferAction::ApplyInPlace => {
+                unreachable!("in-place offers handled above");
             }
             OfferAction::ReplacePeer => {
-                // The existing `RTCPeerConnection` belongs to a session of
-                // `remote_id` that no longer exists (see `OfferAction::ReplacePeer`'s
-                // doc) -- tear it down completely rather than renegotiating
-                // it, then fall through to the same create-from-scratch path
-                // `Accept` uses below.
+                // The old connection belongs to a previous remote session,
+                // or could not recover from the specific transport-role error.
+                // Both use the existing create-from-scratch path below.
                 tracing::info!(
-                    "Replacing stale peer connection for {} after detected restart",
+                    "Replacing peer connection for {} after restart or unrecoverable offer failure",
                     remote_id.0
                 );
                 // Same teardown `RequestAction::CleanupAndConnect` uses
@@ -1557,14 +1585,6 @@ impl WasmWebRtcTransport {
                 );
                 return Ok(false);
             }
-            OfferAction::ApplyInPlace => {
-                let peer = existing_peer
-                    .expect("ApplyInPlace is only returned when an existing peer was found");
-                return self
-                    .apply_offer_in_place(remote_id, payload, peer)
-                    .await
-                    .map(|_| true);
-            }
             OfferAction::DeferTransient => {
                 // A transient signaling state on a *live* peer (e.g. the
                 // polite side mid-glare, or our own answer to an earlier
@@ -1600,6 +1620,16 @@ impl WasmWebRtcTransport {
                 )));
             }
         };
+
+        if let Some(candidates) = retained_candidates {
+            let mut pending = self
+                .pending_candidates
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for candidate in candidates {
+                pending.push(remote_id.clone(), candidate);
+            }
+        }
 
         let old_peer = {
             let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
@@ -1727,7 +1757,9 @@ impl WasmWebRtcTransport {
     /// caller/next attempt to sort out. It does, however, take
     /// `Peer::negotiating` for the whole sequence (same as
     /// `renegotiate_peer`, to close the race between the two) and roll the
-    /// *signaling* state back to `Stable` on failure, so a rejected answer
+    /// *signaling* state back to `Stable` on failure. The specific transport-role
+    /// error with unsuccessful rollback returns `Rebuild` to the caller instead.
+    /// Normally this means a rejected answer
     /// doesn't leave the peer permanently stuck failing every later
     /// negotiation attempt's "signaling state is not stable" precondition.
     ///
@@ -1748,7 +1780,7 @@ impl WasmWebRtcTransport {
         remote_id: NodeId,
         payload: String,
         peer: Arc<Peer>,
-    ) -> mistlib_core::error::Result<()> {
+    ) -> mistlib_core::error::Result<OfferApplyOutcome> {
         let _negotiating = peer.negotiating.lock().await;
 
         // `handle_offer`'s `Stable`/`HaveLocalOffer` snapshot that routed
@@ -1796,8 +1828,19 @@ impl WasmWebRtcTransport {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            rollback_to_stable_on_failure(&peer, &remote_id, &room_id).await;
-            return Err(mistlib_core::error::MistError::Internal(format!("{:?}", e)));
+            let stable = rollback_to_stable_on_failure(&peer, &remote_id, &room_id).await;
+            let error = format!("{:?}", e);
+            if should_rebuild_after_offer_failure(&error, stable)
+                && peer.pc.signaling_state() != RtcSignalingState::Closed
+            {
+                tracing::warn!(
+                    "Offer failed for {} and rollback did not recover: {}",
+                    remote_id.0,
+                    error
+                );
+                return Ok(OfferApplyOutcome::Rebuild);
+            }
+            return Err(mistlib_core::error::MistError::Internal(error));
         }
 
         let answer = match JsFuture::from(peer.pc.create_answer()).await {
@@ -1865,7 +1908,7 @@ impl WasmWebRtcTransport {
             });
         }
 
-        Ok(())
+        Ok(OfferApplyOutcome::Applied)
     }
 }
 
@@ -2179,7 +2222,11 @@ async fn trigger_ice_restart(
 /// rollback call itself can fail too (e.g. the connection is already
 /// closing) -- that's logged and swallowed, since the original error is what
 /// the caller should see and act on.
-async fn rollback_to_stable_on_failure(peer: &Arc<Peer>, remote_id: &NodeId, room_id: &str) {
+async fn rollback_to_stable_on_failure(
+    peer: &Arc<Peer>,
+    remote_id: &NodeId,
+    room_id: &str,
+) -> bool {
     let pc = &peer.pc;
     let signaling_state = pc.signaling_state();
     let rollback = RtcSessionDescriptionInit::new(RtcSdpType::Rollback);
@@ -2228,9 +2275,11 @@ async fn rollback_to_stable_on_failure(peer: &Arc<Peer>, remote_id: &NodeId, roo
     // spawn-not-await pattern as the other three: every caller here still
     // holds `Peer::negotiating` at this point, and `reconcile_peer_tracks` ->
     // `renegotiate_peer` needs to take that same lock.
-    if peer
-        .needs_track_reconcile
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    let stable = pc.signaling_state() == RtcSignalingState::Stable;
+    if stable
+        && peer
+            .needs_track_reconcile
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
         let remote_id = remote_id.clone();
         let room_id = room_id.to_string();
@@ -2241,6 +2290,7 @@ async fn rollback_to_stable_on_failure(peer: &Arc<Peer>, remote_id: &NodeId, roo
             transport.reconcile_peer_tracks(&remote_id).await;
         });
     }
+    stable
 }
 
 fn sdp_from_signaling_payload(payload: &str) -> String {

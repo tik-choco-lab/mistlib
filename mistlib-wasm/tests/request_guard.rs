@@ -15,107 +15,92 @@ fn snapshot(state: Option<ConnectionState>) -> RequestState {
 }
 
 #[test]
-fn connected_with_open_data_channel_is_ignored() {
-    let mut snapshot = snapshot(Some(ConnectionState::Connected));
-    snapshot.peer_exists = true;
-    snapshot.has_open_data_channel = true;
+fn chooses_action_from_the_current_connection_snapshot() {
+    let mut connected_and_open = snapshot(Some(ConnectionState::Connected));
+    connected_and_open.peer_exists = true;
+    connected_and_open.has_open_data_channel = true;
 
-    assert_eq!(request_action_for_snapshot(snapshot), RequestAction::Ignore);
+    let mut connecting_with_attempt = snapshot(Some(ConnectionState::Connecting));
+    connecting_with_attempt.has_attempt = true;
+
+    let mut reconnecting_with_attempt = snapshot(Some(ConnectionState::Reconnecting));
+    reconnecting_with_attempt.has_attempt = true;
+
+    let cases = [
+        (
+            "connected with open channel",
+            connected_and_open,
+            RequestAction::Ignore,
+        ),
+        (
+            "connected without peer",
+            snapshot(Some(ConnectionState::Connected)),
+            RequestAction::CleanupAndConnect,
+        ),
+        (
+            "connecting with attempt",
+            connecting_with_attempt,
+            RequestAction::Ignore,
+        ),
+        (
+            "connecting without attempt",
+            snapshot(Some(ConnectionState::Connecting)),
+            RequestAction::CleanupAndConnect,
+        ),
+        (
+            "reconnecting with attempt",
+            reconnecting_with_attempt,
+            RequestAction::Ignore,
+        ),
+        (
+            "reconnecting without attempt",
+            snapshot(Some(ConnectionState::Reconnecting)),
+            RequestAction::CleanupAndConnect,
+        ),
+        (
+            "failed",
+            snapshot(Some(ConnectionState::Failed)),
+            RequestAction::CleanupAndConnect,
+        ),
+        (
+            "disconnected",
+            snapshot(Some(ConnectionState::Disconnected)),
+            RequestAction::Connect,
+        ),
+        ("missing state", snapshot(None), RequestAction::Connect),
+    ];
+
+    for (name, snapshot, expected) in cases {
+        assert_eq!(
+            request_action_for_snapshot(snapshot),
+            expected,
+            "case: {name}"
+        );
+    }
 }
 
 #[test]
-fn connected_without_peer_is_cleaned_before_connecting() {
-    assert_eq!(
-        request_action_for_snapshot(snapshot(Some(ConnectionState::Connected))),
-        RequestAction::CleanupAndConnect
-    );
-}
+fn remote_restart_overrides_all_stale_local_snapshots() {
+    // A stale Connected peer can keep an Open DataChannel for tens of seconds
+    // after the remote reloads. Once signaling reports that restart, every
+    // local snapshot must clean up and reconnect.
+    let mut connected_and_open = snapshot(Some(ConnectionState::Connected));
+    connected_and_open.peer_exists = true;
+    connected_and_open.has_open_data_channel = true;
 
-#[test]
-fn connecting_with_attempt_is_ignored() {
-    let mut snapshot = snapshot(Some(ConnectionState::Connecting));
-    snapshot.has_attempt = true;
+    let mut connecting_with_attempt = snapshot(Some(ConnectionState::Connecting));
+    connecting_with_attempt.has_attempt = true;
 
-    assert_eq!(request_action_for_snapshot(snapshot), RequestAction::Ignore);
-}
-
-#[test]
-fn connecting_without_attempt_is_cleaned_before_connecting() {
-    assert_eq!(
-        request_action_for_snapshot(snapshot(Some(ConnectionState::Connecting))),
-        RequestAction::CleanupAndConnect
-    );
-}
-
-#[test]
-fn reconnecting_uses_same_attempt_guard_as_connecting() {
-    let mut snapshot = snapshot(Some(ConnectionState::Reconnecting));
-    assert_eq!(
-        request_action_for_snapshot(snapshot),
-        RequestAction::CleanupAndConnect
-    );
-
-    snapshot.has_attempt = true;
-    assert_eq!(request_action_for_snapshot(snapshot), RequestAction::Ignore);
-}
-
-#[test]
-fn disconnected_or_missing_state_connects_without_cleanup() {
-    assert_eq!(
-        request_action_for_snapshot(snapshot(Some(ConnectionState::Disconnected))),
-        RequestAction::Connect
-    );
-    assert_eq!(
-        request_action_for_snapshot(snapshot(None)),
-        RequestAction::Connect
-    );
-}
-
-#[test]
-fn failed_state_is_cleaned_before_connecting() {
-    assert_eq!(
-        request_action_for_snapshot(snapshot(Some(ConnectionState::Failed))),
-        RequestAction::CleanupAndConnect
-    );
-}
-
-#[test]
-fn remote_restarted_overrides_connected_with_open_data_channel() {
-    // This is the exact bug: previously a stale Connected peer with an Open
-    // DataChannel caused the Request to be ignored for tens of seconds after
-    // the remote actually reloaded. Once the signaling layer tells us the
-    // remote restarted, that cached view is known-stale and must not
-    // suppress the reconnect.
-    let mut snapshot = snapshot(Some(ConnectionState::Connected));
-    snapshot.peer_exists = true;
-    snapshot.has_open_data_channel = true;
-    snapshot.remote_restarted = true;
-
-    assert_eq!(
-        request_action_for_snapshot(snapshot),
-        RequestAction::CleanupAndConnect
-    );
-}
-
-#[test]
-fn remote_restarted_overrides_connecting_with_attempt() {
-    let mut snapshot = snapshot(Some(ConnectionState::Connecting));
-    snapshot.has_attempt = true;
-    snapshot.remote_restarted = true;
-
-    assert_eq!(
-        request_action_for_snapshot(snapshot),
-        RequestAction::CleanupAndConnect
-    );
-}
-
-#[test]
-fn remote_restarted_with_no_state_still_cleans_up_and_connects() {
-    let mut snapshot = snapshot(None);
-    snapshot.remote_restarted = true;
-
-    assert_eq!(
-        request_action_for_snapshot(snapshot),
-        RequestAction::CleanupAndConnect
-    );
+    for (name, mut snapshot) in [
+        ("connected with open channel", connected_and_open),
+        ("connecting with attempt", connecting_with_attempt),
+        ("missing state", snapshot(None)),
+    ] {
+        snapshot.remote_restarted = true;
+        assert_eq!(
+            request_action_for_snapshot(snapshot),
+            RequestAction::CleanupAndConnect,
+            "case: {name}"
+        );
+    }
 }

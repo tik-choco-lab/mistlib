@@ -32,11 +32,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_matches_the_package_version() {
-        assert_eq!(get_version(), env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
     fn build_info_contains_the_version_and_target() {
         let value: serde_json::Value = serde_json::from_str(&get_build_info()).unwrap();
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));

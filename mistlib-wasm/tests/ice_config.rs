@@ -13,88 +13,60 @@ fn ice_server(urls: &[&str], username: Option<&str>, credential: Option<&str>) -
 }
 
 #[test]
-fn passes_through_a_plain_stun_server() {
-    let servers = [ice_server(&["stun:stun.l.google.com:19302"], None, None)];
-
-    let plans = build_ice_server_plans(&servers);
+fn preserves_urls_credentials_and_input_order() {
+    let servers = [
+        ice_server(&["stun:a.example.com", "stun:b.example.com"], None, None),
+        ice_server(
+            &["turn:turn.example.com:3478"],
+            Some("alice"),
+            Some("s3cr3t"),
+        ),
+    ];
 
     assert_eq!(
-        plans,
-        vec![IceServerPlan {
-            urls: vec!["stun:stun.l.google.com:19302".to_string()],
-            username: None,
-            credential: None,
-        }]
+        build_ice_server_plans(&servers),
+        vec![
+            IceServerPlan {
+                urls: vec![
+                    "stun:a.example.com".to_string(),
+                    "stun:b.example.com".to_string(),
+                ],
+                username: None,
+                credential: None,
+            },
+            IceServerPlan {
+                urls: vec!["turn:turn.example.com:3478".to_string()],
+                username: Some("alice".to_string()),
+                credential: Some("s3cr3t".to_string()),
+            },
+        ]
     );
 }
 
 #[test]
-fn keeps_turn_credentials() {
-    let servers = [ice_server(
-        &["turn:turn.example.com:3478"],
-        Some("alice"),
-        Some("s3cr3t"),
-    )];
-
-    let plans = build_ice_server_plans(&servers);
-
-    assert_eq!(plans[0].username.as_deref(), Some("alice"));
-    assert_eq!(plans[0].credential.as_deref(), Some("s3cr3t"));
-}
-
-#[test]
-fn drops_entries_with_no_urls() {
-    let servers = [ice_server(&[], None, None)];
-
-    assert!(build_ice_server_plans(&servers).is_empty());
-}
-
-#[test]
-fn respects_an_explicitly_empty_list() {
-    assert!(build_ice_server_plans(&[]).is_empty());
-}
-
-#[test]
-fn drops_credential_less_turn_entry() {
-    // Browsers throw InvalidAccessError at RTCPeerConnection construction
-    // for a turn/turns URL without credentials, which would fail every
-    // connection attempt in the session.
+fn filters_invalid_entries_without_discarding_valid_servers() {
+    // Browsers reject credential-less TURN entries at PeerConnection
+    // construction, so one invalid entry must not poison the whole config.
     let servers = [
+        ice_server(&[], None, None),
         ice_server(&["turn:turn.example.com:3478"], None, None),
         ice_server(&["stun:stun.example.com:19302"], None, None),
+        ice_server(&["turn:valid.example.com"], Some("u"), Some("p")),
     ];
 
-    let plans = build_ice_server_plans(&servers);
-
-    assert_eq!(plans.len(), 1);
     assert_eq!(
-        plans[0].urls,
-        vec!["stun:stun.example.com:19302".to_string()]
+        build_ice_server_plans(&servers),
+        vec![
+            IceServerPlan {
+                urls: vec!["stun:stun.example.com:19302".to_string()],
+                username: None,
+                credential: None,
+            },
+            IceServerPlan {
+                urls: vec!["turn:valid.example.com".to_string()],
+                username: Some("u".to_string()),
+                credential: Some("p".to_string()),
+            },
+        ]
     );
-}
-
-#[test]
-fn preserves_multiple_urls_on_one_server() {
-    let servers = [ice_server(
-        &["stun:a.example.com", "stun:b.example.com"],
-        None,
-        None,
-    )];
-
-    let plans = build_ice_server_plans(&servers);
-
-    assert_eq!(plans[0].urls.len(), 2);
-}
-
-#[test]
-fn drops_only_the_empty_entry_among_several() {
-    let servers = [
-        ice_server(&["stun:a.example.com"], None, None),
-        ice_server(&[], None, None),
-        ice_server(&["turn:b.example.com"], Some("u"), Some("p")),
-    ];
-
-    let plans = build_ice_server_plans(&servers);
-
-    assert_eq!(plans.len(), 2);
 }

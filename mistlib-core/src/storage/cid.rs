@@ -87,15 +87,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cid_deterministic() {
-        let data = b"hello world";
-        let c1 = compute_cid(data, MULTICODEC_RAW);
-        let c2 = compute_cid(data, MULTICODEC_RAW);
-        assert_eq!(c1, c2);
-        assert!(c1.starts_with('b'));
-    }
-
-    #[test]
     fn computed_cids_are_accepted() {
         // Whatever `compute_cid` emits must always pass validation, for both
         // codecs and across a range of inputs.

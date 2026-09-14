@@ -58,7 +58,7 @@ const SEND_QUEUE_POLL_INTERVAL_MS: u64 = 20;
 /// dropped (as it always was): nothing here changes the fire-and-forget
 /// contract, it just makes a single blip far less likely to be the thing
 /// that drops the message.
-const SIGNALING_SEND_RETRY_ATTEMPTS: u32 = 3;
+pub(crate) const SIGNALING_SEND_RETRY_ATTEMPTS: u32 = 3;
 #[cfg(test)]
 const SIGNALING_SEND_RETRY_BACKOFF_MS: u64 = 5;
 #[cfg(not(test))]
@@ -143,9 +143,6 @@ async fn send_signaling_with_retry(
 enum IceRestartOutcome {
     /// The restart offer was applied locally and sent.
     Sent,
-    /// No live peer for this node -- retrying would not help, nothing to
-    /// restart.
-    NoPeer,
     /// A transient failure (non-`Stable` signaling state, a `create_offer`/
     /// `set_local_description` error, or a signaling send that failed even
     /// after its own bounded retry) -- worth retrying the whole sequence.
@@ -697,9 +694,38 @@ impl PeerSharedHandles {
     /// sweeper's full teardown-and-redial (`DISCONNECTED_GRACE_MS`) remains
     /// the final safety net.
     pub(crate) async fn try_ice_restart(&self, node: &NodeId) {
+        let peer = {
+            let peers = self.peers.read().await;
+            peers.get(node).cloned()
+        };
+        let Some(peer) = peer else {
+            tracing::debug!("[IceRestart] skip {}: no active peer", node);
+            return;
+        };
+
+        // Serialize the complete retry episode with ordinary offers and
+        // inbound-offer application. In particular, a failed signaling send
+        // leaves a valid local offer pending; no other negotiation may replace
+        // it between this loop's attempts.
+        let _negotiating = peer.negotiating.lock().await;
+        let mut pending_offer = None;
         for attempt in 1..=ICE_RESTART_RETRY_ATTEMPTS {
-            match self.try_ice_restart_once(node).await {
-                IceRestartOutcome::Sent | IceRestartOutcome::NoPeer => return,
+            let is_current = {
+                let peers = self.peers.read().await;
+                peers
+                    .get(node)
+                    .is_some_and(|current| Arc::ptr_eq(current, &peer))
+            };
+            if !is_current {
+                tracing::debug!("[IceRestart] stop {}: peer was superseded", node);
+                return;
+            }
+
+            match self
+                .try_ice_restart_once(node, &peer, &mut pending_offer)
+                .await
+            {
+                IceRestartOutcome::Sent => return,
                 IceRestartOutcome::Retryable => {
                     if attempt < ICE_RESTART_RETRY_ATTEMPTS {
                         let backoff_ms = super::backoff::exponential_backoff_ms(
@@ -733,18 +759,17 @@ impl PeerSharedHandles {
     /// from a stray offer, but here the entire point is to recover a
     /// connection that's already in trouble, so the same guard would just
     /// block the recovery it's meant to enable.
-    async fn try_ice_restart_once(&self, node: &NodeId) -> IceRestartOutcome {
-        let peer = {
-            let peers = self.peers.read().await;
-            peers.get(node).cloned()
-        };
-        let Some(peer) = peer else {
-            tracing::debug!("[IceRestart] skip {}: no active peer", node);
-            return IceRestartOutcome::NoPeer;
-        };
-
+    async fn try_ice_restart_once(
+        &self,
+        node: &NodeId,
+        peer: &Arc<Peer>,
+        pending_offer: &mut Option<MessageContent>,
+    ) -> IceRestartOutcome {
         let signaling_state = peer.pc.signaling_state();
-        if signaling_state != RTCSignalingState::Stable {
+        let resend_unsent_offer = pending_offer.is_some()
+            || (signaling_state == RTCSignalingState::HaveLocalOffer
+                && peer.local_offer_unsent.load(Ordering::SeqCst));
+        if signaling_state != RTCSignalingState::Stable && !resend_unsent_offer {
             tracing::debug!(
                 "[IceRestart] skip {}: signaling_state={:?}",
                 node,
@@ -753,42 +778,47 @@ impl PeerSharedHandles {
             return IceRestartOutcome::Retryable;
         }
 
-        let offer = match peer
-            .pc
-            .create_offer(Some(RTCOfferOptions {
-                ice_restart: true,
-                ..Default::default()
-            }))
-            .await
-        {
-            Ok(offer) => offer,
-            Err(err) => {
-                tracing::warn!("[IceRestart] create_offer failed for {}: {}", node, err);
+        if !resend_unsent_offer {
+            let offer = match peer
+                .pc
+                .create_offer(Some(RTCOfferOptions {
+                    ice_restart: true,
+                    ..Default::default()
+                }))
+                .await
+            {
+                Ok(offer) => offer,
+                Err(err) => {
+                    tracing::warn!("[IceRestart] create_offer failed for {}: {}", node, err);
+                    return IceRestartOutcome::Retryable;
+                }
+            };
+
+            if let Err(err) = peer.pc.set_local_description(offer).await {
+                tracing::warn!(
+                    "[IceRestart] set_local_description failed for {}: {}",
+                    node,
+                    err
+                );
                 return IceRestartOutcome::Retryable;
             }
-        };
-
-        if let Err(err) = peer.pc.set_local_description(offer).await {
-            tracing::warn!(
-                "[IceRestart] set_local_description failed for {}: {}",
-                node,
-                err
-            );
-            return IceRestartOutcome::Retryable;
         }
 
-        let Some(offer_desc) = peer.pc.local_description().await else {
-            tracing::warn!("[IceRestart] no local_description after set for {}", node);
-            return IceRestartOutcome::Retryable;
+        let msg = if let Some(msg) = pending_offer.as_ref() {
+            msg.clone()
+        } else {
+            let Some(offer_desc) = peer.pc.local_description().await else {
+                tracing::warn!("[IceRestart] no local_description after set for {}", node);
+                return IceRestartOutcome::Retryable;
+            };
+            MessageContent::Data(SignalingData {
+                sender_id: self.local_node_id.clone(),
+                receiver_id: node.clone(),
+                room_id: self.room_id.clone(),
+                data: offer_desc.sdp,
+                signaling_type: SignalingType::Offer,
+            })
         };
-
-        let msg = MessageContent::Data(SignalingData {
-            sender_id: self.local_node_id.clone(),
-            receiver_id: node.clone(),
-            room_id: self.room_id.clone(),
-            data: offer_desc.sdp,
-            signaling_type: SignalingType::Offer,
-        });
         // The send itself already gets its own short bounded retry (a
         // transient route-not-found/network blip shouldn't force a whole new
         // offer to be created) -- only fall back to this function's own
@@ -797,9 +827,17 @@ impl PeerSharedHandles {
             .await
             .is_err()
         {
+            // webrtc-rs cannot roll HaveLocalOffer back to Stable. Preserve
+            // the exact pending restart SDP and let the next bounded outer
+            // attempt resend it instead of trying to create a new offer from
+            // a non-Stable state.
+            peer.local_offer_unsent.store(true, Ordering::SeqCst);
+            *pending_offer = Some(msg);
             return IceRestartOutcome::Retryable;
         }
 
+        peer.local_offer_unsent.store(false, Ordering::SeqCst);
+        *pending_offer = None;
         tracing::info!("[IceRestart] sent restart offer to {}", node);
         IceRestartOutcome::Sent
     }

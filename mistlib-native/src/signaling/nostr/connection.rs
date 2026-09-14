@@ -78,32 +78,41 @@ impl NostrSignaler {
     ) {
         let signaler = self.clone();
         tokio::spawn(async move {
-            let mut attempt = 0_u32;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = &mut disconnected => {}
                 }
 
-                let delay = random_reconnect_backoff_delay(attempt);
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                attempt = attempt.saturating_add(1);
-
-                tracing::info!("NostrSignaler: reconnecting to {}", relay);
-                match signaler
-                    .connect_relay_once(&relay, incoming_tx.clone(), cancel.clone())
-                    .await
-                {
-                    Ok(next_disconnected) => {
-                        tracing::info!("NostrSignaler: reconnected to {}", relay);
-                        attempt = 0;
-                        disconnected = next_disconnected;
+                // Consume each disconnect notification once, then keep
+                // retrying until a new connection supplies a fresh receiver.
+                let mut attempt = 0_u32;
+                loop {
+                    let delay = random_reconnect_backoff_delay(attempt);
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(delay) => {}
                     }
-                    Err(err) => {
-                        tracing::warn!("NostrSignaler: reconnect to {} failed: {:?}", relay, err);
+                    attempt = attempt.saturating_add(1);
+
+                    tracing::info!("NostrSignaler: reconnecting to {}", relay);
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        result = signaler.connect_relay_once(&relay, incoming_tx.clone(), cancel.clone()) => result,
+                    };
+                    match result {
+                        Ok(next_disconnected) => {
+                            tracing::info!("NostrSignaler: reconnected to {}", relay);
+                            disconnected = next_disconnected;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "NostrSignaler: reconnect to {} failed: {:?}",
+                                relay,
+                                err
+                            );
+                        }
                     }
                 }
             }

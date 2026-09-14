@@ -291,6 +291,12 @@ impl Signaler for NostrSignaler {
         *self.rotated_identity.lock().await = Some(TemporarySignalingIdentity::generate());
         self.clear_session_state().await;
         *self.local_joined_at.lock().await = Some(current_unix_millis());
+        // `message_filter` contains the current identity pubkey in `#p`.
+        // Replace the relay-side REQ immediately after rotation; otherwise
+        // broadcast Requests still arrive while direct Answers/Candidates
+        // sent to the new identity are filtered out. Existing subscription
+        // ids are reused, so NIP-01 replaces the filters in place.
+        self.subscribe_room(&room_id).await?;
         self.spawn_discovery_refresh(room_id.clone());
         self.publish_discovery(&room_id).await
     }
