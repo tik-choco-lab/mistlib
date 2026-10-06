@@ -17,6 +17,95 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_test::wasm_bindgen_test;
 use web_time::Duration;
 
+#[wasm_bindgen_test(async)]
+async fn routed_request_does_not_cancel_identifying_reply() {
+    routed_request_preserves_reply("zzz", "aaa").await;
+}
+
+#[wasm_bindgen_test(async)]
+async fn routed_request_preserves_reply_with_lower_local_id() {
+    routed_request_preserves_reply("aaa", "zzz").await;
+}
+
+async fn routed_request_preserves_reply(local_id: &str, peer_id: &str) {
+    use mistlib_core::overlay::{ActionHandler, OverlayRouter, OverlayTransport};
+    use mistlib_core::signaling::{
+        RoutedSignaler, RoutedSignalingHandler, SignalingHandler, SignalingRoute,
+    };
+    use std::sync::Arc;
+    struct Noop;
+    impl ActionHandler for Noop {
+        fn handle_action(&self, _: mistlib_core::action::OverlayAction) {}
+    }
+    let local = Arc::new(WasmNostrSignaler::new(
+        NodeId(local_id.into()),
+        NostrSignalingConfig::default(),
+    ));
+    let peer = WasmNostrSignaler::new(NodeId(peer_id.into()), NostrSignalingConfig::default());
+    let room = "wasm-routed-request";
+    *local.room_id.lock().unwrap() = Some(room.into());
+    let router = Arc::new(OverlayRouter::new(
+        &mistlib_core::config::Config::new_default(),
+        Arc::new(std::sync::Mutex::new(
+            mistlib_core::overlay::node_store::NodeStore::new(),
+        )),
+        local.local_node_id.clone(),
+    ));
+    let overlay = Arc::new(OverlayTransport {
+        router,
+        action_handler: Arc::new(Noop),
+    });
+    let routes = Arc::new(RoutedSignaler::new(local.clone(), overlay));
+    let transport = Arc::new(crate::transport::webrtc::WasmWebRtcTransport::new(
+        routes.clone(),
+        local.local_node_id.clone(),
+    ));
+    transport.set_room_id(room.into());
+    let handler = RoutedSignalingHandler::new(routes, transport.clone(), SignalingRoute::WebSocket);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let event = build_message_event_with_sequence(
+        &peer.codec_config,
+        &peer.crypto,
+        &peer.identity,
+        &local.identity.public_key,
+        &discovery_signal(&peer.local_node_id, room),
+        1,
+    )
+    .unwrap();
+    local.process_event(event, &tx).unwrap();
+    handler
+        .handle_message(rx.recv().await.unwrap())
+        .await
+        .unwrap();
+    TimeoutFuture::new(300).await;
+    let pending = local
+        .exchanges
+        .lock()
+        .unwrap()
+        .pending(&peer.identity.public_key);
+    let queued = local
+        .exchanges
+        .lock()
+        .unwrap()
+        .is_queued(&peer.identity.public_key);
+    let attempted = local
+        .outgoing_sequences
+        .lock()
+        .unwrap()
+        .contains_key(&peer.identity.public_key);
+    transport.close_all_peer_connections();
+    local.close().await.unwrap();
+    assert!(
+        pending,
+        "production routing completed discovery on Request alone"
+    );
+    assert!(!queued, "identifying reply was never attempted");
+    assert!(
+        attempted,
+        "routed Request suppressed the paced initial identifying reply"
+    );
+}
+
 #[wasm_bindgen_test]
 fn nostr_message_subscription_uses_room_scope() {
     let config = NostrSignalingConfig::default();
@@ -38,6 +127,53 @@ fn nostr_message_subscription_uses_room_scope() {
     assert!(
         !actual_scopes.contains(&signaler.identity.public_key),
         "message subscription must use room scope, not the local Nostr pubkey"
+    );
+}
+
+#[wasm_bindgen_test(async)]
+async fn queued_ordinary_is_promoted_by_explicit_request() {
+    use mistlib_core::signaling::nostr::DiscoveryPriority;
+    let local = WasmNostrSignaler::new(NodeId("local".into()), NostrSignalingConfig::default());
+    let room = "wasm-queued-reply";
+    *local.room_id.lock().unwrap() = Some(room.into());
+    let live = WasmNostrSignaler::new(NodeId("live".into()), NostrSignalingConfig::default());
+    for i in 0..31 {
+        let ordinary = WasmNostrSignaler::new(
+            NodeId(format!("ordinary-{i}")),
+            NostrSignalingConfig::default(),
+        );
+        let key = &ordinary.identity.public_key;
+        assert!(local
+            .exchanges
+            .lock()
+            .unwrap()
+            .request(key, web_time::Instant::now()));
+        local.queue_request(key, room, DiscoveryPriority::Ordinary);
+    }
+    let key = &live.identity.public_key;
+    assert!(local
+        .exchanges
+        .lock()
+        .unwrap()
+        .request(key, web_time::Instant::now()));
+    local.queue_request(key, room, DiscoveryPriority::Ordinary);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let event = build_message_event_with_sequence(
+        &live.codec_config,
+        &live.crypto,
+        &live.identity,
+        &local.identity.public_key,
+        &discovery_signal(&live.local_node_id, room),
+        1,
+    )
+    .unwrap();
+    local.process_event(event, &tx).unwrap();
+    TimeoutFuture::new(1050).await;
+    let attempted = local.outgoing_sequences.lock().unwrap().contains_key(key);
+    local.close().await.unwrap();
+    assert!(
+        attempted,
+        "explicit reply stayed behind ordinary browser backlog"
     );
 }
 
@@ -1406,4 +1542,151 @@ fn env_string(name: &str) -> Option<String> {
         .ok()
         .and_then(|value| value.as_string())
         .filter(|value| !value.is_empty())
+}
+
+#[wasm_bindgen_test(async)]
+async fn nostr_bound_responder_retries_failed_reply_then_stops_on_sdp() {
+    let local = WasmNostrSignaler::new(NodeId("local".into()), NostrSignalingConfig::default());
+    let peer = WasmNostrSignaler::new(NodeId("peer".into()), NostrSignalingConfig::default());
+    let room = "wasm-discovery-retry";
+    *local.room_id.lock().unwrap() = Some(room.into());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    for (sequence, delay, expected_publishes) in [(1, 0, 1), (2, 0, 1), (3, 1550, 2)] {
+        TimeoutFuture::new(delay).await;
+        let event = build_message_event_with_sequence(
+            &peer.codec_config,
+            &peer.crypto,
+            &peer.identity,
+            &local.identity.public_key,
+            &discovery_signal(&peer.local_node_id, room),
+            sequence,
+        )
+        .unwrap();
+        // No open socket: a failed reply enqueue must remain pending.
+        local.process_event(event, &tx).unwrap();
+        TimeoutFuture::new(25).await;
+        assert_eq!(
+            local
+                .outgoing_sequences
+                .lock()
+                .unwrap()
+                .get(&peer.identity.public_key),
+            Some(&expected_publishes)
+        );
+    }
+    let offer = build_message_event_with_sequence(
+        &peer.codec_config,
+        &peer.crypto,
+        &peer.identity,
+        &local.identity.public_key,
+        &offer_signal(&peer.local_node_id, &local.local_node_id, room),
+        4,
+    )
+    .unwrap();
+    local.process_event(offer, &tx).unwrap();
+    assert!(local
+        .exchanges
+        .lock()
+        .unwrap()
+        .poll(web_time::Instant::now() + Duration::from_secs(100))
+        .is_empty());
+}
+
+#[wasm_bindgen_test(async)]
+async fn nostr_discovery_retry_state_is_cleared_on_room_switch_and_close() {
+    let local = WasmNostrSignaler::new(NodeId("local".into()), NostrSignalingConfig::default());
+    local.set_room_id("wasm-retry-room-a").unwrap();
+    local
+        .exchanges
+        .lock()
+        .unwrap()
+        .request("peer", web_time::Instant::now());
+    local.set_room_id("wasm-retry-room-b").unwrap();
+    assert!(local
+        .exchanges
+        .lock()
+        .unwrap()
+        .poll(web_time::Instant::now() + Duration::from_secs(100))
+        .is_empty());
+    local
+        .exchanges
+        .lock()
+        .unwrap()
+        .request("peer", web_time::Instant::now());
+    local.close().await.unwrap();
+    assert!(local
+        .exchanges
+        .lock()
+        .unwrap()
+        .poll(web_time::Instant::now() + Duration::from_secs(100))
+        .is_empty());
+}
+
+#[wasm_bindgen_test(async)]
+async fn nostr_outgoing_offer_keeps_repair_pending_and_target_pauses_retries() {
+    let local = WasmNostrSignaler::new(NodeId("local".into()), NostrSignalingConfig::default());
+    let peer = WasmNostrSignaler::new(NodeId("peer".into()), NostrSignalingConfig::default());
+    let room = "wasm-paced-repair";
+    *local.room_id.lock().unwrap() = Some(room.into());
+    local
+        .exchanges
+        .lock()
+        .unwrap()
+        .request(&peer.identity.public_key, web_time::Instant::now());
+    assert!(local
+        .publish_message_to_pubkey(
+            &peer.identity.public_key,
+            &offer_signal(&local.local_node_id, &peer.local_node_id, room)
+        )
+        .is_err());
+    assert!(local
+        .exchanges
+        .lock()
+        .unwrap()
+        .pending(&peer.identity.public_key));
+    TimeoutFuture::new(1550).await;
+    local.maintain_bootstrap(2).await;
+    TimeoutFuture::new(150).await;
+    assert_eq!(
+        local.outgoing_sequences.lock().unwrap()[&peer.identity.public_key],
+        1
+    );
+    local.close().await.unwrap();
+}
+
+#[wasm_bindgen_test(async)]
+async fn nostr_historical_requests_are_bounded_paced_and_cancelled() {
+    let local = WasmNostrSignaler::new(NodeId("local".into()), NostrSignalingConfig::default());
+    let room = "wasm-paced-history";
+    *local.room_id.lock().unwrap() = Some(room.into());
+    let mut keys = Vec::new();
+    for _ in 0..40 {
+        let peer = WasmNostrSignaler::new(NodeId("peer".into()), NostrSignalingConfig::default());
+        keys.push(peer.identity.public_key.clone());
+        local
+            .send_request_to_pubkey(&peer.identity.public_key, room)
+            .unwrap();
+    }
+    assert!(local.outgoing_sequences.lock().unwrap().is_empty());
+    assert!(
+        !local.exchanges.lock().unwrap().pending(&keys[0]),
+        "eviction released initial reservation"
+    );
+    assert!(local
+        .exchanges
+        .lock()
+        .unwrap()
+        .request(&keys[0], web_time::Instant::now()));
+    TimeoutFuture::new(950).await;
+    let sent = local.outgoing_sequences.lock().unwrap().len();
+    assert!(
+        (1..=10).contains(&sent),
+        "historical sends obey the shared 100ms minimum"
+    );
+    local.close().await.unwrap();
+    TimeoutFuture::new(950).await;
+    assert!(
+        local.outgoing_sequences.lock().unwrap().is_empty(),
+        "old worker cannot escape close"
+    );
 }

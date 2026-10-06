@@ -15,6 +15,8 @@ const SWEEPER_INTERVAL_MS: u64 = 10;
 #[cfg(not(test))]
 const SWEEPER_INTERVAL_MS: u64 = 2000;
 
+const BOOTSTRAP_MAINTENANCE_BUDGET: Duration = Duration::from_millis(100);
+
 /// Sweeper livelock fix: how long the no-peer-registered branch waits before
 /// treating a bare `Connecting`/`Reconnecting` reservation (a
 /// `connection_states` entry with nothing yet in `self.peers`) as abandoned
@@ -352,11 +354,33 @@ impl WebRtcTransport {
         let last_takeover_at = self.last_takeover_at.clone();
 
         tokio::spawn(async move {
+            let mut last_sweep = Instant::now();
             loop {
                 tokio::select! {
                     _ = cancel_for_task.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(SWEEPER_INTERVAL_MS)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(SWEEPER_INTERVAL_MS.min(1000))) => {}
                 }
+                let connected = handles
+                    .connection_states
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|state| **state == ConnectionState::Connected)
+                    .count();
+                // Bound relay backpressure and let shutdown interrupt an in-flight probe.
+                tokio::select! {
+                    biased;
+                    _ = cancel_for_task.cancelled() => break,
+                    _ = tokio::time::timeout(
+                        BOOTSTRAP_MAINTENANCE_BUDGET,
+                        handles.signaler.maintain_bootstrap(connected),
+                    ) => {}
+                }
+                // Bootstrap polls every second; keep the existing cleanup cadence.
+                if last_sweep.elapsed() < Duration::from_millis(SWEEPER_INTERVAL_MS) {
+                    continue;
+                }
+                last_sweep = Instant::now();
 
                 {
                     let ttl = Duration::from_millis(last_disconnect_ttl_ms);

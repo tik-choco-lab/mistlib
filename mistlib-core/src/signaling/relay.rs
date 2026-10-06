@@ -1,5 +1,5 @@
 use crate::overlay::OverlayTransport;
-use crate::signaling::{MessageContent, Signaler, SignalingHandler};
+use crate::signaling::{MessageContent, Signaler, SignalingHandler, SignalingType};
 use crate::types::NodeId;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -97,6 +97,10 @@ impl Signaler for RoutedSignaler {
         self.bootstrap.note_peer_alive(peer).await;
     }
 
+    async fn maintain_bootstrap(&self, connected_peers: usize) {
+        self.bootstrap.maintain_bootstrap(connected_peers).await;
+    }
+
     async fn reset_session(&self) -> crate::error::Result<()> {
         self.peer_routes
             .lock()
@@ -136,14 +140,14 @@ impl SignalingHandler for RoutedSignalingHandler {
     async fn handle_message(&self, msg: MessageContent) -> crate::error::Result<()> {
         if let MessageContent::Data(data) = &msg {
             self.routes.remember_route(&data.sender_id, self.ingress);
-            // Deliberately unconditional, not `if self.ingress == Overlay`.
-            // This is the one place both ingresses meet, and the bug this
-            // fixes was itself an ingress the refresh path had missed; adding
-            // another "this branch only" condition here would invite the same
-            // omission for the next transport. On the WebSocket ingress it
-            // duplicates the refresh the Nostr handler already does, which is
-            // harmless -- `touch_node` takes a `max()` of the existing expiry.
-            self.routes.note_peer_alive(&data.sender_id).await;
+            // Confirmed negotiation traffic refreshes both ingresses. Discovery
+            // alone must not complete the exchange that delivers our identity.
+            if !matches!(
+                data.signaling_type,
+                SignalingType::Request | SignalingType::Rejoin
+            ) {
+                self.routes.note_peer_alive(&data.sender_id).await;
+            }
         }
         self.inner.handle_message(msg).await
     }

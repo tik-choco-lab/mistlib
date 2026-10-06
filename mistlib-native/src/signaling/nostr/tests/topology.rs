@@ -32,7 +32,10 @@ async fn assert_direct_request_from(
     receiver_id: &NodeId,
     room_id: &str,
 ) {
-    let frame = rx.try_recv().expect("expected direct Request frame");
+    let frame = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .expect("expected direct Request frame");
     let event = event_from_published_frame(&frame);
     let decoded = decode_message_event(
         &sender.codec_config,

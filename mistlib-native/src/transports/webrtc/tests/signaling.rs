@@ -4,6 +4,179 @@ use mistlib_core::signaling::{MessageContent, SignalingData, SignalingHandler, S
 use mistlib_core::transport::Transport;
 use mistlib_core::types::{ConnectionState, NodeId};
 
+/// Both signaling ingresses can deliver the same Answer, and the wasm sender
+/// retries its transaction until the ACK arrives. Each delivery must succeed
+/// without replacing the peer or reapplying an already committed description.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_answers_are_idempotent_and_acknowledged() {
+    use webrtc::peer_connection::signaling_state::RTCSignalingState;
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<MessageContent>>);
+    #[async_trait]
+    impl Signaler for Recorder {
+        async fn send_signaling(&self, _: &NodeId, msg: MessageContent) -> MistResult<()> {
+            self.0.lock().unwrap().push(msg);
+            Ok(())
+        }
+        async fn close(&self) -> MistResult<()> {
+            Ok(())
+        }
+    }
+
+    let recorder = Arc::new(Recorder::default());
+    let transport = WebRtcTransport::new(recorder.clone(), NodeId("a".into()));
+    transport.set_room_id("answers".into());
+    let remote = NodeId("b".into());
+    let peer = transport.create_pc(remote.clone()).await.unwrap();
+    peer.pc.create_data_channel("reliable", None).await.unwrap();
+    transport
+        .peers
+        .write()
+        .await
+        .insert(remote.clone(), peer.clone());
+    let offer = peer.pc.create_offer(None).await.unwrap();
+    peer.pc.set_local_description(offer).await.unwrap();
+    let answerer = transport
+        .create_pc(NodeId("answerer".into()))
+        .await
+        .unwrap();
+    answerer
+        .pc
+        .set_remote_description(peer.pc.local_description().await.unwrap())
+        .await
+        .unwrap();
+    let answer = answerer.pc.create_answer(None).await.unwrap();
+    let mut gathered = answerer.pc.gathering_complete_promise().await;
+    answerer.pc.set_local_description(answer).await.unwrap();
+    let answer = answerer.pc.local_description().await.unwrap();
+    let message = MessageContent::Data(SignalingData {
+        sender_id: remote.clone(),
+        receiver_id: NodeId("a".into()),
+        room_id: "answers".into(),
+        signaling_type: SignalingType::Answer,
+        data: serde_json::to_string(&mistlib_core::signaling::NegotiationEnvelope {
+            id: 42,
+            sdp: answer.sdp.clone(),
+        })
+        .unwrap(),
+    });
+    let (first, concurrent) = tokio::join!(
+        transport.handle_message(message.clone()),
+        transport.handle_message(message.clone()),
+    );
+    first.expect("first answer");
+    concurrent.expect("concurrent duplicate answer");
+    transport
+        .handle_message(message)
+        .await
+        .expect("late duplicate answer");
+    assert_eq!(peer.pc.signaling_state(), RTCSignalingState::Stable);
+    assert!(Arc::ptr_eq(
+        transport.peers.read().await.get(&remote).unwrap(),
+        &peer
+    ));
+    let acks = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|msg| {
+            matches!(msg,
+                MessageContent::Data(data) if data.signaling_type == SignalingType::NegotiationAck
+            )
+        })
+        .count();
+    assert_eq!(
+        acks, 3,
+        "ACK every delivery so a lost ACK does not sustain retries"
+    );
+
+    // A native resend re-reads localDescription after ICE gathering.
+    tokio::time::timeout(std::time::Duration::from_secs(10), gathered.recv())
+        .await
+        .expect("ICE gathering completed");
+    let resent = answerer.pc.local_description().await.unwrap().sdp;
+    assert_ne!(answer.sdp, resent, "real localDescription growth");
+    assert!(resent.lines().any(|line| line.starts_with("a=candidate:")));
+    let remote_candidates_before = peer
+        .pc
+        .get_stats()
+        .await
+        .reports
+        .values()
+        .filter(|report| matches!(report, webrtc::stats::StatsReportType::RemoteCandidate(_)))
+        .count();
+    transport
+        .handle_answer(remote.clone(), resent.clone())
+        .await
+        .expect("candidate-augmented raw answer retransmission");
+    // The resend must recover candidates, not just suppress the warning.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let remote_candidates = peer
+                .pc
+                .get_stats()
+                .await
+                .reports
+                .values()
+                .filter(|report| {
+                    matches!(report, webrtc::stats::StatsReportType::RemoteCandidate(_))
+                })
+                .count();
+            if remote_candidates > remote_candidates_before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-delivered answer supplied remote ICE candidates");
+    let augmented_envelope = MessageContent::Data(SignalingData {
+        sender_id: remote.clone(),
+        receiver_id: NodeId("a".into()),
+        room_id: "answers".into(),
+        signaling_type: SignalingType::Answer,
+        data: serde_json::to_string(&mistlib_core::signaling::NegotiationEnvelope {
+            id: 43,
+            sdp: resent.clone(),
+        })
+        .unwrap(),
+    });
+    transport.handle_message(augmented_envelope).await.unwrap();
+    let acks = recorder.0.lock().unwrap().iter().filter(|msg| {
+        matches!(msg, MessageContent::Data(data) if data.signaling_type == SignalingType::NegotiationAck)
+    }).count();
+    assert_eq!(acks, 4, "ACK the candidate-augmented answer too");
+    transport
+        .handle_answer(remote.clone(), resent.replace("\r\n", "\n"))
+        .await
+        .expect("candidate-augmented answer with LF line endings");
+    assert_eq!(peer.pc.signaling_state(), RTCSignalingState::Stable);
+    assert_eq!(peer.pc.remote_description().await.unwrap().sdp, answer.sdp);
+    assert!(Arc::ptr_eq(
+        transport.peers.read().await.get(&remote).unwrap(),
+        &peer
+    ));
+    for field in ["a=ice-ufrag:", "a=fingerprint:"] {
+        assert!(resent.contains(field));
+        let changed = resent.replace(field, &format!("{field}changed"));
+        assert!(transport
+            .handle_answer(remote.clone(), changed)
+            .await
+            .is_err());
+    }
+
+    // Do not hide an unrelated answer or discard a pending offer. Only a
+    // re-delivery of the negotiation committed in Stable is idempotent.
+    let unrelated = answer.sdp.replace("s=-", "s=unrelated");
+    assert_ne!(unrelated, answer.sdp);
+    assert!(transport.handle_answer(remote, unrelated).await.is_err());
+    assert_eq!(peer.pc.signaling_state(), RTCSignalingState::Stable);
+    peer.close_all().await;
+    answerer.close_all().await;
+}
+
 // --- Rejoin ------------------------------------------------------------
 //
 // A node's Nostr signaling keypair regenerates on every restart while its
@@ -111,8 +284,8 @@ async fn failed_offer_send_rolls_back_instead_of_wedging_the_peer() {
     use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
     /// Like `disconnect::LoopbackSignaler`, but can be told to fail exactly
-    /// the next `send_signaling` call -- simulating `RoutedSignaler`
-    /// returning `RouteNotFound` for one specific send.
+    /// the next Offer send -- a concurrent trickled candidate must not
+    /// consume the failure intended for the renegotiation below.
     struct FlakySignaler {
         tx: mpsc::UnboundedSender<MessageContent>,
         fail_next: Arc<AtomicBool>,
@@ -121,7 +294,9 @@ async fn failed_offer_send_rolls_back_instead_of_wedging_the_peer() {
     #[async_trait]
     impl Signaler for FlakySignaler {
         async fn send_signaling(&self, to: &NodeId, msg: MessageContent) -> MistResult<()> {
-            if self.fail_next.swap(false, Ordering::SeqCst) {
+            if matches!(&msg, MessageContent::Data(data) if data.signaling_type == SignalingType::Offer)
+                && self.fail_next.swap(false, Ordering::SeqCst)
+            {
                 return Err(MistError::RouteNotFound(to.clone()));
             }
             let _ = self.tx.send(msg);
@@ -180,7 +355,7 @@ async fn failed_offer_send_rolls_back_instead_of_wedging_the_peer() {
     );
 
     // Simulate the exact production failure: the RoutedSignaler drops A's
-    // next signaling send (e.g. RouteNotFound because the overlay route to
+    // next Offer send (e.g. RouteNotFound because the overlay route to
     // B hasn't caught up with the connection that was *just* established).
     a_fail_next.store(true, Ordering::SeqCst);
 

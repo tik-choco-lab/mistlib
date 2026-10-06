@@ -46,6 +46,13 @@ impl Signaler for WasmBootstrapSignaler {
         }
     }
 
+    async fn maintain_bootstrap(&self, connected_peers: usize) {
+        match self {
+            Self::WebSocket(signaler) => signaler.maintain_bootstrap(connected_peers).await,
+            Self::Nostr(signaler) => signaler.maintain_bootstrap(connected_peers).await,
+        }
+    }
+
     async fn reset_session(&self) -> mistlib_core::error::Result<()> {
         match self {
             Self::WebSocket(signaler) => signaler.reset_session().await,

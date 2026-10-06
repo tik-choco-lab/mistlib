@@ -55,6 +55,10 @@ pub trait Signaler: HostSendSync {
     /// [`DiscoveryTable::touch_node`]: crate::signaling::nostr::DiscoveryTable::touch_node
     async fn note_peer_alive(&self, _peer: &NodeId) {}
 
+    /// Periodic bootstrap maintenance with the transport's actual connected
+    /// peer count. Default is inert; Nostr uses it for bounded alternate probes.
+    async fn maintain_bootstrap(&self, _connected_peers: usize) {}
+
     async fn close(&self) -> Result<()>;
 }
 

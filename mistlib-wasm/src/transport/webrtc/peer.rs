@@ -162,6 +162,10 @@ pub struct Peer {
     /// instead of re-reading a state snapshot that's already stale by the
     /// time it acts on it.
     pub negotiating: tokio::sync::Mutex<()>,
+    /// Original SDP of the last applied answer. Chrome adds trickled ICE
+    /// candidates to remoteDescription.sdp, so that getter cannot identify
+    /// an exact retransmission. Scoped to this Peer and replaced per answer.
+    pub applied_answer_sdp: Mutex<Option<String>>,
     /// Set when a track publish/unpublish changed this peer's senders but the
     /// follow-up renegotiation could not run (peer in ICE-disconnected
     /// recovery grace, transient non-`Stable` signaling, ...) -- see
@@ -204,6 +208,7 @@ impl Peer {
             buffered_amount_waiters: Arc::new(RwLock::new(HashMap::new())),
             reliable_send_gate: tokio::sync::Mutex::new(()),
             negotiating: tokio::sync::Mutex::new(()),
+            applied_answer_sdp: Mutex::new(None),
             needs_track_reconcile: std::sync::atomic::AtomicBool::new(false),
             negotiated_max_message_bytes: AtomicU32::new(0),
             send_queue: Mutex::new(SendQueue::default()),

@@ -5,6 +5,9 @@ use mistlib_core::signaling::nostr::{
     event_frame_json, next_outgoing_sequence as next_nostr_sequence, random_subscription_id,
     DedupeCache, DiscoveryTable, InvitePskCrypto, NostrCodecConfig, TemporarySignalingIdentity,
 };
+use mistlib_core::signaling::nostr::{
+    DiscoveryBootstrap, DiscoveryExchanges, DiscoveryOutbox, DiscoveryPriority, TARGET_PEERS,
+};
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingData, SignalingType};
 use mistlib_core::stats::STATS;
 use mistlib_core::types::NodeId;
@@ -16,6 +19,7 @@ use web_time::Duration;
 mod connection;
 mod handler;
 mod keepalive;
+mod pacing;
 mod refresh;
 mod relay_source;
 #[cfg(test)]
@@ -57,6 +61,11 @@ pub struct WasmNostrSignaler {
     sockets: Arc<Mutex<Vec<WebSocket>>>,
     room_id: Arc<Mutex<Option<String>>>,
     discovery_table: Arc<Mutex<DiscoveryTable>>,
+    bootstrap: Arc<Mutex<DiscoveryBootstrap>>,
+    exchanges: Arc<Mutex<DiscoveryExchanges>>,
+    outbox: Arc<Mutex<DiscoveryOutbox>>,
+    session_epoch: Arc<Mutex<u64>>,
+    connected_peers: Arc<Mutex<usize>>,
     dedupe: Arc<Mutex<DedupeCache>>,
     message_dedupe: Arc<Mutex<DedupeCache>>,
     outgoing_sequences: Arc<Mutex<HashMap<String, u64>>>,
@@ -93,6 +102,11 @@ impl WasmNostrSignaler {
             sockets: Arc::new(Mutex::new(Vec::new())),
             room_id: Arc::new(Mutex::new(None)),
             discovery_table: Arc::new(Mutex::new(DiscoveryTable::default())),
+            bootstrap: Arc::new(Mutex::new(DiscoveryBootstrap::default())),
+            exchanges: Arc::new(Mutex::new(DiscoveryExchanges::default())),
+            outbox: Arc::new(Mutex::new(DiscoveryOutbox::default())),
+            session_epoch: Arc::new(Mutex::new(0)),
+            connected_peers: Arc::new(Mutex::new(0)),
             dedupe: Arc::new(Mutex::new(DedupeCache::new(dedupe_ttl))),
             message_dedupe: Arc::new(Mutex::new(DedupeCache::new(dedupe_ttl))),
             outgoing_sequences: Arc::new(Mutex::new(HashMap::new())),
@@ -117,6 +131,15 @@ impl WasmNostrSignaler {
     }
 
     fn clear_session_state(&self) {
+        *self.session_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .connected_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
+        *self.outbox.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryOutbox::default();
+        tracing::info!("Nostr discovery retries stopped reason=session change");
+        *self.exchanges.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryExchanges::default();
+        *self.bootstrap.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryBootstrap::default();
         self.discovery_table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -158,6 +181,10 @@ impl WasmNostrSignaler {
     /// touch `discovery_table` itself — `bind_node_with_epoch` already
     /// removed the dead pubkey's `by_pubkey` entry as part of the rebind.
     pub(super) fn purge_peer_state(&self, pubkey: &str) {
+        self.exchanges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .progress(pubkey, web_time::Instant::now());
         self.requested_pubkeys
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -279,6 +306,23 @@ impl WasmNostrSignaler {
         receiver_pubkey: &str,
         room_id: &str,
     ) -> mistlib_core::error::Result<()> {
+        if !self
+            .exchanges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request(receiver_pubkey, web_time::Instant::now())
+        {
+            return Ok(());
+        }
+        self.queue_request(receiver_pubkey, room_id, DiscoveryPriority::Ordinary);
+        Ok(())
+    }
+
+    fn publish_reserved_request(
+        &self,
+        receiver_pubkey: &str,
+        room_id: &str,
+    ) -> mistlib_core::error::Result<()> {
         let request = SignalingData {
             sender_id: self.local_node_id.clone(),
             receiver_id: NodeId::broadcast(),
@@ -303,6 +347,17 @@ impl WasmNostrSignaler {
             }
         };
         if changed {
+            *self.session_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            *self
+                .connected_peers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = 0;
+            *self.outbox.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryOutbox::default();
+            tracing::info!("Nostr discovery retries stopped reason=session change");
+            *self.exchanges.lock().unwrap_or_else(|e| e.into_inner()) =
+                DiscoveryExchanges::default();
+            *self.bootstrap.lock().unwrap_or_else(|e| e.into_inner()) =
+                DiscoveryBootstrap::default();
             self.discovery_table
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -395,6 +450,17 @@ impl Signaler for WasmNostrSignaler {
     /// reconnect after a blip) is rejected in one direction only. See
     /// `Signaler::note_peer_alive`.
     async fn note_peer_alive(&self, peer: &NodeId) {
+        let pubkey = self
+            .discovery_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pubkey_for_node(peer);
+        if let Some(pubkey) = pubkey {
+            self.exchanges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .progress(&pubkey, web_time::Instant::now());
+        }
         self.discovery_table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -439,6 +505,91 @@ impl Signaler for WasmNostrSignaler {
             .ok_or_else(|| mistlib_core::error::MistError::RouteNotFound(to.clone()))?;
 
         self.publish_message_to_pubkey(&pubkey, &data)
+    }
+
+    async fn maintain_bootstrap(&self, connected_peers: usize) {
+        let previous_connected = {
+            let mut count = self
+                .connected_peers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *count, connected_peers)
+        };
+        let Some(room_id) = self.room_id() else {
+            return;
+        };
+        let identity = self.current_identity();
+        let rank = self
+            .codec_config
+            .topology_rank(&room_id, &identity.public_key);
+        if connected_peers >= TARGET_PEERS {
+            if previous_connected < TARGET_PEERS {
+                tracing::info!("Nostr discovery retries stopped reason=target reached");
+            }
+            self.bootstrap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stop();
+            let dropped = self
+                .outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stop_probes();
+            for pubkey in dropped {
+                self.exchanges
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .release(&pubkey);
+            }
+            return;
+        }
+        let retries = {
+            let bootstrap = self.bootstrap.lock().unwrap_or_else(|e| e.into_inner());
+            self.exchanges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poll_with_evidence(web_time::Instant::now(), |key| bootstrap.evidence(key))
+        };
+        for pubkey in retries {
+            self.queue_request(&pubkey, &room_id, DiscoveryPriority::Probe);
+        }
+        let candidates = {
+            let mut table = self
+                .discovery_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut requested = self
+                .requested_pubkeys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut bootstrap = self.bootstrap.lock().unwrap_or_else(|e| e.into_inner());
+            let candidates = bootstrap.poll(
+                web_time::Instant::now(),
+                &mut table,
+                &identity.public_key,
+                &rank,
+                &requested,
+                connected_peers,
+            );
+            requested.extend(candidates.iter().cloned());
+            candidates
+        };
+        for pubkey in candidates {
+            if self.room_id().as_deref() != Some(room_id.as_str()) {
+                return;
+            }
+            if self.current_identity().public_key != identity.public_key {
+                return;
+            }
+            if self
+                .exchanges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .request(&pubkey, web_time::Instant::now())
+            {
+                self.queue_request(&pubkey, &room_id, DiscoveryPriority::Probe);
+            }
+        }
     }
 
     async fn reset_session(&self) -> mistlib_core::error::Result<()> {

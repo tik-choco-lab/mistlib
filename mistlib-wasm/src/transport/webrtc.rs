@@ -183,6 +183,10 @@ pub enum IsolationRecovery {
     Schedule,
     Skip,
 }
+mod answer_sdp;
+#[cfg(test)]
+#[path = "webrtc/answer_tests.rs"]
+mod answer_tests;
 pub mod backpressure;
 pub mod candidate_delivery;
 pub mod ice_config;
@@ -381,10 +385,23 @@ impl WasmWebRtcTransport {
         let isolation_recovery_epoch = self.isolation_recovery_epoch.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
+            let mut cleanup_tick = false;
             loop {
-                gloo_timers::future::TimeoutFuture::new(2000).await;
+                gloo_timers::future::TimeoutFuture::new(1000).await;
                 if sweeper_generation.load(Ordering::Relaxed) != generation {
                     break;
+                }
+                let connected = states
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|state| **state == ConnectionState::Connected)
+                    .count();
+                signaler.maintain_bootstrap(connected).await;
+                // Preserve the two-second cleanup cadence.
+                cleanup_tick = !cleanup_tick;
+                if cleanup_tick {
+                    continue;
                 }
 
                 let nodes: Vec<NodeId> = {
@@ -2301,7 +2318,11 @@ fn sdp_from_signaling_payload(payload: &str) -> String {
         .unwrap_or_else(|| payload.to_string())
 }
 
-fn parse_and_add_candidate(node: &NodeId, peer: &Peer, cand_json: &str) -> Result<(), JsValue> {
+fn parse_and_add_candidate(
+    node: &NodeId,
+    peer: &Peer,
+    cand_json: &str,
+) -> Result<js_sys::Promise, JsValue> {
     let cand_obj = js_sys::JSON::parse(cand_json)?;
     let candidate_str = Reflect::get(&cand_obj, &JsValue::from_str("candidate"))
         .ok()
@@ -2341,8 +2362,9 @@ fn parse_and_add_candidate(node: &NodeId, peer: &Peer, cand_json: &str) -> Resul
         .map(|parts| parts[1])
         .unwrap_or("unknown")
         .to_string();
+    let observed_promise = promise.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        match JsFuture::from(promise).await {
+        match JsFuture::from(observed_promise).await {
             Ok(_) => tracing::debug!(
                 "addIceCandidate succeeded for {} (type={})",
                 node.0,
@@ -2357,7 +2379,7 @@ fn parse_and_add_candidate(node: &NodeId, peer: &Peer, cand_json: &str) -> Resul
         }
     });
 
-    Ok(())
+    Ok(promise)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2883,14 +2905,63 @@ impl SignalingHandler for WasmWebRtcTransport {
                     peers.get(&data.sender_id).cloned()
                 };
                 if let Some(peer) = peer {
+                    // Keep the state check and application atomic with other
+                    // negotiation steps, including the other signaling path.
+                    let _negotiating = peer.negotiating.lock().await;
+                    let sdp = sdp_from_signaling_payload(&answer_payload);
+                    if peer.pc.signaling_state() == RtcSignalingState::Stable {
+                        if let Some(applied) = peer.pc.remote_description() {
+                            let (matches_applied, exact_duplicate) = peer
+                                .applied_answer_sdp
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .as_deref()
+                                .map(|original| {
+                                    (
+                                        answer_sdp::same_negotiation(original, &sdp),
+                                        original == sdp,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            if applied.type_() == RtcSdpType::Answer && matches_applied {
+                                // Chrome includes already trickled candidates in
+                                // remoteDescription. Feed only new additions via
+                                // the normal candidate path, retaining m-line/MID.
+                                let candidates = if exact_duplicate {
+                                    Vec::new()
+                                } else {
+                                    answer_sdp::new_candidates(&applied.sdp(), &sdp)
+                                };
+                                for candidate in candidates {
+                                    let payload = serde_json::json!({
+                                        "candidate": candidate.candidate,
+                                        "sdpMid": candidate.sdp_mid,
+                                        "sdpMLineIndex": candidate.sdp_m_line_index,
+                                    })
+                                    .to_string();
+                                    match parse_and_add_candidate(&data.sender_id, &peer, &payload) {
+                                        Ok(promise) => {
+                                            // Settle before releasing the negotiation lock,
+                                            // so a concurrent resend sees this candidate.
+                                            let _ = JsFuture::from(promise).await;
+                                        }
+                                        Err(err) => tracing::warn!("failed to parse re-delivered answer candidate for {}: {:?}", data.sender_id.0, err),
+                                    }
+                                }
+                                if let Some(id) = transaction_id {
+                                    self.acknowledge_negotiation(data.sender_id.clone(), id);
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
                     if peer.pc.signaling_state() != RtcSignalingState::HaveLocalOffer {
                         return Err(mistlib_core::error::MistError::Internal(format!(
-                            "Answer precondition failed: signaling state is not HaveLocalOffer for {}",
+                            "Answer precondition failed: signaling_state={:?} for {}; no matching applied answer (excluding ICE candidate lines)",
+                            peer.pc.signaling_state(),
                             data.sender_id.0
                         )));
                     }
-
-                    let sdp = sdp_from_signaling_payload(&answer_payload);
 
                     // Stale-answer guard: a duplicate/late answer for a
                     // *previous* local offer can still arrive after we've
@@ -2943,6 +3014,10 @@ impl SignalingHandler for WasmWebRtcTransport {
                             .await;
                         return Err(mistlib_core::error::MistError::Internal(format!("{:?}", e)));
                     }
+                    *peer
+                        .applied_answer_sdp
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(sdp);
                     answer_applied = true;
                     self.apply_pending_candidates(&data.sender_id, &peer);
                     self.spawn_connectivity_watchdog_if_needed(&data.sender_id, &peer);

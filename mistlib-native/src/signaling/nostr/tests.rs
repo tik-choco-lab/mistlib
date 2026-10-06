@@ -911,7 +911,7 @@ async fn invalid_event_does_not_block_later_valid_event_with_same_id() {
         .process_event(invalid_event, tx.clone())
         .await
         .is_err());
-    assert!(signaler.process_event(event, tx).await.is_err());
+    assert!(signaler.process_event(event, tx).await.is_ok());
 
     assert!(signaler
         .discovery_table
@@ -921,6 +921,7 @@ async fn invalid_event_does_not_block_later_valid_event_with_same_id() {
         .is_some());
 }
 
+mod discovery_retry;
 mod rejoin;
 mod replay;
 mod security;
@@ -1328,4 +1329,284 @@ async fn live_go_relay_reconnects_rejoined_node_with_same_id_among_four_nodes() 
     carol.close().await.unwrap();
     dave.close().await.unwrap();
     rejoined_bob.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_requests_live_alternate_excluded_by_dead_predecessors() {
+    use mistlib_core::signaling::nostr::TemporarySignalingIdentity;
+    for use_activity in [false, true] {
+        let room = "bootstrap-dead-predecessors";
+        let mut signaler = NostrSignaler::new(NodeId("newcomer".into()), config());
+        let mut identities = (0..10)
+            .map(|_| TemporarySignalingIdentity::generate())
+            .collect::<Vec<_>>();
+        identities.sort_by_key(|id| signaler.codec_config.topology_rank(room, &id.public_key));
+        signaler.identity = identities[0].clone();
+        let provider = &identities[9];
+        *signaler.room_id.lock().await = Some(room.into());
+        let (relay_tx, mut relay_rx) = mpsc::channel(16);
+        signaler.senders.lock().await.push(relay_tx);
+        let now = web_time::Instant::now();
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for dead in &identities[1..9] {
+            signaler
+                .discovery_table
+                .lock()
+                .await
+                .insert_pubkey_with_rank(
+                    dead.public_key.clone(),
+                    u64::MAX,
+                    signaler.codec_config.topology_rank(room, &dead.public_key),
+                );
+
+            signaler.bootstrap.lock().await.observe(
+                &dead.public_key,
+                unix_now + 1,
+                None,
+                now - Duration::from_secs(1),
+            );
+        }
+        let mut advertisement =
+            mistlib_core::signaling::nostr::build_discovery_event_with_joined_at(
+                &signaler.codec_config,
+                &signaler.crypto,
+                provider,
+                room,
+                Some((unix_now - if use_activity { 40 } else { 100 }) * 1000),
+            )
+            .unwrap();
+        if use_activity {
+            advertisement.created_at = unix_now - 40;
+            advertisement.refresh_id();
+            advertisement.sig = signaler
+                .crypto
+                .sign_event(provider, &advertisement)
+                .unwrap();
+        }
+        signaler
+            .process_event(advertisement, mpsc::channel(8).0)
+            .await
+            .unwrap();
+        assert!(
+            relay_rx.try_recv().is_err(),
+            "normal topology excludes this newcomer"
+        );
+        if use_activity {
+            let message = build_message_event_with_sequence(
+                &signaler.codec_config,
+                &signaler.crypto,
+                provider,
+                &identities[1].public_key,
+                &SignalingData {
+                    sender_id: NodeId("provider".into()),
+                    receiver_id: NodeId::broadcast(),
+                    room_id: room.into(),
+                    data: String::new(),
+                    signaling_type: SignalingType::Request,
+                },
+                1,
+            )
+            .unwrap();
+            let (incoming_tx, mut incoming_rx) = mpsc::channel(8);
+            signaler.process_event(message, incoming_tx).await.unwrap();
+            assert!(
+                incoming_rx.try_recv().is_err(),
+                "activity hint does not admit another peer's payload"
+            );
+        }
+        signaler.maintain_bootstrap(0).await;
+        let frame = timeout(Duration::from_secs(2), relay_rx.recv())
+            .await
+            .unwrap()
+            .expect("bounded retry publishes a Request");
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let event: NostrEvent = serde_json::from_value(value[1].clone()).unwrap();
+        let decoded = decode_message_event(
+            &signaler.codec_config,
+            &signaler.crypto,
+            provider,
+            &NodeId("provider".into()),
+            &event,
+            room,
+        )
+        .unwrap();
+        assert_eq!(decoded.data.signaling_type, SignalingType::Request);
+        assert_eq!(decoded.data.sender_id, signaler.local_node_id);
+        // The live provider ranks first despite eight fresher dead identities.
+        for _ in 0..3 {
+            timeout(Duration::from_secs(2), relay_rx.recv())
+                .await
+                .unwrap()
+                .expect("remaining first-round probes");
+        }
+        signaler.maintain_bootstrap(0).await;
+        assert!(relay_rx.try_recv().is_err(), "no repeated probe");
+        signaler.close().await.unwrap();
+        assert!(signaler.requested_pubkeys.lock().await.is_empty());
+    }
+}
+
+// Regression tests for bootstrap I/O running in the cleanup sweeper.
+struct BootstrapNoopHandler;
+
+impl mistlib_core::transport::NetworkEventHandler for BootstrapNoopHandler {
+    fn on_event(&self, _: mistlib_core::transport::NetworkEvent) {}
+}
+
+async fn bootstrap_stalled_transport() -> (
+    crate::transports::webrtc::WebRtcTransport,
+    std::sync::Arc<NostrSignaler>,
+    mpsc::Receiver<String>,
+) {
+    use mistlib_core::signaling::nostr::{DiscoveryBootstrap, TemporarySignalingIdentity};
+    use mistlib_core::transport::Transport;
+    let signaler = std::sync::Arc::new(NostrSignaler::new(NodeId("local".into()), config()));
+    let room = "bootstrap-stalled-relay";
+    *signaler.room_id.lock().await = Some(room.into());
+    let candidate = TemporarySignalingIdentity::generate().public_key;
+    signaler
+        .discovery_table
+        .lock()
+        .await
+        .insert_pubkey_with_rank(
+            candidate.clone(),
+            u64::MAX,
+            signaler.codec_config.topology_rank(room, &candidate),
+        );
+    let mut bootstrap = DiscoveryBootstrap::default();
+    bootstrap.observe(
+        &candidate,
+        1000,
+        None,
+        web_time::Instant::now() - Duration::from_secs(1),
+    );
+    *signaler.bootstrap.lock().await = bootstrap;
+    // An open full queue models a relay writer suspended in write.send().
+    let (relay_tx, relay_rx) = mpsc::channel(1);
+    relay_tx.send("queued frame".into()).await.unwrap();
+    signaler.senders.lock().await.push(relay_tx);
+    let transport =
+        crate::transports::webrtc::WebRtcTransport::new(signaler.clone(), NodeId("local".into()));
+    transport.set_room_id(room.into());
+    transport
+        .start(std::sync::Arc::new(BootstrapNoopHandler))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if signaler.senders.try_lock().is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("bootstrap must reach the blocked relay enqueue");
+    (transport, signaler, relay_rx)
+}
+
+#[tokio::test]
+async fn bootstrap_backpressure_must_not_block_cleanup() {
+    use crate::transports::webrtc::PENDING_CANDIDATE_UNRESERVED_TTL_MS;
+    let (transport, _signaler, mut relay_rx) = bootstrap_stalled_transport().await;
+    let node = NodeId("abandoned-candidates".into());
+    transport
+        .pending_candidates
+        .write()
+        .await
+        .insert(node.clone(), vec!["candidate".into()]);
+    transport
+        .pending_candidates_first_seen
+        .write()
+        .await
+        .insert(
+            node.clone(),
+            std::time::Instant::now()
+                - Duration::from_millis(PENDING_CANDIDATE_UNRESERVED_TTL_MS + 1),
+        );
+    let cleanup = timeout(Duration::from_millis(250), async {
+        while transport
+            .pending_candidates
+            .read()
+            .await
+            .contains_key(&node)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    transport.stop_session_sweeper();
+    relay_rx.recv().await;
+    drop(relay_rx);
+    assert!(
+        cleanup.is_ok(),
+        "relay backpressure blocked unrelated candidate cleanup"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_backpressure_must_not_prevent_sweeper_cancellation() {
+    let (transport, signaler, mut relay_rx) = bootstrap_stalled_transport().await;
+    let retained_map = std::sync::Arc::downgrade(&transport.pending_candidates);
+    transport.stop_session_sweeper();
+    drop(transport);
+    let stopped = timeout(Duration::from_millis(250), async {
+        while retained_map.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    // Pacing belongs to signaling and is cancelled separately from the sweeper.
+    signaler.pacing_cancel.lock().await.cancel();
+    assert!(
+        stopped.is_ok(),
+        "cancelled sweeper retains session maps while publish is blocked"
+    );
+    timeout(Duration::from_millis(250), async {
+        while signaler.send_order.try_lock().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    relay_rx.recv().await;
+    drop(relay_rx);
+    assert!(signaler.send_order.try_lock().is_ok());
+    assert_eq!(signaler.senders.lock().await.len(), 1);
+    assert_eq!(signaler.requested_pubkeys.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_publish_preserves_all_relay_senders() {
+    let signaler = NostrSignaler::new(NodeId("local".into()), config());
+    let (first_tx, mut first_rx) = mpsc::channel(1);
+    let (stalled_tx, mut stalled_rx) = mpsc::channel(1);
+    let (last_tx, mut last_rx) = mpsc::channel(1);
+    stalled_tx.send("queued frame".into()).await.unwrap();
+    *signaler.senders.lock().await = vec![first_tx, stalled_tx, last_tx];
+
+    assert!(timeout(
+        Duration::from_millis(10),
+        signaler.publish_frame("cancelled frame".into()),
+    )
+    .await
+    .is_err());
+    assert_eq!(signaler.senders.lock().await.len(), 3);
+    assert_eq!(first_rx.try_recv().unwrap(), "cancelled frame");
+    assert_eq!(stalled_rx.try_recv().unwrap(), "queued frame");
+    assert!(last_rx.try_recv().is_err());
+
+    timeout(
+        Duration::from_secs(1),
+        signaler.publish_frame("next frame".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    for rx in [&mut first_rx, &mut stalled_rx, &mut last_rx] {
+        assert_eq!(rx.try_recv().unwrap(), "next frame");
+    }
 }

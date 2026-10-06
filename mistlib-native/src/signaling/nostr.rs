@@ -4,16 +4,20 @@ use mistlib_core::signaling::nostr::{
     random_subscription_id, DedupeCache, DiscoveryTable, InvitePskCrypto, NostrCodecConfig,
     TemporarySignalingIdentity,
 };
+use mistlib_core::signaling::nostr::{
+    DiscoveryBootstrap, DiscoveryExchanges, DiscoveryOutbox, DiscoveryPriority, TARGET_PEERS,
+};
 use mistlib_core::signaling::{MessageContent, Signaler};
 use mistlib_core::types::NodeId;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod connection;
+mod pacing;
 mod processing;
 mod publish;
 mod refresh;
@@ -52,6 +56,7 @@ pub struct NostrSignaler {
     identity: TemporarySignalingIdentity,
     rotated_identity: Arc<Mutex<Option<TemporarySignalingIdentity>>>,
     session_epoch: Arc<AtomicU64>,
+    connected_peers: Arc<AtomicUsize>,
     codec_config: NostrCodecConfig,
     crypto: InvitePskCrypto,
     /// Serializes targeted (per-receiver) publishes end-to-end: held from
@@ -72,6 +77,12 @@ pub struct NostrSignaler {
     senders: Arc<Mutex<Vec<mpsc::Sender<String>>>>,
     room_id: Arc<Mutex<Option<String>>>,
     discovery_table: Arc<Mutex<DiscoveryTable>>,
+    bootstrap: Arc<Mutex<DiscoveryBootstrap>>,
+    exchanges: Arc<Mutex<DiscoveryExchanges>>,
+    outbox: Arc<Mutex<DiscoveryOutbox>>,
+    pacing_cancel: Arc<Mutex<CancellationToken>>,
+    #[cfg(test)]
+    request_jitter: Duration,
     dedupe: Arc<Mutex<DedupeCache>>,
     message_dedupe: Arc<Mutex<DedupeCache>>,
     outgoing_sequences: Arc<Mutex<HashMap<String, u64>>>,
@@ -98,12 +109,19 @@ impl NostrSignaler {
             identity: TemporarySignalingIdentity::generate(),
             rotated_identity: Arc::new(Mutex::new(None)),
             session_epoch: Arc::new(AtomicU64::new(0)),
+            connected_peers: Arc::new(AtomicUsize::new(0)),
             codec_config,
             crypto,
             send_order: Arc::new(Mutex::new(())),
             senders: Arc::new(Mutex::new(Vec::new())),
             room_id: Arc::new(Mutex::new(None)),
             discovery_table: Arc::new(Mutex::new(DiscoveryTable::default())),
+            bootstrap: Arc::new(Mutex::new(DiscoveryBootstrap::default())),
+            exchanges: Arc::new(Mutex::new(DiscoveryExchanges::default())),
+            outbox: Arc::new(Mutex::new(DiscoveryOutbox::default())),
+            pacing_cancel: Arc::new(Mutex::new(CancellationToken::new())),
+            #[cfg(test)]
+            request_jitter: Duration::ZERO,
             dedupe: Arc::new(Mutex::new(DedupeCache::new(dedupe_ttl))),
             message_dedupe: Arc::new(Mutex::new(DedupeCache::new(dedupe_ttl))),
             outgoing_sequences: Arc::new(Mutex::new(HashMap::new())),
@@ -145,7 +163,18 @@ impl NostrSignaler {
             }
         };
         if changed {
+            tracing::info!("Nostr discovery retries stopped reason=session change");
+            self.session_epoch.fetch_add(1, Ordering::SeqCst);
+            self.connected_peers.store(0, Ordering::SeqCst);
+            {
+                let mut cancel = self.pacing_cancel.lock().await;
+                cancel.cancel();
+                *cancel = CancellationToken::new();
+            }
+            *self.outbox.lock().await = DiscoveryOutbox::default();
+            *self.exchanges.lock().await = DiscoveryExchanges::default();
             self.discovery_table.lock().await.clear();
+            *self.bootstrap.lock().await = DiscoveryBootstrap::default();
             self.dedupe.lock().await.clear();
             self.message_dedupe.lock().await.clear();
             self.outgoing_sequences.lock().await.clear();
@@ -218,7 +247,17 @@ impl NostrSignaler {
     }
 
     async fn clear_session_state(&self) {
+        tracing::info!("Nostr discovery retries stopped reason=session change");
+        self.connected_peers.store(0, Ordering::SeqCst);
+        {
+            let mut cancel = self.pacing_cancel.lock().await;
+            cancel.cancel();
+            *cancel = CancellationToken::new();
+        }
+        *self.outbox.lock().await = DiscoveryOutbox::default();
+        *self.exchanges.lock().await = DiscoveryExchanges::default();
         self.discovery_table.lock().await.clear();
+        *self.bootstrap.lock().await = DiscoveryBootstrap::default();
         self.dedupe.lock().await.clear();
         self.message_dedupe.lock().await.clear();
         self.outgoing_sequences.lock().await.clear();
@@ -237,6 +276,13 @@ impl Signaler for NostrSignaler {
     /// reconnect after a blip) is rejected in one direction only. See
     /// `Signaler::note_peer_alive`.
     async fn note_peer_alive(&self, peer: &NodeId) {
+        let pubkey = self.discovery_table.lock().await.pubkey_for_node(peer);
+        if let Some(pubkey) = pubkey {
+            self.exchanges
+                .lock()
+                .await
+                .progress(&pubkey, web_time::Instant::now());
+        }
         self.discovery_table
             .lock()
             .await
@@ -282,6 +328,91 @@ impl Signaler for NostrSignaler {
         self.publish_message_to_pubkey(&pubkey, &data).await
     }
 
+    async fn maintain_bootstrap(&self, connected_peers: usize) {
+        let previous_connected = self.connected_peers.swap(connected_peers, Ordering::SeqCst);
+        let Some(room_id) = self.current_room_id().await else {
+            return;
+        };
+        let identity = self.current_identity().await;
+        let rank = self
+            .codec_config
+            .topology_rank(&room_id, &identity.public_key);
+        let session_epoch = self.session_epoch();
+        if connected_peers >= TARGET_PEERS {
+            if previous_connected < TARGET_PEERS {
+                tracing::info!("Nostr discovery retries stopped reason=target reached");
+            }
+            self.bootstrap.lock().await.stop();
+            let dropped = self.outbox.lock().await.stop_probes();
+            for pubkey in dropped {
+                self.exchanges.lock().await.release(&pubkey);
+            }
+            return;
+        }
+        let retries = {
+            let bootstrap = self.bootstrap.lock().await;
+            self.exchanges
+                .lock()
+                .await
+                .poll_with_evidence(web_time::Instant::now(), |key| bootstrap.evidence(key))
+        };
+        for pubkey in retries {
+            if !self.session_is_current(session_epoch)
+                || self.current_room_id().await.as_deref() != Some(room_id.as_str())
+            {
+                return;
+            }
+            self.queue_request(
+                &pubkey,
+                &room_id,
+                session_epoch,
+                DiscoveryPriority::Probe,
+                Duration::ZERO,
+            )
+            .await;
+        }
+        let candidates = {
+            let mut table = self.discovery_table.lock().await;
+            let mut requested = self.requested_pubkeys.lock().await;
+            let mut bootstrap = self.bootstrap.lock().await;
+            let candidates = bootstrap.poll(
+                web_time::Instant::now(),
+                &mut table,
+                &identity.public_key,
+                &rank,
+                &requested,
+                connected_peers,
+            );
+            requested.extend(candidates.iter().cloned());
+            candidates
+        };
+        for pubkey in candidates {
+            if !self.session_is_current(session_epoch)
+                || self.current_room_id().await.as_deref() != Some(room_id.as_str())
+            {
+                return;
+            }
+            if self.current_identity().await.public_key != identity.public_key {
+                return;
+            }
+            if self
+                .exchanges
+                .lock()
+                .await
+                .request(&pubkey, web_time::Instant::now())
+            {
+                self.queue_request(
+                    &pubkey,
+                    &room_id,
+                    session_epoch,
+                    DiscoveryPriority::Probe,
+                    Duration::ZERO,
+                )
+                .await;
+            }
+        }
+    }
+
     async fn reset_session(&self) -> mistlib_core::error::Result<()> {
         let Some(room_id) = self.current_room_id().await else {
             return Ok(());
@@ -308,6 +439,9 @@ impl Signaler for NostrSignaler {
         if let Some(cancel) = self.reconnect_cancel.lock().await.take() {
             cancel.cancel();
         }
+        // A paced send can hold senders while waiting for relay queue space.
+        // Cancel it before acquiring that lock.
+        self.pacing_cancel.lock().await.cancel();
         self.senders.lock().await.clear();
         self.room_id.lock().await.take();
         self.clear_session_state().await;

@@ -1,3 +1,9 @@
+mod bootstrap;
+pub use bootstrap::{DiscoveryBootstrap, TARGET_PEERS};
+mod outbox;
+pub use outbox::{DiscoveryOutbox, DiscoveryPriority};
+mod exchange;
+pub use exchange::DiscoveryExchanges;
 pub mod codec;
 pub mod crypto;
 pub mod dedupe;

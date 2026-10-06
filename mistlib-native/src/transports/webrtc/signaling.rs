@@ -19,6 +19,9 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
+#[path = "answer_sdp.rs"]
+mod answer_sdp;
+
 impl WebRtcTransport {
     async fn send_negotiation_ack(&self, remote_id: &NodeId, room_id: &str, id: u64) {
         let Ok(payload) = serde_json::to_string(&NegotiationAck { id }) else {
@@ -888,15 +891,49 @@ impl WebRtcTransport {
         };
 
         if let Some(peer) = peer {
+            // Serialize the state check and application with offers, ICE
+            // restarts and answers arriving through the other signaling path.
+            let _negotiating = peer.negotiating.lock().await;
+            let answer = parse_answer_payload(&sdp)?;
             let signaling_state = peer.pc.signaling_state();
+            if signaling_state == RTCSignalingState::Stable {
+                if let Some(applied) = peer.pc.remote_description().await {
+                    if applied.sdp_type == RTCSdpType::Answer
+                        && answer_sdp::same_negotiation(&applied.sdp, &answer.sdp)
+                    {
+                        // Native resends gain gathered candidates. Recover only
+                        // those additions without reapplying the negotiation.
+                        // The normal native ICE path also dedupes candidates
+                        // already received by trickle or an earlier resend.
+                        for candidate in answer_sdp::new_candidates(&applied.sdp, &answer.sdp) {
+                            let candidate = RTCIceCandidateInit {
+                                candidate: candidate.candidate,
+                                sdp_mid: candidate.sdp_mid,
+                                sdp_mline_index: Some(candidate.sdp_m_line_index),
+                                username_fragment: None,
+                            };
+                            // Use the same ICE API as handle_candidate, on
+                            // this locked peer even if cleanup replaces it.
+                            if let Err(err) = peer.pc.add_ice_candidate(candidate).await {
+                                tracing::warn!(
+                                    "failed to apply re-delivered answer candidate for {}: {}",
+                                    remote_id.0,
+                                    err
+                                );
+                            }
+                        }
+                        // Let the caller ACK every successful re-delivery.
+                        return Ok(());
+                    }
+                }
+            }
             if signaling_state != RTCSignalingState::HaveLocalOffer {
                 return Err(crate::error::MistError::Internal(format!(
-                    "Answer precondition failed: signaling_state={:?}",
+                    "Answer precondition failed: signaling_state={:?}; no matching applied answer (excluding ICE candidate lines)",
                     signaling_state
                 )));
             }
 
-            let answer = parse_answer_payload(&sdp)?;
             if let Err(e) = peer.pc.set_remote_description(answer).await {
                 // A malformed/rejected answer would otherwise leave this peer
                 // stuck at HaveLocalOffer forever (our own offer already

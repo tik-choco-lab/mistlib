@@ -70,6 +70,30 @@ fn signaling_msg(from: &str, to: &str) -> MessageContent {
     })
 }
 
+#[test]
+fn discovery_only_ingress_remembers_route_without_confirming_progress() {
+    for ingress in [SignalingRoute::WebSocket, SignalingRoute::Overlay] {
+        for signaling_type in [SignalingType::Request, SignalingType::Rejoin] {
+            let bootstrap = Arc::new(RecordingSignaler::default());
+            let (routes, _) = make_relay(
+                Arc::new(RecordingActionHandler::default()),
+                bootstrap.clone(),
+            );
+            let inner = Arc::new(RecordingSignalingHandler::default());
+            let handler = RoutedSignalingHandler::new(routes.clone(), inner.clone(), ingress);
+            let MessageContent::Data(mut data) = signaling_msg("peer", "local") else {
+                unreachable!()
+            };
+            data.signaling_type = signaling_type;
+            futures::executor::block_on(handler.handle_message(MessageContent::Data(data)))
+                .unwrap();
+            assert!(bootstrap.alive.lock().unwrap().is_empty());
+            assert_eq!(routes.route_for(&NodeId("peer".into())), Some(ingress));
+            assert_eq!(inner.handled.lock().unwrap().len(), 1);
+        }
+    }
+}
+
 fn make_relay(
     handler: Arc<RecordingActionHandler>,
     bootstrap: Arc<RecordingSignaler>,

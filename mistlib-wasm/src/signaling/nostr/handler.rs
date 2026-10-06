@@ -67,6 +67,15 @@ impl WasmNostrSignaler {
                         .remove(&decoded.signaling_pubkey);
                 }
             }
+            self.bootstrap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(
+                    &decoded.signaling_pubkey,
+                    event.created_at,
+                    decoded.joined_at,
+                    web_time::Instant::now(),
+                );
             let should_request = {
                 let mut table = self
                     .discovery_table
@@ -90,6 +99,14 @@ impl WasmNostrSignaler {
             if first_request {
                 self.send_request_to_pubkey(&decoded.signaling_pubkey, &room_id)?;
             }
+            self.exchanges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe_advertisement(
+                    &decoded.signaling_pubkey,
+                    event.created_at,
+                    decoded.joined_at,
+                );
             return Ok(());
         }
 
@@ -126,6 +143,15 @@ impl WasmNostrSignaler {
                     && (is_room_mailbox_message(&self.codec_config, &event, &room_id)
                         || is_broadcast_sentinel_message(&self.codec_config, &event, &room_id)) =>
             {
+                // decode_message_event already verified signature, time and room scope.
+                self.bootstrap
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe_activity(&event.pubkey, event.created_at);
+                self.exchanges
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe_activity(&event.pubkey, event.created_at);
                 let _ = self.mark_seen_if_current(&event.id, &room_id);
                 return Ok(());
             }
@@ -201,8 +227,7 @@ impl WasmNostrSignaler {
             // an active peer never lapses out of `node_to_pubkey` due to a
             // missed discovery re-announce cycle mid-exchange.
             table.touch_node(&incoming.sender_id, self.codec_config.ttl_seconds);
-            let reply_pubkey = if !outcome.is_known()
-                && incoming.signaling_type == SignalingType::Request
+            let reply_pubkey = if incoming.signaling_type == SignalingType::Request
                 && incoming.receiver_id.is_broadcast()
             {
                 Some(decoded.sender_pubkey.clone())
@@ -221,6 +246,24 @@ impl WasmNostrSignaler {
         // layer via a synthetic `Rejoin` BEFORE the triggering message
         // itself is forwarded, so it tears down the stale peer connection
         // first.
+        self.exchanges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe_activity(&decoded.sender_pubkey, event.created_at);
+        if matches!(
+            incoming.signaling_type,
+            SignalingType::Offer
+                | SignalingType::Answer
+                | SignalingType::Candidate
+                | SignalingType::Candidates
+                | SignalingType::CandidateAck
+                | SignalingType::NegotiationAck
+        ) {
+            self.exchanges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .progress(&decoded.sender_pubkey, web_time::Instant::now());
+        }
         if let Some(previous_pubkey) = rebound_from {
             self.purge_peer_state(&previous_pubkey);
             if self.room_is_current(&room_id) {
@@ -254,13 +297,33 @@ impl WasmNostrSignaler {
                 ))
             })?;
         if let Some(pubkey) = reply_pubkey {
-            let first_request = self
-                .requested_pubkeys
+            self.requested_pubkeys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(pubkey.clone());
-            if first_request {
-                self.send_request_to_pubkey(&pubkey, &room_id)?;
+            if self
+                .outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .promote_reply(&pubkey)
+            {
+                return Ok(());
+            }
+            let reserved = self
+                .exchanges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .request(&pubkey, web_time::Instant::now());
+            if reserved {
+                self.exchanges
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe_activity(&pubkey, event.created_at);
+                self.queue_request(
+                    &pubkey,
+                    &room_id,
+                    mistlib_core::signaling::nostr::DiscoveryPriority::Reply,
+                );
             }
         }
         Ok(())

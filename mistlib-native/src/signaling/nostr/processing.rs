@@ -164,6 +164,12 @@ impl NostrSignaler {
             // keyed by `NodeId`, not by the very pubkey that rotates -- in
             // the message-processing branch below via
             // `DiscoveryTable::bind_node_with_epoch`'s `BindOutcome::Rebound`.
+            self.bootstrap.lock().await.observe(
+                &decoded.signaling_pubkey,
+                event.created_at,
+                decoded.joined_at,
+                web_time::Instant::now(),
+            );
             let should_request = {
                 let mut table = self.discovery_table.lock().await;
                 if !self.session_is_current(session_epoch) {
@@ -200,6 +206,11 @@ impl NostrSignaler {
                 }
                 self.send_request_to_pubkey(&pubkey, &room_id).await?;
             }
+            self.exchanges.lock().await.observe_advertisement(
+                &decoded.signaling_pubkey,
+                event.created_at,
+                decoded.joined_at,
+            );
             return Ok(());
         }
 
@@ -225,6 +236,15 @@ impl NostrSignaler {
                                 &room_id,
                             )) =>
                 {
+                    // decode_message_event already verified signature, time and room scope.
+                    self.bootstrap
+                        .lock()
+                        .await
+                        .observe_activity(&event.pubkey, event.created_at);
+                    self.exchanges
+                        .lock()
+                        .await
+                        .observe_activity(&event.pubkey, event.created_at);
                     let mut dedupe = self.dedupe.lock().await;
                     dedupe.check_and_insert(&event.id);
                     return Ok(());
@@ -329,8 +349,7 @@ impl NostrSignaler {
                 // so an active peer never lapses out of `node_to_pubkey` due to
                 // a missed discovery re-announce cycle mid-exchange.
                 table.touch_node(&incoming.sender_id, self.codec_config.ttl_seconds);
-                let reply_pubkey = if !outcome.is_known()
-                    && incoming.signaling_type == SignalingType::Request
+                let reply_pubkey = if incoming.signaling_type == SignalingType::Request
                     && incoming.receiver_id.is_broadcast()
                 {
                     Some(decoded.sender_pubkey.clone())
@@ -339,6 +358,24 @@ impl NostrSignaler {
                 };
                 (reply_pubkey, outcome.rebound_from().map(str::to_string))
             };
+            self.exchanges
+                .lock()
+                .await
+                .observe_activity(&decoded.sender_pubkey, event.created_at);
+            if matches!(
+                incoming.signaling_type,
+                SignalingType::Offer
+                    | SignalingType::Answer
+                    | SignalingType::Candidate
+                    | SignalingType::Candidates
+                    | SignalingType::CandidateAck
+                    | SignalingType::NegotiationAck
+            ) {
+                self.exchanges
+                    .lock()
+                    .await
+                    .progress(&decoded.sender_pubkey, web_time::Instant::now());
+            }
             if let Some(previous_pubkey) = rebound_from {
                 tracing::info!(
                     "NostrSignaler: node {} rebound from pubkey {} to {} -- peer restarted \
@@ -352,6 +389,10 @@ impl NostrSignaler {
                 // exists, and leaving it behind would let stale sequence
                 // counters / request bookkeeping / session epochs bleed into
                 // the peer's fresh session.
+                self.exchanges
+                    .lock()
+                    .await
+                    .progress(&previous_pubkey, web_time::Instant::now());
                 self.requested_pubkeys.lock().await.remove(&previous_pubkey);
                 self.incoming_sequences
                     .lock()
@@ -409,16 +450,25 @@ impl NostrSignaler {
                     ))
                 })?;
             if let Some(pubkey) = reply_pubkey {
-                let first_request = { self.requested_pubkeys.lock().await.insert(pubkey.clone()) };
-                if !first_request {
-                    return Ok(());
-                }
+                self.requested_pubkeys.lock().await.insert(pubkey.clone());
                 if self.current_room_id().await.as_deref() != Some(room_id.as_str())
                     || !self.session_is_current(session_epoch)
                 {
                     return Ok(());
                 }
-                self.send_request_to_pubkey(&pubkey, &room_id).await?;
+                // A valid explicit Request is already a probe: reply promptly.
+                if let Err(err) = self.publish_request_to_pubkey(&pubkey, &room_id).await {
+                    tracing::warn!(
+                        "Nostr identifying reply failed; bounded retry remains pending: {err:?}"
+                    );
+                }
+                if self.session_is_current(session_epoch) {
+                    // The initial Request may have just created this exchange.
+                    self.exchanges
+                        .lock()
+                        .await
+                        .observe_activity(&pubkey, event.created_at);
+                }
             }
         }
         Ok(())
