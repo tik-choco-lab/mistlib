@@ -14,8 +14,10 @@ fn config() -> (NostrSignalingConfig, NostrCodecConfig, InvitePskCrypto) {
         message_kind: 25050,
         ttl_seconds: 60,
         max_clock_skew_seconds: 300,
-        invite_salt: "salt".to_string(),
-        invite_code: "invite".to_string(),
+        // ':' cannot occur in base64url ciphertext, so leak probes cannot
+        // accidentally match randomized encrypted bytes.
+        invite_salt: "private:salt".to_string(),
+        invite_code: "private:invite".to_string(),
     };
     let codec = NostrCodecConfig::from_config(&raw);
     let crypto = InvitePskCrypto::new(&raw.invite_salt, &raw.invite_code);

@@ -38,9 +38,9 @@ fn message_event_round_trips_and_hides_plaintext() {
         SignalingSecretKey::from_bytes_for_tests([2u8; 32]),
     );
     let data = SignalingData {
-        sender_id: NodeId("alice".to_string()),
-        receiver_id: NodeId("bob".to_string()),
-        room_id: "secret-room".to_string(),
+        sender_id: NodeId("private:alice".to_string()),
+        receiver_id: NodeId("private:bob".to_string()),
+        room_id: "private:room".to_string(),
         data: "v=0\r\nsdp".to_string(),
         signaling_type: SignalingType::Offer,
     };
@@ -48,12 +48,18 @@ fn message_event_round_trips_and_hides_plaintext() {
     let event = build_message_event(&codec, &crypto, &alice, &bob.public_key, &data).unwrap();
     let event_json = serde_json::to_string(&event).unwrap();
     assert!(!event.content.contains("v=0"));
-    assert!(!event.content.contains("mistpsk1"));
-    assert!(!event_json.contains("alice"));
-    assert!(!event_json.contains("bob"));
-    assert!(!event_json.contains("secret-room"));
-    assert!(!event_json.contains("mistlib"));
-    assert!(!event_json.contains("room"));
+    assert!(!event.content.contains(r#""mistpsk1""#));
+    // Probe complete private values outside the ciphertext alphabet. Short
+    // words such as "bob" can occur by chance in valid randomized ciphertext.
+    assert!(!event_json.contains(&data.sender_id.0));
+    assert!(!event_json.contains(&data.receiver_id.0));
+    assert!(!event_json.contains(&data.room_id));
+    assert!(event
+        .content
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    assert!(!event_json.contains(r#""mistlib""#));
+    assert!(!event_json.contains(r#""room""#));
     // Directed messages tag the real recipient pubkey (standard Nostr `p`
     // tag targeting) so the relay can filter without decrypting; this is an
     // intentional, documented metadata tradeoff for O(1) fan-out (see
@@ -63,14 +69,13 @@ fn message_event_round_trips_and_hides_plaintext() {
         &codec,
         &crypto,
         &bob,
-        &NodeId("bob".to_string()),
+        &data.receiver_id,
         &event,
-        "secret-room",
+        &data.room_id,
     )
     .unwrap();
     assert_eq!(decoded.sender_pubkey, alice.public_key);
-    assert_eq!(decoded.data.sender_id, data.sender_id);
-    assert_eq!(decoded.data.data, data.data);
+    assert_eq!(decoded.data, data);
     assert_eq!(decoded.sequence, Some(1));
     assert_eq!(decoded.message_id.as_deref().unwrap().len(), 32);
 }

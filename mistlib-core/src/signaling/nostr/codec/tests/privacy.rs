@@ -10,23 +10,23 @@ fn relay_frames_do_not_expose_invite_or_room_material() {
         SignalingSecretKey::from_bytes_for_tests([2u8; 32]),
     );
     let data = SignalingData {
-        sender_id: NodeId("alice".to_string()),
-        receiver_id: NodeId("bob".to_string()),
-        room_id: "secret-room".to_string(),
+        sender_id: NodeId("private:alice".to_string()),
+        receiver_id: NodeId("private:bob".to_string()),
+        room_id: "private:room".to_string(),
         data: "kind 25050 encrypted payload test".to_string(),
         signaling_type: SignalingType::Offer,
     };
 
-    let discovery = build_discovery_event(&codec, &crypto, &alice, "secret-room").unwrap();
+    let discovery = build_discovery_event(&codec, &crypto, &alice, &data.room_id).unwrap();
     let message = build_message_event(&codec, &crypto, &alice, &bob.public_key, &data).unwrap();
     let discovery_req = req_frame_json(
         &random_subscription_id(),
-        &[discovery_filter(&codec, "secret-room")],
+        &[discovery_filter(&codec, &data.room_id)],
     )
     .unwrap();
     let message_req = req_frame_json(
         &random_subscription_id(),
-        &[message_filter(&codec, "secret-room", &bob.public_key)],
+        &[message_filter(&codec, &data.room_id, &bob.public_key)],
     )
     .unwrap();
     let capture = [
@@ -40,10 +40,16 @@ fn relay_frames_do_not_expose_invite_or_room_material() {
     for hidden in [
         raw.invite_salt.as_str(),
         raw.invite_code.as_str(),
-        "secret-room",
-        "alice",
-        "bob",
-        "kind 25050 encrypted payload test",
+        data.room_id.as_str(),
+        data.sender_id.0.as_str(),
+        data.receiver_id.0.as_str(),
+        data.data.as_str(),
+    ] {
+        assert!(!capture.contains(hidden), "{hidden} leaked in relay frame");
+    }
+    // Ciphertext may contain arbitrary base64url words. Check protocol names
+    // as JSON tokens and require opaque content instead of matching substrings.
+    for hidden in [
         "mistlib",
         "webrtc",
         "mistpsk1",
@@ -52,8 +58,13 @@ fn relay_frames_do_not_expose_invite_or_room_material() {
         "discovery",
         "messages",
     ] {
-        assert!(!capture.contains(hidden), "{hidden} leaked in relay frame");
+        let token = serde_json::to_string(hidden).unwrap();
+        assert!(!capture.contains(&token), "{hidden} leaked in relay frame");
     }
+    assert!(message
+        .content
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
 }
 
 #[test]
