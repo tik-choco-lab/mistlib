@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/offer_failure.rs"]
+#[path = "../../src/transport/webrtc/offer_failure.rs"]
 #[allow(dead_code)]
 mod offer_failure;
 

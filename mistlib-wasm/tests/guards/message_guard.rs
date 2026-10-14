@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/message_guard.rs"]
+#[path = "../../src/transport/webrtc/message_guard.rs"]
 mod message_guard;
 
 use message_guard::{check_message_size, SizeCheck};

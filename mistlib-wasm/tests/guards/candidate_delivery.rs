@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-#[path = "../src/transport/webrtc/candidate_delivery.rs"]
+#[path = "../../src/transport/webrtc/candidate_delivery.rs"]
 mod candidate_delivery;
 
 use candidate_delivery::{CandidateDelivery, TrackStatus, MAX_TRACKED_CANDIDATE_NODES};

@@ -1,4 +1,4 @@
-#[path = "../src/session_registry.rs"]
+#[path = "../../src/session_registry.rs"]
 mod session_registry;
 
 use session_registry::SessionRegistry;

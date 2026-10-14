@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/pending_candidates.rs"]
+#[path = "../../src/transport/webrtc/pending_candidates.rs"]
 mod pending_candidates;
 
 use mistlib_core::types::{ConnectionState, NodeId};

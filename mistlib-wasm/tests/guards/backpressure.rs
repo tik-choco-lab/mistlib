@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/backpressure.rs"]
+#[path = "../../src/transport/webrtc/backpressure.rs"]
 mod backpressure;
 
 use backpressure::{backpressure_action, BackpressureAction};

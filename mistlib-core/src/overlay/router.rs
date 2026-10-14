@@ -62,12 +62,18 @@ impl OverlayRouter {
     /// Returns the next per-destination sequence number (monotonic, starting at 1).
     /// Bounded: the least recently used counter is evicted past the cap, so a
     /// long-running node under destination churn cannot grow this map forever.
-    pub(crate) fn next_seq(&self, to: &NodeId) -> u64 {
+    pub(crate) fn with_next_seq<T>(
+        &self,
+        to: &NodeId,
+        build: impl FnOnce(u64) -> crate::error::Result<T>,
+    ) -> crate::error::Result<T> {
         let now = web_time::Instant::now();
         let mut counters = self
             .seq_counters
             .lock()
             .expect("seq_counters lock poisoned");
+        let seq = counters.get(to).map_or(1, |counter| counter.value + 1);
+        let result = build(seq)?;
         if counters.len() >= SEQ_COUNTER_MAX_DESTINATIONS && !counters.contains_key(to) {
             if let Some(oldest) = counters
                 .iter()
@@ -81,9 +87,9 @@ impl OverlayRouter {
             value: 0,
             last_used: now,
         });
-        counter.value += 1;
+        counter.value = seq;
         counter.last_used = now;
-        counter.value
+        Ok(result)
     }
 
     /// Feeds a delivered message through the per-source reorder buffer, returning
@@ -310,6 +316,52 @@ mod tests {
         );
         assert!(!relayed_result.should_deliver);
         assert!(relayed_result.actions.is_empty());
+    }
+
+    #[test]
+    fn rejected_frame_preserves_sequence_and_outgoing_state_at_varint_boundary() {
+        use crate::action::OverlayAction;
+        use crate::error::MistError;
+        use crate::overlay::OverlayEnvelope;
+        use crate::types::DeliveryMethod;
+        use bytes::Bytes;
+        let router = router();
+        let target = NodeId("target".into());
+        router.seq_counters.lock().unwrap().insert(
+            target.clone(),
+            SeqCounter {
+                value: 250,
+                last_used: web_time::Instant::now(),
+            },
+        );
+        let rejected = router.wrap_data_checked(
+            &target,
+            Bytes::new(),
+            DeliveryMethod::ReliableOrdered,
+            |size| Err(MistError::MessageTooLarge { size, limit: 0 }),
+        );
+        assert!(matches!(rejected, Err(MistError::MessageTooLarge { .. })));
+        assert_eq!(router.seq_counters.lock().unwrap()[&target].value, 250);
+        assert_eq!(router.seen_envelopes.lock().unwrap().len(), 0);
+        let mut checked_size = 0;
+        let action = router
+            .wrap_data_checked(
+                &target,
+                Bytes::new(),
+                DeliveryMethod::ReliableOrdered,
+                |size| {
+                    checked_size = size;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let OverlayAction::SendMessage { data, .. } = action else {
+            panic!("send action")
+        };
+        assert_eq!(data.len(), checked_size);
+        let envelope: OverlayEnvelope = crate::overlay::wire::deserialize(&data).unwrap();
+        assert_eq!(envelope.seq, 251);
+        assert_eq!(router.seen_envelopes.lock().unwrap().len(), 1);
     }
 
     #[test]

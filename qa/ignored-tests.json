@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "reason": "Legacy live relay probes and media integration are diagnostic-only; they are not counted as successful release QA.",
+  "tests": [
+    "mistlib-native:signaling::nostr::tests::live_go_relay_exchanges_nostr_signaling",
+    "mistlib-native:signaling::nostr::tests::live_go_relay_reconnects_rejoined_node_with_same_id",
+    "mistlib-native:signaling::nostr::tests::live_go_relay_reconnects_rejoined_node_with_same_id_among_four_nodes",
+    "mistlib-native:signaling::nostr::tests::live_relay_accepts_signed_discovery_event",
+    "mistlib-native:signaling::nostr::tests::topology::live_go_relay_mixed_six_native_nodes_connect_to_wasm_nodes",
+    "mistlib-native:signaling::nostr::tests::topology::live_go_relay_peer_reconnects_after_disconnect",
+    "mistlib-native:signaling::nostr::tests::topology::live_go_relay_six_nodes_reconnect_one_peer_keeps_graph_connected",
+    "mistlib-native:signaling::nostr::tests::topology::live_go_relay_six_nodes_secret_rank_topology",
+    "mistlib-native::loopback_media:publish_local_track_delivers_media_to_an_already_connected_peer",
+    "mistlib-native::loopback_media:webrtc_track_flows_through_bridge_into_an_hls_segment"
+  ]
+}

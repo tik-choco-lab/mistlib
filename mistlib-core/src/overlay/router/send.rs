@@ -25,23 +25,38 @@ impl OverlayRouter {
     }
 
     pub fn wrap_data(&self, to: &NodeId, data: Bytes, method: DeliveryMethod) -> OverlayAction {
-        // Assign a per-destination sequence number only for reliable-ordered unicast;
-        // broadcasts and other methods keep seq == 0 (no sequencing).
-        let seq = if method == DeliveryMethod::ReliableOrdered && !to.is_broadcast() {
-            self.next_seq(to)
-        } else {
-            0
+        self.wrap_data_checked(to, data, method, |_| Ok(()))
+            .expect("OverlayEnvelope serialization must not fail")
+    }
+
+    /// Validate the actual encoded frame before committing a sequence or outgoing state.
+    /// The validator runs while the destination sequence is reserved; it must not
+    /// re-enter this router's send methods.
+    pub fn wrap_data_checked(
+        &self,
+        to: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+        validate: impl FnOnce(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<OverlayAction> {
+        let build = |seq| {
+            let envelope = OverlayEnvelope::new(
+                self.local_node_id.clone(),
+                to.clone(),
+                self.hop_count,
+                MessageContent::Raw(data),
+            )
+            .with_seq(seq);
+            let encoded = crate::overlay::wire::serialize(&envelope)
+                .map_err(|err| crate::error::MistError::Internal(err.to_string()))?;
+            validate(encoded.len())?;
+            self.remember_outgoing(&envelope);
+            Ok(self.create_send_action(to, Bytes::from(encoded), method))
         };
-        let envelope = OverlayEnvelope::new(
-            self.local_node_id.clone(),
-            to.clone(),
-            self.hop_count,
-            MessageContent::Raw(data),
-        )
-        .with_seq(seq);
-        self.remember_outgoing(&envelope);
-        let enveloped_data = crate::overlay::wire::serialize(&envelope)
-            .expect("OverlayEnvelope serialization must not fail");
-        self.create_send_action(to, Bytes::from(enveloped_data), method)
+        if method == DeliveryMethod::ReliableOrdered && !to.is_broadcast() {
+            self.with_next_seq(to, build)
+        } else {
+            build(0)
+        }
     }
 }

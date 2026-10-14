@@ -76,7 +76,7 @@ fn handle_storage_control_message(room_id: &str, from: &NodeId, data: &[u8]) {
                 crate::storage::handle_want(room_id.to_string(), from.clone(), cid.to_string());
             }
         }
-        0x02 => handle_storage_have(rest),
+        0x02 => handle_storage_have(from, rest),
         0x03 => {
             if let Ok(cid) = std::str::from_utf8(rest) {
                 crate::storage::handle_query(room_id.to_string(), from.clone(), cid.to_string());
@@ -92,7 +92,7 @@ fn handle_storage_control_message(room_id: &str, from: &NodeId, data: &[u8]) {
                 crate::storage::resolver::parse_have_chunk_message(data)
             {
                 crate::storage::WANT_REGISTRY.with(|r| {
-                    r.fulfill_chunk(&cid, chunk_index, chunk_total, payload);
+                    r.fulfill_chunk_from(&cid, from, chunk_index, chunk_total, payload);
                 });
             }
         }
@@ -100,7 +100,7 @@ fn handle_storage_control_message(room_id: &str, from: &NodeId, data: &[u8]) {
     }
 }
 
-fn handle_storage_have(rest: &[u8]) {
+fn handle_storage_have(from: &NodeId, rest: &[u8]) {
     let Some((&cid_len, body)) = rest.split_first() else {
         return;
     };
@@ -111,7 +111,7 @@ fn handle_storage_have(rest: &[u8]) {
 
     if let Ok(cid) = std::str::from_utf8(&body[..cid_len]) {
         let payload = body[cid_len..].to_vec();
-        crate::storage::handle_have(cid.to_string(), payload);
+        crate::storage::handle_have_from(from.clone(), cid.to_string(), payload);
     }
 }
 

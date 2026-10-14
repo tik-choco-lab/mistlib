@@ -340,6 +340,26 @@ pub async fn send_message_direct(
         ));
     };
 
+    if !target_node.is_broadcast() {
+        let next_hop = overlay
+            .routing_table
+            .lock()
+            .unwrap()
+            .get_next_hop(&target_node)
+            .unwrap_or_else(|| target_node.clone());
+        return Ok(transport.try_enqueue_send_with(&next_hop, |validate| {
+            let OverlayAction::SendMessage { data, method, .. } = overlay.wrap_data_checked(
+                &target_node,
+                Bytes::from(data),
+                delivery_method(method),
+                validate,
+            )?
+            else {
+                unreachable!("wrap_data_checked always produces a send action");
+            };
+            Ok((data, method))
+        })?);
+    }
     let action = overlay.wrap_data(&target_node, Bytes::from(data), delivery_method(method));
     let OverlayAction::SendMessage { to, data, method } = action else {
         return Err(crate::error::MistError::Internal(
@@ -352,6 +372,74 @@ pub async fn send_message_direct(
     } else {
         transport.send(&to, data, method).await?;
     }
+    Ok(())
+}
+
+/// Await peer queue capacity and completion of the local DataChannel write.
+/// Uses the same roomless session selection as the existing direct send.
+pub async fn send_message_direct_wait(
+    target_id: String,
+    data: Vec<u8>,
+    method: u32,
+) -> crate::error::Result<()> {
+    send_message_direct_wait_for(None, target_id, data, method).await
+}
+
+/// Room-scoped awaitable unicast. Never falls back to another room.
+pub async fn send_message_direct_wait_in_room(
+    room_id: String,
+    target_id: String,
+    data: Vec<u8>,
+    method: u32,
+) -> crate::error::Result<()> {
+    send_message_direct_wait_for(Some(room_id), target_id, data, method).await
+}
+
+async fn send_message_direct_wait_for(
+    room_id: Option<String>,
+    target_id: String,
+    data: Vec<u8>,
+    method: u32,
+) -> crate::error::Result<()> {
+    let target = NodeId(target_id);
+    if target.is_broadcast() {
+        return Err(crate::error::MistError::Internal(
+            "awaitable send requires a unicast target".to_string(),
+        ));
+    }
+    let ctx = match room_id {
+        Some(room_id) => ENGINE.get_session(&room_id).await,
+        None => ENGINE.resolve_unicast_session(&target).await,
+    }
+    .ok_or_else(|| crate::error::MistError::Internal("no active session".to_string()))?;
+    let overlay = ctx.overlay.as_ref().ok_or_else(|| {
+        crate::error::MistError::Internal("overlay router is not available".to_string())
+    })?;
+    let transport = ctx.webrtc_transport.as_ref().ok_or_else(|| {
+        crate::error::MistError::Internal("WebRTC transport is not available".to_string())
+    })?;
+    // Snapshot the next hop before waiting. The reserved queue stays bound to this
+    // connection even if routing changes while capacity is unavailable.
+    let next_hop = overlay
+        .routing_table
+        .lock()
+        .unwrap()
+        .get_next_hop(&target)
+        .unwrap_or_else(|| target.clone());
+    transport
+        .send_wait_with(&next_hop, |validate| {
+            let OverlayAction::SendMessage { data, method, .. } = overlay.wrap_data_checked(
+                &target,
+                Bytes::from(data),
+                delivery_method(method),
+                validate,
+            )?
+            else {
+                unreachable!("wrap_data_checked always produces a send action");
+            };
+            Ok((data, method))
+        })
+        .await?;
     Ok(())
 }
 

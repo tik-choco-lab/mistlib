@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/isolation.rs"]
+#[path = "../../src/transport/webrtc/isolation.rs"]
 mod isolation;
 
 use isolation::is_isolated;

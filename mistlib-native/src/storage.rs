@@ -281,6 +281,10 @@ pub fn handle_have_status(from: mistlib_core::types::NodeId, cid: String) {
 }
 
 pub fn handle_have(cid: String, data: Vec<u8>) {
+    handle_have_from(mistlib_core::types::NodeId(String::new()), cid, data);
+}
+
+pub fn handle_have_from(from: mistlib_core::types::NodeId, cid: String, data: Vec<u8>) {
     if !mistlib_core::storage::is_valid_cid(&cid) {
         tracing::warn!(
             "Storage: dropping HAVE with malformed CID (possible path-traversal attempt): {:?}",
@@ -289,10 +293,26 @@ pub fn handle_have(cid: String, data: Vec<u8>) {
         return;
     }
 
-    WANT_REGISTRY.fulfill(&cid, data);
+    WANT_REGISTRY.fulfill_from(&cid, &from, data);
 }
 
 pub fn handle_have_chunk(cid: String, chunk_index: u16, chunk_total: u16, data: Vec<u8>) {
+    handle_have_chunk_from(
+        mistlib_core::types::NodeId(String::new()),
+        cid,
+        chunk_index,
+        chunk_total,
+        data,
+    );
+}
+
+pub fn handle_have_chunk_from(
+    from: mistlib_core::types::NodeId,
+    cid: String,
+    chunk_index: u16,
+    chunk_total: u16,
+    data: Vec<u8>,
+) {
     if !mistlib_core::storage::is_valid_cid(&cid) {
         tracing::warn!(
             "Storage: dropping HAVE_CHUNK with malformed CID (possible path-traversal attempt): {:?}",
@@ -301,7 +321,7 @@ pub fn handle_have_chunk(cid: String, chunk_index: u16, chunk_total: u16, data: 
         return;
     }
 
-    WANT_REGISTRY.fulfill_chunk(&cid, chunk_index, chunk_total, data);
+    WANT_REGISTRY.fulfill_chunk_from(&cid, &from, chunk_index, chunk_total, data);
 }
 
 #[cfg(test)]

@@ -211,7 +211,11 @@ pub fn handle_have_status(from: mistlib_core::types::NodeId, cid: String) {
 }
 
 pub fn handle_have(cid: String, data: Vec<u8>) {
-    WANT_REGISTRY.with(|r| r.fulfill(&cid, data));
+    handle_have_from(mistlib_core::types::NodeId(String::new()), cid, data);
+}
+
+pub fn handle_have_from(from: mistlib_core::types::NodeId, cid: String, data: Vec<u8>) {
+    WANT_REGISTRY.with(|r| r.fulfill_from(&cid, &from, data));
 }
 
 #[wasm_bindgen]

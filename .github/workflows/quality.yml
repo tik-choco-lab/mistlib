@@ -1,0 +1,287 @@
+name: Quality
+
+on:
+  workflow_call:
+    inputs:
+      soak-seconds:
+        type: number
+        default: 15
+        description: Extended soak window; cannot shorten the release policy
+    outputs:
+      version:
+        value: ${{ jobs.rust.outputs.version }}
+        description: Version of the verified candidate
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MISTLIB_BUILD_COMMIT: ${{ github.sha }}
+  MISTLIB_BUILD_DIRTY: 'false'
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: qa/package-lock.json
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p mistlib-core -p mistlib-native --all-targets --locked -- -D warnings
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: qa
+      - run: npm audit --omit=optional --audit-level=high
+        working-directory: qa
+      - run: python -m unittest discover -s qa -p 'test_*.py' -v
+      - run: npm test
+        working-directory: qa
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: version
+        run: python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print("version="+version())' >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.148
+      # Includes sim and WASM's host guards. No retries can turn a failure green.
+      - run: cargo nextest run --workspace --features mistlib-core/sim --locked --profile qa
+      - run: python qa/check_junit.py target/nextest/qa/junit.xml
+      - run: cargo test --workspace --features mistlib-core/sim --doc --locked
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          overwrite: true
+          name: rust-test-results
+          path: target/nextest/qa/junit.xml
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-rust-attempt-${{ github.run_attempt }}
+          path: target/nextest/qa/junit.xml
+          if-no-files-found: warn
+
+  native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            binary: libmistlib.so
+          - os: windows-latest
+            target: windows-x86_64
+            rust-target: x86_64-pc-windows-msvc
+            binary: mistlib.dll
+          - os: macos-15
+            target: macos-aarch64
+            rust-target: aarch64-apple-darwin
+            binary: libmistlib.dylib
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: qa-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: qa/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: qa
+      - run: cargo build --release --locked -p mistlib-native --target ${{ matrix.rust-target }}
+      - run: python qa/package.py native --binary target/${{ matrix.rust-target }}/release/${{ matrix.binary }} --target ${{ matrix.target }} --out dist
+      - name: Load the packaged library, not a build-directory substitute
+        run: |
+          python -c 'import glob,zipfile; zipfile.ZipFile(glob.glob("dist/*.zip")[0]).extractall("work/native")'
+          version=$(python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print(version())')
+          node qa/suite.mjs --native work/native/${{ matrix.binary }} --target ${{ matrix.target }} --out qa/results/native-${{ matrix.target }}.json --commit "$GITHUB_SHA" --version "$version" --soak-seconds '${{ inputs.soak-seconds }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: candidate-native-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          overwrite: true
+          name: evidence-native-${{ matrix.target }}
+          path: qa/results/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-native-${{ matrix.target }}-attempt-${{ github.run_attempt }}
+          path: qa/results/
+          if-no-files-found: warn
+
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+      - run: wasm-pack build mistlib-wasm --target web --release -- --locked
+      - run: python qa/package.py wasm --pkg mistlib-wasm/pkg --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: candidate-wasm
+          path: dist/*
+          if-no-files-found: error
+
+  wasm-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: qa/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: qa
+      - run: npx --no-install playwright install --with-deps chromium
+        working-directory: qa
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.114
+      - run: node qa/wasm_tests.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          overwrite: true
+          name: wasm-regression-results
+          path: qa/results/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-wasm-attempt-${{ github.run_attempt }}
+          path: qa/results/
+          if-no-files-found: warn
+
+  browser:
+    needs: [wasm, native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: qa/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: qa
+      - run: npx --no-install playwright install --with-deps ${{ matrix.browser }}
+        working-directory: qa
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-wasm
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-native-linux-x86_64
+          path: dist
+      - name: Exercise the installed npm tarball and packaged native library
+        run: |
+          python -c 'import glob,zipfile; zipfile.ZipFile(glob.glob("dist/mistlib-native-*.zip")[0]).extractall("work/native")'
+          version=$(python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print(version())')
+          node qa/suite.mjs --native work/native/libmistlib.so --package "dist/tik-choco-mistlib-$version.tgz" --browser ${{ matrix.browser }} --target linux-x86_64 --out qa/results/browser-${{ matrix.browser }}.json --commit "$GITHUB_SHA" --version "$version" --soak-seconds '${{ inputs.soak-seconds }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          overwrite: true
+          name: evidence-browser-${{ matrix.browser }}
+          path: qa/results/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-browser-${{ matrix.browser }}-attempt-${{ github.run_attempt }}
+          path: qa/results/
+          if-no-files-found: warn
+
+  gate:
+    if: always()
+    needs: [checks, rust, native, wasm, wasm-regressions, browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Failed, cancelled, or skipped requirements must stop promotion
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python -c 'import json,os; jobs=json.loads(os.environ["NEEDS"]); assert jobs and all(j["result"] == "success" for j in jobs.values()), jobs'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: evidence-*
+          path: reports
+          merge-multiple: true
+      - run: python qa/gate.py --dist dist --reports reports --commit "$GITHUB_SHA" --version '${{ needs.rust.outputs.version }}' --out quality.json
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: quality-receipt
+          path: quality.json
+          if-no-files-found: error

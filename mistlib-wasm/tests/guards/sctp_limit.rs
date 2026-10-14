@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/sctp_limit.rs"]
+#[path = "../../src/transport/webrtc/sctp_limit.rs"]
 mod sctp_limit;
 
 use sctp_limit::effective_message_limit;

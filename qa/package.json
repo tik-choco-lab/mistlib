@@ -1,0 +1,12 @@
+{
+  "name": "mistlib-release-qa",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.64.0",
+    "ws": "8.22.0"
+  }
+}

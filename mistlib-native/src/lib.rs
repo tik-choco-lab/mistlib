@@ -21,9 +21,10 @@ pub use app::{
     init, init_and_join, init_with_config, join_room, leave_room, leave_room_id,
     publish_local_track, register_event_callback, register_event_callback_v2,
     register_log_callback, register_media_track_handler, register_media_track_handler_async,
-    register_raw_handler, send_message, send_message_direct, send_message_in_room, set_config,
-    shutdown, try_send_message, try_send_message_in_room, unpublish_local_track, update_position,
-    update_position_in_room, DELIVERY_RELIABLE, DELIVERY_UNRELIABLE, DELIVERY_UNRELIABLE_ORDERED,
+    register_raw_handler, send_message, send_message_direct, send_message_direct_wait,
+    send_message_direct_wait_in_room, send_message_in_room, set_config, shutdown, try_send_message,
+    try_send_message_in_room, unpublish_local_track, update_position, update_position_in_room,
+    DELIVERY_RELIABLE, DELIVERY_UNRELIABLE, DELIVERY_UNRELIABLE_ORDERED,
 };
 pub use error::{MistError, Result};
 pub use events::{

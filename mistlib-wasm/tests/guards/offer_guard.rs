@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/offer_guard.rs"]
+#[path = "../../src/transport/webrtc/offer_guard.rs"]
 mod offer_guard;
 
 use mistlib_core::types::ConnectionState;

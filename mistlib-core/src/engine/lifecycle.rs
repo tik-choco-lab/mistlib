@@ -174,17 +174,22 @@ impl MistEngine {
                 if self_net.run_generation.load(AtomicOrdering::Relaxed) != run_generation {
                     break;
                 }
-                let event = match rx.try_recv() {
-                    Ok(event) => event,
-                    Err(TryRecvError::Empty) => {
-                        self_net
-                            .runtime
-                            .sleep(web_time::Duration::from_millis(100))
-                            .await;
-                        continue;
-                    }
-                    Err(TryRecvError::Disconnected) => break,
+                // Wake as soon as transport data arrives. Retain the idle
+                // timeout so a session generation change still stops this task
+                // when no more network events arrive.
+                let event = match futures_util::future::select(
+                    Box::pin(rx.recv()),
+                    self_net.runtime.sleep(web_time::Duration::from_millis(100)),
+                )
+                .await
+                {
+                    futures_util::future::Either::Left((Some(event), _)) => event,
+                    futures_util::future::Either::Left((None, _)) => break,
+                    futures_util::future::Either::Right(_) => continue,
                 };
+                if self_net.run_generation.load(AtomicOrdering::Relaxed) != run_generation {
+                    break;
+                }
                 self_net.process_network_event(event).await;
             }
         }));

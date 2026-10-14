@@ -12,7 +12,7 @@ use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEvent, NetworkEventHandler};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -122,6 +122,10 @@ async fn send_candidate_with_retries(
 
 pub struct Peer {
     pub pc: RtcPeerConnection,
+    /// Belongs to this PC generation, not NodeId. ICE may enter Reconnecting
+    /// before any DataChannel opens, so transport state alone cannot tell
+    /// whether cleanup owes the host a matching disconnect notification.
+    pub(super) connection_announced: AtomicBool,
     pub channels: Arc<RwLock<HashMap<DeliveryMethod, RtcDataChannel>>>,
     /// Waiters for `WasmWebRtcTransport::send`'s backpressure wait (see
     /// `wait_for_buffered_amount_low` in `webrtc.rs`), keyed by
@@ -204,6 +208,7 @@ impl Peer {
     pub fn new(pc: RtcPeerConnection) -> Self {
         Self {
             pc,
+            connection_announced: AtomicBool::new(false),
             channels: Arc::new(RwLock::new(HashMap::new())),
             buffered_amount_waiters: Arc::new(RwLock::new(HashMap::new())),
             reliable_send_gate: tokio::sync::Mutex::new(()),
@@ -904,6 +909,7 @@ impl Peer {
                 .remove(&from_msg);
 
             if prev != Some(ConnectionState::Connected) {
+                peer_open.connection_announced.store(true, Ordering::SeqCst);
                 crate::app::emit_peer_connected(from_msg.clone(), room_id_open.clone());
             }
             peer_open.flush_send_queue(&from_msg);

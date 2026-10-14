@@ -4,6 +4,105 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+#[wasm_bindgen_test(async)]
+async fn cleanup_notifies_established_peers_once_and_never_announces_a_failed_join() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    for (watchdog, state, expected) in [
+        (false, ConnectionState::Reconnecting, true),
+        (false, ConnectionState::Reconnecting, false),
+        (true, ConnectionState::Reconnecting, true),
+        (true, ConnectionState::Connecting, false),
+        (true, ConnectionState::Reconnecting, false),
+    ] {
+        let notifications = Rc::new(RefCell::new(Vec::new()));
+        let received = notifications.clone();
+        let callback = Closure::<dyn FnMut(u32, String, js_sys::Uint8Array, String)>::new(
+            move |kind, node, _, room| received.borrow_mut().push((kind, node, room)),
+        );
+        let previous = crate::app::EVENT_CALLBACK.with(|slot| {
+            slot.replace(Some(
+                callback
+                    .as_ref()
+                    .unchecked_ref::<js_sys::Function>()
+                    .clone(),
+            ))
+        });
+        let transport =
+            WasmWebRtcTransport::new(Arc::new(Recorder::default()), NodeId("local".into()));
+        transport.set_room_id("cleanup-room".into());
+        transport.set_ice_servers(vec![]);
+        let remote = NodeId("remote".into());
+        let peer = transport.create_pc(remote.clone()).unwrap();
+        peer.connection_announced.store(expected, Ordering::SeqCst);
+        transport
+            .peers
+            .write()
+            .unwrap()
+            .insert(remote.clone(), peer.clone());
+        transport
+            .connection_states
+            .write()
+            .unwrap()
+            .insert(remote.clone(), state);
+        if watchdog {
+            transport.connection_timeout_ms.store(1, Ordering::Relaxed);
+            transport
+                .connection_attempt_ids
+                .write()
+                .unwrap()
+                .insert(remote.clone(), 1);
+            // The second callback must see the retired attempt and emit nothing.
+            for _ in 0..2 {
+                transport.spawn_connection_watchdog(
+                    remote.clone(),
+                    1,
+                    peer.clone(),
+                    ConnectionWatchdogPhase::Connectivity,
+                );
+            }
+        } else {
+            transport.disconnected_since.write().unwrap().insert(
+                remote.clone(),
+                DisconnectGrace {
+                    started_at: web_time::Instant::now()
+                        - std::time::Duration::from_millis(DISCONNECTED_GRACE_MS),
+                    origin: GraceOrigin::LivenessSuspect,
+                },
+            );
+            transport.ensure_session_sweeper();
+        }
+        for _ in 0..60 {
+            if !transport.peers.read().unwrap().contains_key(&remote) {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(100).await;
+        }
+        // Includes another sweeper tick and flushes deferred host callbacks.
+        gloo_timers::future::TimeoutFuture::new(if watchdog { 10 } else { 2100 }).await;
+        transport.stop_session_sweeper();
+        transport.close_all_peer_connections();
+        crate::app::EVENT_CALLBACK.with(|slot| {
+            slot.replace(previous);
+        });
+        let want = if expected {
+            vec![(
+                crate::app::EVENT_PEER_DISCONNECTED,
+                "remote".into(),
+                "cleanup-room".into(),
+            )]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            *notifications.borrow(),
+            want,
+            "watchdog={watchdog}, state={state:?}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct Recorder(Mutex<Vec<MessageContent>>);
 

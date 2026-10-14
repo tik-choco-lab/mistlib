@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/send_queue.rs"]
+#[path = "../../src/transport/webrtc/send_queue.rs"]
 mod send_queue;
 
 use bytes::Bytes;

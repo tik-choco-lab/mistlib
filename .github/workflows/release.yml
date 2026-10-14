@@ -1,219 +1,133 @@
-# Release for mistlib. Fires on a `v*` tag push.
-#
-# Generated file. Edits here are overwritten the next time sources are synced
-# from the upstream development repository -- change it there instead. Tags are
-# cut by the release tooling that lives alongside it.
-#
-# Four distribution channels:
-#   1. GitHub Release  — native binaries and the wasm zip
-#   2. npm             — mistlib; the primary route for bundled web apps
-#   3. jsDelivr        — an npm mirror, so version-pinned CDN URLs come for free
-#   4. GitHub Pages    — deployed by pages.yml when main moves, not from here
-#
-# Language wrappers (Unity / Python / JS) are not shipped here. They live in
-# tik-choco-lab/mistlib-examples, which cuts its own releases.
-#
-# One-time setup this workflow depends on:
-#   * A trusted publisher configured on npmjs.com for the `mistlib` package:
-#     Settings > Trusted Publisher > GitHub Actions, with organization
-#     `tik-choco-lab`, repository `mistlib`, and workflow filename `release.yml`
-#     (filename only, not a path). Leave the environment field empty -- this job
-#     does not declare one. No NPM_TOKEN secret is involved.
-
+# Generated from the development repository's publish/overlay directory.
 name: Release
 
+# Versioned main commits request a release. Tags are created only after QA.
 on:
   push:
-    tags: ["v*"]
-
-env:
-  CARGO_TERM_COLOR: always
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  # Confirm the tag doesn't point at broken code before building any artifact.
-  test:
-    name: test (core + native)
+  prepare:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.existing.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: actions/setup-python@v5
         with:
-          tool: nextest
-      - run: cargo nextest run -p mistlib-core -p mistlib-native --locked --profile ci
-
-  wasm:
-    name: build wasm
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+          python-version: '3.12'
+      - id: version
+        run: python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print("version="+version())' >> "$GITHUB_OUTPUT"
+      - id: existing
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         with:
-          tool: wasm-pack
-      - run: wasm-pack build --target web --release
-        working-directory: mistlib-wasm
+          script: |
+            try {
+              await github.rest.repos.getReleaseByTag({...context.repo, tag: `v${process.env.VERSION}`});
+              core.setOutput('publish', 'false');
+              core.notice('Already released; bump manifests to request another release.');
+              return; // Still run QA on main; do not publish or move existing tags.
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              core.setOutput('publish', 'true');
+            }
+            try {
+              const tag = await github.rest.git.getRef({...context.repo, ref: `tags/v${process.env.VERSION}`});
+              let object = tag.data.object;
+              while (object.type === 'tag') {
+                object = (await github.rest.git.getTag({...context.repo, tag_sha: object.sha})).data.object;
+              }
+              if (object.sha !== context.sha) throw new Error('Version tag belongs to another commit; use a new version.');
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            try {
+              const latest = (await github.rest.repos.getLatestRelease(context.repo)).data.tag_name;
+              const core = value => {
+                const match = value.match(/^v?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?/);
+                if (!match) throw new Error('Cannot compare the latest release version.');
+                return match.slice(1).map(part => Number(part || 0));
+              };
+              const candidate = core(process.env.VERSION), stable = core(latest);
+              const firstDifference = candidate.findIndex((part, index) => part !== stable[index]);
+              if (firstDifference >= 0 && candidate[firstDifference] < stable[firstDifference]) {
+                throw new Error('Candidate would downgrade the current stable release.');
+              }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
 
-      # The raw pkg/ is what the npm and Pages jobs consume.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wasm-pkg
-          path: mistlib-wasm/pkg/
-          if-no-files-found: error
-
-      - name: Assemble archive
-        run: |
-          set -euo pipefail
-          rm -rf staging
-          mkdir -p staging/pkg
-          cp -R mistlib-wasm/pkg/. staging/pkg/
-          cp LICENSE README.md staging/
-          # Keeps the license discoverable when pkg/ is vendored on its own.
-          cp LICENSE staging/pkg/
-          (cd staging && zip -qr "../mistlib-wasm-${GITHUB_REF_NAME}.zip" .)
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-wasm
-          path: mistlib-wasm-*.zip
-          if-no-files-found: error
-
-  native:
-    name: package native (${{ matrix.target }})
-    needs: test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux-x86_64
-            binary: libmistlib.so
-          - os: windows-latest
-            target: windows-x86_64
-            binary: mistlib.dll
-          - os: macos-latest
-            target: macos-aarch64
-            binary: libmistlib.dylib
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - run: cargo build --release --locked -p mistlib-native
-
-      # bash exists on every runner, so this stays a single step. `zip` ships with
-      # Linux and macOS but not with Git Bash on Windows, where `7z` is available
-      # instead -- use whichever is present.
-      - name: Assemble archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf staging
-          mkdir -p staging
-          cp "target/release/${{ matrix.binary }}" staging/
-          cp LICENSE README.md staging/
-          out="$PWD/mistlib-native-${{ matrix.target }}-${GITHUB_REF_NAME}.zip"
-          cd staging
-          if command -v zip >/dev/null 2>&1; then zip -qr "$out" .; else 7z a -tzip "$out" . >/dev/null; fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-native-${{ matrix.target }}
-          path: mistlib-native-*.zip
-          if-no-files-found: error
-
-  publish:
-    name: publish GitHub Release
-    needs: [wasm, native]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: assets
-          merge-multiple: true
-      - run: ls -lh assets
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          # Tags like v0.6.0-rc.1 are marked prerelease so "latest release" stays put.
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: assets/*.zip
+  quality:
+    needs: prepare
+    uses: ./.github/workflows/quality.yml
 
   npm:
-    name: publish to npm
-    needs: wasm
+    needs: [prepare, quality]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    # Trusted publishing: npm accepts a short-lived OIDC token minted by GitHub
-    # for this exact repository and workflow, so there is no long-lived NPM_TOKEN
-    # to leak, rotate, or accidentally scope wrong -- and no 2FA prompt that CI
-    # cannot answer. npm marks classic automation tokens as a security risk and
-    # points here instead. Provenance attestations are produced automatically.
     permissions:
-      id-token: write
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: wasm-pkg
-          path: pkg
+          python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: quality-receipt
+      - name: Publish exactly the verified tarball (OIDC)
+        run: python qa/npm_publish.py --dist dist --receipt quality.json --commit "$GITHUB_SHA" --version '${{ needs.prepare.outputs.version }}'
 
-      # Trusted publishing needs npm >= 11.5.1 and Node >= 22.14. Node 24 ships a
-      # new enough npm today, but pin the floor explicitly so a runner image
-      # change cannot silently drop back to token auth semantics.
-      - name: Ensure npm supports trusted publishing
-        run: |
-          set -euo pipefail
-          npm install -g npm@^11
-          npm --version
-          node --version
-
-      # wasm-pack copies a crate-level README into pkg/ when one exists, and
-      # mistlib-wasm has none -- without this the npmjs.com page would be blank.
-      # npm always includes README/LICENSE regardless of the `files` field, and
-      # resolves relative links against package.json's `repository`.
-      - name: Add README and license
-        run: cp README.md LICENSE pkg/
-
-      # wasm-pack writes name=mistlib-wasm and the version from Cargo.toml. Override
-      # both to the published name and the tag: the release tooling already keeps
-      # them in step, so this is a guard against them drifting apart.
-      - name: Prepare package metadata
-        working-directory: pkg
-        run: |
-          set -euo pipefail
-          npm pkg set name="@tik-choco/mistlib"
-          npm pkg set version="${GITHUB_REF_NAME#v}"
-          npm pkg set repository.type="git"
-          npm pkg set repository.url="git+https://github.com/tik-choco-lab/mistlib.git"
-          npm pkg set homepage="https://github.com/tik-choco-lab/mistlib"
-          cat package.json
-
-      # No NODE_AUTH_TOKEN here on purpose -- the OIDC exchange replaces it.
-      - name: Publish
-        working-directory: pkg
-        run: |
-          set -euo pipefail
-          # A prerelease such as v0.6.0-rc.1 must not move the `latest` dist-tag.
-          tag=latest
-          case "${GITHUB_REF_NAME}" in *-*) tag=next ;; esac
-          echo "dist-tag: $tag"
-          # --access public is the default for an unscoped package; state it anyway.
-          npm publish --access public --tag "$tag"
+  publish:
+    needs: [prepare, quality, npm]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: quality-receipt
+      - run: python qa/verify.py --dist dist --receipt quality.json --commit "$GITHUB_SHA" --version '${{ needs.prepare.outputs.version }}'
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
+          files: |
+            dist/*.zip
+            dist/*.tgz
+            quality.json

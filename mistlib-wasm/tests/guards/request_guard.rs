@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/request_guard.rs"]
+#[path = "../../src/transport/webrtc/request_guard.rs"]
 mod request_guard;
 
 use mistlib_core::types::ConnectionState;

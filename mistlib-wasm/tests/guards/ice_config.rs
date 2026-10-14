@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/ice_config.rs"]
+#[path = "../../src/transport/webrtc/ice_config.rs"]
 mod ice_config;
 
 use ice_config::{build_ice_server_plans, IceServerPlan};

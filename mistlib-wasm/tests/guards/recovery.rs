@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/recovery.rs"]
+#[path = "../../src/transport/webrtc/recovery.rs"]
 mod recovery;
 
 use mistlib_core::types::ConnectionState;

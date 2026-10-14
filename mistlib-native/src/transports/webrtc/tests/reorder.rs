@@ -186,3 +186,86 @@ async fn send_queue_rejects_once_capacity_is_exceeded() {
          ever be accepted while the channel never opens, got {accepted}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn awaitable_send_completes_real_datachannel_writes_in_order() {
+    let (ta, tb, _id_a, id_b, recorder) = connect_pair_with_recorder().await;
+    for i in 0..20u32 {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ta.send_wait(
+                &id_b,
+                Bytes::copy_from_slice(&i.to_be_bytes()),
+                DeliveryMethod::ReliableOrdered,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while recorder.seen.lock().unwrap().len() < 20 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *recorder.seen.lock().unwrap(),
+        (0..20u32).collect::<Vec<_>>()
+    );
+    ta.close_all_peer_connections().await;
+    tb.close_all_peer_connections().await;
+}
+
+#[tokio::test]
+async fn awaitable_send_waits_for_channel_open_and_errors_on_peer_teardown() {
+    let t = make_transport();
+    let node = NodeId("stalled-peer".into());
+    let peer = t.create_pc(node.clone()).await.unwrap();
+    let dc = peer.pc.create_data_channel("reliable", None).await.unwrap();
+    peer.channels
+        .write()
+        .await
+        .insert(DeliveryMethod::ReliableOrdered, dc);
+    t.peers.write().await.insert(node.clone(), peer.clone());
+    t.send_queues
+        .write()
+        .unwrap()
+        .insert(node.clone(), peer.send_tx.clone());
+    let first = t.send_wait(
+        &node,
+        Bytes::from_static(b"in-flight"),
+        DeliveryMethod::ReliableOrdered,
+    );
+    tokio::pin!(first);
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut first)
+        .await
+        .is_err());
+    // Fill the queue behind the stalled in-flight frame.
+    for _ in 0..PEER_SEND_QUEUE_CAPACITY {
+        t.send(
+            &node,
+            Bytes::from_static(b"queued"),
+            DeliveryMethod::ReliableOrdered,
+        )
+        .await
+        .unwrap();
+    }
+    let second = t.send_wait(
+        &node,
+        Bytes::from_static(b"waiting-for-capacity"),
+        DeliveryMethod::ReliableOrdered,
+    );
+    tokio::pin!(second);
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut second)
+        .await
+        .is_err());
+    peer.close_all().await;
+    assert!(tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .unwrap()
+        .is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .is_err());
+    t.close_all_peer_connections().await;
+}

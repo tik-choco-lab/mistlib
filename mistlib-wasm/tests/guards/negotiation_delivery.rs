@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-#[path = "../src/transport/webrtc/negotiation_delivery.rs"]
+#[path = "../../src/transport/webrtc/negotiation_delivery.rs"]
 mod negotiation_delivery;
 
 use mistlib_core::types::NodeId;

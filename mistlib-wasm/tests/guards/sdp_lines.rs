@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/sdp_lines.rs"]
+#[path = "../../src/transport/webrtc/sdp_lines.rs"]
 mod sdp_lines;
 
 use sdp_lines::mline_signature;

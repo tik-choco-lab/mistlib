@@ -161,12 +161,18 @@ impl super::MistEngine {
             crate::storage::handle_have_status(from_origin, cid);
             true
         } else if let Some((cid, data)) = resolver::parse_have_message(data) {
-            crate::storage::handle_have(cid, data);
+            crate::storage::handle_have_from(from_origin, cid, data);
             true
         } else if let Some((cid, chunk_index, chunk_total, data)) =
             resolver::parse_have_chunk_message(data)
         {
-            crate::storage::handle_have_chunk(cid, chunk_index, chunk_total, data);
+            crate::storage::handle_have_chunk_from(
+                from_origin,
+                cid,
+                chunk_index,
+                chunk_total,
+                data,
+            );
             true
         } else {
             false

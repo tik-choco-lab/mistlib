@@ -383,6 +383,7 @@ impl WasmWebRtcTransport {
         let sweeper_generation = self.sweeper_generation.clone();
         let signaler = self.signaler.clone();
         let isolation_recovery_epoch = self.isolation_recovery_epoch.clone();
+        let room_id = self.room_id.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let mut cleanup_tick = false;
@@ -533,12 +534,20 @@ impl WasmWebRtcTransport {
                             lock.remove(&node);
                         }
                         peer.close_all(&node);
-                        schedule_isolation_recovery(
-                            signaler.clone(),
-                            states.clone(),
-                            attempts.clone(),
-                            isolation_recovery_epoch.clone(),
-                        );
+                        // close_all detaches the browser callbacks. In particular,
+                        // grace expiry cannot rely on DataChannel.onclose to tell
+                        // the host that an established peer was lost.
+                        if peer.connection_announced.swap(false, Ordering::SeqCst) {
+                            let room = room_id.read().unwrap_or_else(|e| e.into_inner()).clone();
+                            crate::app::emit_peer_disconnected(node.clone(), room);
+                        } else {
+                            schedule_isolation_recovery(
+                                signaler.clone(),
+                                states.clone(),
+                                attempts.clone(),
+                                isolation_recovery_epoch.clone(),
+                            );
+                        }
                         tracing::warn!("[Sweeper] Force cleaned session for {}", node.0);
                     }
                 }
@@ -1162,6 +1171,7 @@ impl WasmWebRtcTransport {
         let signaler = self.signaler.clone();
         let isolation_recovery_epoch = self.isolation_recovery_epoch.clone();
         let timeout_ms = self.connection_timeout_ms.load(Ordering::Relaxed);
+        let room_id = self.room_id.clone();
 
         tracing::info!(
             "Connection watchdog armed: peer={}, attempt_id={}, phase={}, timeout_ms={}",
@@ -1273,12 +1283,20 @@ impl WasmWebRtcTransport {
                 .remove_node(&node);
             let pc_state = peer.pc.connection_state();
             peer.close_all(&node);
-            schedule_isolation_recovery(
-                signaler,
-                conn_states,
-                attempt_ids,
-                isolation_recovery_epoch,
-            );
+            // A connectivity watchdog can race with liveness grace after the
+            // DataChannel has opened. Its cleanup detaches onclose just like
+            // the sweeper, so established peers still need a host notification.
+            if peer.connection_announced.swap(false, Ordering::SeqCst) {
+                let room = room_id.read().unwrap_or_else(|e| e.into_inner()).clone();
+                crate::app::emit_peer_disconnected(node.clone(), room);
+            } else {
+                schedule_isolation_recovery(
+                    signaler,
+                    conn_states,
+                    attempt_ids,
+                    isolation_recovery_epoch,
+                );
+            }
             tracing::warn!(
                 "Connection timeout to {}. fail-fast cleanup (attempt_id={}, phase={}, timeout_ms={}, remote_description_set={}, ice_state={:?}, pc_state={:?}, channels={}, reliable_open={}).",
                 node.0,

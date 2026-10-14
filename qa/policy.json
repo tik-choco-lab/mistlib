@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "nativeTargets": ["linux-x86_64", "windows-x86_64", "macos-aarch64"],
+  "browsers": ["chromium", "firefox"],
+  "phases": ["delivery", "aoi", "multi-room", "leave-rejoin", "relay-outage", "peer-restart", "storage", "soak"],
+  "messagesPerDirection": 32,
+  "connectionDeadlineMs": 30000,
+  "deliveryDeadlineMs": 10000,
+  "negativeObservationMs": 1000,
+  "soakSeconds": 15,
+  "rejoinCycles": 3
+}

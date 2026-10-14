@@ -1,4 +1,4 @@
-#[path = "../src/transport/webrtc/ice_restart.rs"]
+#[path = "../../src/transport/webrtc/ice_restart.rs"]
 mod ice_restart;
 
 use ice_restart::should_trigger_ice_restart;

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock};
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
@@ -229,6 +229,15 @@ pub struct Peer {
 pub(crate) struct QueuedSend {
     pub data: Bytes,
     pub method: DeliveryMethod,
+    pub completion: Option<oneshot::Sender<mistlib_core::error::Result<()>>>,
+}
+
+impl QueuedSend {
+    fn complete(self, result: mistlib_core::error::Result<()>) {
+        if let Some(tx) = self.completion {
+            let _ = tx.send(result);
+        }
+    }
 }
 
 /// Shared transport-level state passed into peer handler setup functions.
@@ -1195,19 +1204,33 @@ impl Peer {
                         queued.method,
                         node
                     );
+                    queued.complete(Err(mistlib_core::error::MistError::Internal(format!(
+                        "Send channel unavailable for {}",
+                        node
+                    ))));
                     continue;
                 };
 
-                if let Err(err) = dc.send(&queued.data).await {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => Err(mistlib_core::error::MistError::Internal(
+                        format!("Peer {} torn down during send", node),
+                    )),
+                    result = dc.send(&queued.data) => result.map(|_| ()).map_err(|err| {
+                        mistlib_core::error::MistError::Internal(format!("DataChannel send to {} failed: {}", node, err))
+                    }),
+                };
+                if result.is_ok() {
+                    STATS.add_send_frame(&queued.data);
+                } else if let Err(err) = &result {
                     tracing::warn!(
-                        "[SendQueue] failed to send queued {:?} message to {}: {:?}",
+                        "[SendQueue] failed to send queued {:?} message to {}: {}",
                         queued.method,
                         node,
                         err
                     );
-                    continue;
                 }
-                STATS.add_send_frame(&queued.data);
+                queued.complete(result);
             }
 
             // The peer was torn down (cancelled) or `send_tx` was dropped

@@ -817,6 +817,8 @@ pub struct WebRtcTransport {
     /// drains into nothing -- the same "queue full / stuck disconnected"
     /// outcome an actually-gone peer already produces today.
     pub(crate) send_queues: Arc<StdRwLock<HashMap<NodeId, mpsc::Sender<peer::QueuedSend>>>>,
+    // Serialize lazy frame stamping and enqueueing after capacity has been reserved.
+    send_wait_admission: Mutex<()>,
     pub event_handler: Mutex<Option<Arc<dyn NetworkEventHandler>>>,
     /// Sender for remote media track (audio/video) arrival events. `None` by
     /// default (data-channel-only mode); set via `set_media_track_handler`
@@ -1098,6 +1100,7 @@ impl WebRtcTransport {
             api,
             peers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             send_queues: Arc::new(StdRwLock::new(HashMap::new())),
+            send_wait_admission: Mutex::new(()),
             event_handler: Mutex::new(None),
             media_tx: Mutex::new(GLOBAL_MEDIA_TX.lock().unwrap().clone()),
             connection_states: Arc::new(StdRwLock::new(HashMap::new())),
@@ -1317,13 +1320,103 @@ impl WebRtcTransport {
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
         send_tx
-            .try_send(peer::QueuedSend { data, method })
+            .try_send(peer::QueuedSend { data, method, completion: None })
             .map_err(|_| {
                 mistlib_core::error::MistError::Internal(format!(
                     "Send queue full for {:?} method {:?} (peer not keeping up or stuck disconnected)",
                     node, method
                 ))
             })
+    }
+
+    /// Wait for peer queue capacity, then for this frame's DataChannel send result.
+    /// Success is local transport completion, not acknowledgement by the remote peer.
+    /// Cancellation after admission does not retract the queued frame.
+    pub async fn send_wait(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        self.check_message_size(data.len())?;
+        self.send_wait_with(node, |validate| {
+            validate(data.len())?;
+            Ok((data, method))
+        })
+        .await
+    }
+
+    /// Build the frame only after queue admission is guaranteed. In particular,
+    /// callers must not stamp reliable overlay sequences before this callback.
+    pub(crate) async fn send_wait_with(
+        &self,
+        node: &NodeId,
+        build: impl FnOnce(
+            &dyn Fn(usize) -> mistlib_core::error::Result<()>,
+        ) -> mistlib_core::error::Result<(Bytes, DeliveryMethod)>,
+    ) -> mistlib_core::error::Result<()> {
+        let send_tx = self
+            .send_queues
+            .read()
+            .unwrap()
+            .get(node)
+            .cloned()
+            .ok_or_else(|| {
+                mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
+            })?;
+        let permit = send_tx.reserve_owned().await.map_err(|_| {
+            mistlib_core::error::MistError::Internal(format!("Send queue closed for {}", node))
+        })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let _admission = self.send_wait_admission.lock().unwrap();
+            let (data, method) = build(&|size| self.check_message_size(size))?;
+            // No cancellable wait may occur between sequence stamping and this send.
+            permit.send(peer::QueuedSend {
+                data,
+                method,
+                completion: Some(tx),
+            });
+        }
+        rx.await.map_err(|_| {
+            mistlib_core::error::MistError::Internal(format!(
+                "Peer {} torn down before send completion",
+                node
+            ))
+        })?
+    }
+
+    /// Reserve queue capacity before building and committing an overlay frame.
+    pub(crate) fn try_enqueue_send_with(
+        &self,
+        node: &NodeId,
+        build: impl FnOnce(
+            &dyn Fn(usize) -> mistlib_core::error::Result<()>,
+        ) -> mistlib_core::error::Result<(Bytes, DeliveryMethod)>,
+    ) -> mistlib_core::error::Result<()> {
+        let send_tx = self
+            .send_queues
+            .read()
+            .unwrap()
+            .get(node)
+            .cloned()
+            .ok_or_else(|| {
+                mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
+            })?;
+        let permit = send_tx.try_reserve_owned().map_err(|_| {
+            mistlib_core::error::MistError::Internal(format!(
+                "Send queue full or closed for {}",
+                node
+            ))
+        })?;
+        let _admission = self.send_wait_admission.lock().unwrap();
+        let (data, method) = build(&|size| self.check_message_size(size))?;
+        permit.send(peer::QueuedSend {
+            data,
+            method,
+            completion: None,
+        });
+        Ok(())
     }
 
     /// Fully synchronous version of `Transport::send` -- no `.await`

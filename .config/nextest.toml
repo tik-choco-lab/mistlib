@@ -12,3 +12,13 @@ fail-fast = false
 [[profile.ci.overrides]]
 filter = 'test(/renegotiat|datachannel_close|ice_restart/)'
 retries = 4
+
+# Used by the shared CI/release gate. Record first-attempt results; a retry
+# must not hide a regression. The legacy ci profile remains useful locally.
+[profile.qa]
+retries = 0
+fail-fast = false
+
+[profile.qa.junit]
+path = "junit.xml"
+report-skipped = "ignored"

@@ -18,6 +18,7 @@ use mistlib_core::transport::Transport;
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Exercises the `handle_offer` (answer side) and `replace_peer_and_close_old`
 /// (offer side) insert sites via a real handshake: both must leave
@@ -223,4 +224,363 @@ async fn try_enqueue_send_never_fails_while_a_concurrent_writer_hammers_peers() 
 
     stop.store(true, Ordering::Relaxed);
     writer.await.unwrap();
+}
+
+#[tokio::test]
+async fn awaitable_send_waits_for_capacity_and_frame_completion() {
+    use crate::transports::webrtc::peer::QueuedSend;
+    let t = make_transport();
+    let node = NodeId("receipt-peer".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(QueuedSend {
+        data: Bytes::from_static(b"first"),
+        method: DeliveryMethod::ReliableOrdered,
+        completion: None,
+    })
+    .unwrap();
+    t.send_queues.write().unwrap().insert(node.clone(), tx);
+    let send = t.send_wait(
+        &node,
+        Bytes::from_static(b"second"),
+        DeliveryMethod::ReliableOrdered,
+    );
+    tokio::pin!(send);
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut send)
+        .await
+        .is_err());
+    assert_eq!(rx.recv().await.unwrap().data, Bytes::from_static(b"first"));
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut send)
+        .await
+        .is_err());
+    let queued = rx.recv().await.unwrap();
+    assert_eq!(queued.data, Bytes::from_static(b"second"));
+    queued.completion.unwrap().send(Ok(())).unwrap();
+    assert!(send.await.is_ok());
+}
+
+#[tokio::test]
+async fn awaitable_send_reports_write_failure_and_queue_teardown() {
+    let t = make_transport();
+    let node = NodeId("receipt-peer".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    t.send_queues.write().unwrap().insert(node.clone(), tx);
+    let send = t.send_wait(
+        &node,
+        Bytes::from_static(b"fail"),
+        DeliveryMethod::ReliableOrdered,
+    );
+    tokio::pin!(send);
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut send)
+        .await
+        .is_err());
+    rx.recv()
+        .await
+        .unwrap()
+        .completion
+        .unwrap()
+        .send(Err(mistlib_core::error::MistError::Internal(
+            "write failure".into(),
+        )))
+        .unwrap();
+    assert!(send
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("write failure"));
+    drop(rx);
+    assert!(t
+        .send_wait(
+            &node,
+            Bytes::from_static(b"closed"),
+            DeliveryMethod::ReliableOrdered
+        )
+        .await
+        .is_err());
+    assert!(t
+        .send_wait(
+            &NodeId("missing".into()),
+            Bytes::new(),
+            DeliveryMethod::ReliableOrdered
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn awaitable_send_errors_when_admitted_frame_is_discarded() {
+    let t = make_transport();
+    let node = NodeId("receipt-peer".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    t.send_queues.write().unwrap().insert(node.clone(), tx);
+    let send = t.send_wait(
+        &node,
+        Bytes::from_static(b"discarded"),
+        DeliveryMethod::ReliableOrdered,
+    );
+    tokio::pin!(send);
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut send)
+        .await
+        .is_err());
+    drop(rx.recv().await.unwrap());
+    assert!(send.await.is_err());
+}
+
+#[tokio::test]
+async fn w5_regression_cancel_before_admission_must_not_consume_overlay_sequence() {
+    use crate::engine::tests::session_registry::{
+        session_with_webrtc_transport, REGISTRY_TEST_LOCK,
+    };
+    use crate::engine::ENGINE;
+    use crate::transports::webrtc::peer::QueuedSend;
+    use mistlib_core::overlay::OverlayRouter;
+    let _guard = REGISTRY_TEST_LOCK.lock().await;
+    let transport = Arc::new(make_transport());
+    let peer = NodeId("review-peer".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(QueuedSend {
+        data: Bytes::new(),
+        method: DeliveryMethod::ReliableOrdered,
+        completion: None,
+    })
+    .unwrap();
+    transport
+        .send_queues
+        .write()
+        .unwrap()
+        .insert(peer.clone(), tx);
+    let mut session = session_with_webrtc_transport("review-room", transport);
+    let overlay = Arc::new(OverlayRouter::new(
+        &mistlib_core::config::Config::default(),
+        session.node_store.clone(),
+        NodeId("sender".into()),
+    ));
+    Arc::get_mut(&mut session).unwrap().overlay = Some(overlay.clone());
+    ENGINE
+        .sessions
+        .write()
+        .unwrap()
+        .push(("review-room".into(), session));
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(20),
+        crate::app::send_message_direct_wait_in_room(
+            "review-room".into(),
+            peer.0.clone(),
+            b"cancelled".to_vec(),
+            crate::app::DELIVERY_RELIABLE,
+        ),
+    )
+    .await;
+    assert!(cancelled.is_err());
+    rx.recv().await.unwrap();
+    let success = crate::app::send_message_direct_wait_in_room(
+        "review-room".into(),
+        peer.0.clone(),
+        b"next".to_vec(),
+        crate::app::DELIVERY_RELIABLE,
+    );
+    tokio::pin!(success);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut success)
+            .await
+            .is_err()
+    );
+    let frame = rx.recv().await.unwrap();
+    let envelope: mistlib_core::overlay::OverlayEnvelope =
+        mistlib_core::overlay::wire::deserialize(&frame.data).unwrap();
+    frame.completion.unwrap().send(Ok(())).unwrap();
+    assert!(success.await.is_ok());
+    ENGINE
+        .sessions
+        .write()
+        .unwrap()
+        .retain(|(id, _)| id != "review-room");
+    let receiver = OverlayRouter::new(
+        &mistlib_core::config::Config::default(),
+        overlay.node_store.clone(),
+        peer,
+    );
+    let delivered = receiver.reorder_inbound(&envelope.from, envelope.seq, envelope.content);
+    assert_eq!(
+        delivered.len(),
+        1,
+        "successful next frame has seq {}; cancelling before admission left a gap (8s stall)",
+        envelope.seq
+    );
+}
+
+#[tokio::test]
+async fn rejected_oversized_send_must_not_stall_next_valid_send() {
+    use crate::engine::tests::session_registry::{
+        session_with_webrtc_transport, REGISTRY_TEST_LOCK,
+    };
+    use crate::engine::ENGINE;
+    use mistlib_core::overlay::OverlayRouter;
+    let _guard = REGISTRY_TEST_LOCK.lock().await;
+    let transport = Arc::new(make_transport());
+    let peer = NodeId("review-peer".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    transport
+        .send_queues
+        .write()
+        .unwrap()
+        .insert(peer.clone(), tx);
+    let mut session = session_with_webrtc_transport("review-room", transport.clone());
+    let overlay = Arc::new(OverlayRouter::new(
+        &mistlib_core::config::Config::default(),
+        session.node_store.clone(),
+        NodeId("sender".into()),
+    ));
+    Arc::get_mut(&mut session).unwrap().overlay = Some(overlay.clone());
+    ENGINE
+        .sessions
+        .write()
+        .unwrap()
+        .push(("review-room".into(), session));
+    transport.set_max_message_bytes(64);
+    let rejected = crate::app::send_message_direct_wait_in_room(
+        "review-room".into(),
+        peer.0.clone(),
+        vec![0; 64],
+        crate::app::DELIVERY_RELIABLE,
+    )
+    .await;
+    assert!(
+        matches!(rejected, Err(crate::error::MistError::Core(mistlib_core::error::MistError::MessageTooLarge { size, limit: 64 })) if size > 64)
+    );
+    assert!(rx.try_recv().is_err(), "rejected frame must not be queued");
+    let success = crate::app::send_message_direct_wait_in_room(
+        "review-room".into(),
+        peer.0.clone(),
+        b"next".to_vec(),
+        crate::app::DELIVERY_RELIABLE,
+    );
+    tokio::pin!(success);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut success)
+            .await
+            .is_err()
+    );
+    let frame = rx.recv().await.unwrap();
+    let envelope: mistlib_core::overlay::OverlayEnvelope =
+        mistlib_core::overlay::wire::deserialize(&frame.data).unwrap();
+    frame.completion.unwrap().send(Ok(())).unwrap();
+    assert!(success.await.is_ok());
+    ENGINE
+        .sessions
+        .write()
+        .unwrap()
+        .retain(|(id, _)| id != "review-room");
+    let receiver = OverlayRouter::new(
+        &mistlib_core::config::Config::default(),
+        overlay.node_store.clone(),
+        peer,
+    );
+    let delivered = receiver.reorder_inbound(&envelope.from, envelope.seq, envelope.content);
+    assert_eq!(
+        delivered.len(),
+        1,
+        "successful next frame has seq {}; rejecting an oversized frame left a gap (8s stall)",
+        envelope.seq
+    );
+}
+
+#[tokio::test]
+async fn direct_send_rejections_must_not_consume_overlay_sequence() {
+    use crate::engine::tests::session_registry::{
+        session_with_webrtc_transport, REGISTRY_TEST_LOCK,
+    };
+    use crate::engine::ENGINE;
+    use mistlib_core::overlay::OverlayRouter;
+    let _guard = REGISTRY_TEST_LOCK.lock().await;
+    let transport = Arc::new(make_transport());
+    let peer = NodeId("review-peer".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    transport
+        .send_queues
+        .write()
+        .unwrap()
+        .insert(peer.clone(), tx.clone());
+    let mut session = session_with_webrtc_transport("review-room", transport.clone());
+    let overlay = Arc::new(OverlayRouter::new(
+        &mistlib_core::config::Config::default(),
+        session.node_store.clone(),
+        NodeId("sender".into()),
+    ));
+    Arc::get_mut(&mut session).unwrap().overlay = Some(overlay.clone());
+    ENGINE
+        .sessions
+        .write()
+        .unwrap()
+        .push(("review-room".into(), session));
+    transport.send_queues.write().unwrap().remove(&peer);
+    assert!(
+        crate::app::send_message_direct(peer.0.clone(), vec![], crate::app::DELIVERY_RELIABLE)
+            .await
+            .is_err()
+    );
+    let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+    drop(closed_rx);
+    transport
+        .send_queues
+        .write()
+        .unwrap()
+        .insert(peer.clone(), closed_tx);
+    assert!(
+        crate::app::send_message_direct(peer.0.clone(), vec![], crate::app::DELIVERY_RELIABLE)
+            .await
+            .is_err()
+    );
+    transport
+        .send_queues
+        .write()
+        .unwrap()
+        .insert(peer.clone(), tx.clone());
+    tx.try_send(crate::transports::webrtc::peer::QueuedSend {
+        data: Bytes::new(),
+        method: DeliveryMethod::ReliableOrdered,
+        completion: None,
+    })
+    .unwrap();
+    assert!(
+        crate::app::send_message_direct(peer.0.clone(), vec![], crate::app::DELIVERY_RELIABLE)
+            .await
+            .is_err()
+    );
+    rx.recv().await.unwrap();
+    transport.set_max_message_bytes(64);
+    let rejected =
+        crate::app::send_message_direct(peer.0.clone(), vec![0; 64], crate::app::DELIVERY_RELIABLE)
+            .await;
+    assert!(
+        matches!(rejected, Err(crate::error::MistError::Core(mistlib_core::error::MistError::MessageTooLarge { size, limit: 64 })) if size > 64)
+    );
+    assert!(rx.try_recv().is_err(), "rejected frame must not be queued");
+    crate::app::send_message_direct(
+        peer.0.clone(),
+        b"next".to_vec(),
+        crate::app::DELIVERY_RELIABLE,
+    )
+    .await
+    .unwrap();
+    let frame = rx.recv().await.unwrap();
+    assert!(frame.completion.is_none());
+    let envelope: mistlib_core::overlay::OverlayEnvelope =
+        mistlib_core::overlay::wire::deserialize(&frame.data).unwrap();
+    ENGINE
+        .sessions
+        .write()
+        .unwrap()
+        .retain(|(id, _)| id != "review-room");
+    let receiver = OverlayRouter::new(
+        &mistlib_core::config::Config::default(),
+        overlay.node_store.clone(),
+        peer,
+    );
+    let delivered = receiver.reorder_inbound(&envelope.from, envelope.seq, envelope.content);
+    assert_eq!(
+        delivered.len(),
+        1,
+        "successful next frame has seq {}; rejecting an oversized frame left a gap (8s stall)",
+        envelope.seq
+    );
 }
