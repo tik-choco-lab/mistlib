@@ -1,0 +1,2 @@
+# Every runner must hash the exact committed release policy bytes.
+qa/policy.json text eol=lf
