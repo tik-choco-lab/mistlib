@@ -11,6 +11,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { nativeClient, browserClient, until } from './clients.mjs';
 import { startRelay } from './relay.mjs';
 
+const harnessErrors = [];
+process.on('unhandledRejection', error => {
+  harnessErrors.push(String(error?.stack || error));
+  process.exitCode = 1;
+});
+
 const { values: args } = parseArgs({ options: { ...Object.fromEntries(
   ['native', 'package', 'browser', 'target', 'out', 'commit', 'version', 'soak-seconds'].map(key => [key, { type: 'string' }])),
   'allow-dirty': { type: 'boolean', default: false } } });
@@ -250,7 +256,7 @@ try {
   for (const kinds of args.browser ? [['browser', 'browser'], ['browser', 'native'], ['native', 'browser']] : [['native', 'native']]) {
     await runPair(kinds, url);
   }
-  report.passed = true;
+  report.passed = harnessErrors.length === 0;
 } catch (error) {
   report.error = String(error.stack || error);
   process.exitCode = 1;
@@ -258,6 +264,10 @@ try {
   for (const resource of resources) await resource.close().catch(() => {});
   if (server) await new Promise(resolve => server.close(resolve));
   if (app) await rm(app, { recursive: true, force: true });
+  if (harnessErrors.length) {
+    report.passed = false;
+    report.error = [report.error, ...harnessErrors].filter(Boolean).join('\n');
+  }
   report.finishedAt = new Date().toISOString();
   await writeFile(output, JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify({ id: report.id, passed: report.passed, cases: report.cases.length, error: report.error }));

@@ -7,6 +7,9 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 
+// Traces grow with soak length; killing the browser mid-save truncates them and crashes Playwright.
+const TRACE_SAVE_DEADLINE_MS = 60000;
+
 export async function bounded(promise, timeout, description) {
   let timer;
   try {
@@ -148,7 +151,7 @@ export async function browserClient(browserType, url, directory, name) {
         try {
           const remaining = await bounded(page.evaluate(() => window.qa?.events || []), 1000, 'final events').catch(() => []);
           await writeFile(join(directory, `${name}.log`), JSON.stringify({ errors, consoleLog, events: [...history, ...remaining] }));
-          await bounded(context.tracing.stop({ path: join(directory, `${name}-trace.zip`) }), 5000, 'save trace');
+          await bounded(context.tracing.stop({ path: join(directory, `${name}-trace.zip`) }), TRACE_SAVE_DEADLINE_MS, 'save trace');
         } finally { await server.kill(); }
       },
     };
