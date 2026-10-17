@@ -11,6 +11,7 @@
     "mistlib-native:signaling::nostr::tests::topology::live_go_relay_six_nodes_reconnect_one_peer_keeps_graph_connected",
     "mistlib-native:signaling::nostr::tests::topology::live_go_relay_six_nodes_secret_rank_topology",
     "mistlib-native::loopback_media:publish_local_track_delivers_media_to_an_already_connected_peer",
+    "mistlib-native::loopback_media:track_audience_gates_the_offered_track_for_a_connected_peer",
     "mistlib-native::loopback_media:webrtc_track_flows_through_bridge_into_an_hls_segment"
   ]
 }
