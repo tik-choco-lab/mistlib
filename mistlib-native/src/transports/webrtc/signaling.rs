@@ -707,6 +707,9 @@ impl WebRtcTransport {
             crate::mem::record_peer_cleaned();
         }
         crate::mem::record_peer_inserted();
+        // `create_pc` attached under the audience of that moment; catch up with
+        // any change made before this peer became visible in `peers`.
+        self.resync_registered_peer(&remote_id, &peer).await;
 
         let attempt_id = self.reserve_connection_attempt(&remote_id);
         // `[ConnTiming]` instrumentation: attempt-start timestamp for the
@@ -735,7 +738,7 @@ impl WebRtcTransport {
             let expected = Arc::downgrade(&peer);
             self.cleanup_session_if_current(&remote_id, &expected, true, "handle_offer_error")
                 .await;
-        } else if self.has_published_tracks() {
+        } else if self.has_published_tracks_for(&remote_id) {
             // New-peer hook, answer-side completion: `create_pc` (called
             // above) already attached every published track to `peer`'s
             // RTCPeerConnection before `apply_offer` ran, but per JSEP the

@@ -99,6 +99,22 @@ pub fn set_local_track_enabled(track_id: String, enabled: bool) -> Result<(), Js
     Ok(())
 }
 
+pub fn set_local_track_audience(
+    track_id: String,
+    nodes: Option<Vec<NodeId>>,
+) -> Result<(), JsValue> {
+    let transports = crate::app::all_session_webrtc_transports();
+    if transports.is_empty() {
+        return Err(JsValue::from_str("WebRTC transport is not initialized"));
+    }
+    for webrtc in transports {
+        webrtc
+            .set_local_track_audience(&track_id, nodes.clone())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub fn publish_local_track(track_id: String) -> Result<(), JsValue> {
     let transports = crate::app::all_session_webrtc_transports();
     if transports.is_empty() {

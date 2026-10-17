@@ -248,6 +248,7 @@ pub struct LocalTrack {
     pub track: MediaStreamTrack,
     pub kind: String,
     pub published: bool,
+    pub audience: mistlib_core::transport::track_audience::TrackAudience,
 }
 
 pub struct WasmWebRtcTransport {
@@ -1748,7 +1749,7 @@ impl WasmWebRtcTransport {
                     .insert(remote_id.clone(), epoch);
             }
 
-            if self.has_published_tracks() {
+            if self.has_published_tracks(&remote_id) {
                 // New-peer hook, answer-side completion -- mirrors
                 // `mistlib-native`'s `signaling::handle_offer`: `create_pc`
                 // (called above) already attached every published track to

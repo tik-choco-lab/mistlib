@@ -23,7 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use mistlib::transports::webrtc::WebRtcTransport;
-use mistlib_core::signaling::{MessageContent, Signaler, SignalingHandler};
+use mistlib_core::signaling::{MessageContent, Signaler, SignalingHandler, SignalingType};
 use mistlib_core::transport::{NetworkEvent, NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, NodeId};
 use webrtc::api::media_engine::MIME_TYPE_H264;
@@ -41,12 +41,15 @@ use hls_support::{Segmenter, SegmenterConfig};
 /// standing in for a real signaling transport (Nostr, WebSocket, ...).
 struct DirectSignaler {
     peer: Mutex<Option<Arc<dyn SignalingHandler>>>,
+    /// SDP of every offer sent through this signaler, in order.
+    offers: Mutex<Vec<String>>,
 }
 
 impl DirectSignaler {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             peer: Mutex::new(None),
+            offers: Mutex::new(Vec::new()),
         })
     }
 
@@ -62,6 +65,11 @@ impl Signaler for DirectSignaler {
         _to: &NodeId,
         msg: MessageContent,
     ) -> mistlib_core::error::Result<()> {
+        if let MessageContent::Data(data) = &msg {
+            if data.signaling_type == SignalingType::Offer {
+                self.offers.lock().unwrap().push(data.data.clone());
+            }
+        }
         let peer = self.peer.lock().unwrap().clone();
         if let Some(peer) = peer {
             tokio::spawn(async move {
@@ -319,6 +327,105 @@ async fn publish_local_track_delivers_media_to_an_already_connected_peer() {
         .expect("media channel closed unexpectedly");
     assert_eq!(event.remote_id, node_a);
     keep_sending.abort();
+}
+
+// Per-track audience over a live connection, observed on the wire: the offers
+// the publisher sends carry the video m-section only while the peer is in the
+// track's audience. Excluded -> no offer mentions the track; widened -> an
+// offer with a sending video section; narrowed -> a later offer whose video
+// section no longer sends; `None` -> sending again. Reads the offers
+// (`DirectSignaler::offers`) rather than `on_track`, which needs live RTP delivery.
+#[ignore = "needs real UDP ICE connectivity; unreliable on restricted networks, see comment"]
+#[tokio::test]
+async fn track_audience_gates_the_offered_track_for_a_connected_peer() {
+    let node_a = NodeId("publisher3".to_string());
+    let node_b = NodeId("viewer3".to_string());
+
+    let sig_a = DirectSignaler::new();
+    let sig_b = DirectSignaler::new();
+    let transport_a = Arc::new(WebRtcTransport::new(sig_a.clone(), node_a.clone()));
+    let transport_b = Arc::new(WebRtcTransport::new(sig_b.clone(), node_b.clone()));
+    sig_a.set_peer(transport_b.clone());
+    sig_b.set_peer(transport_a.clone());
+
+    transport_a.start(Arc::new(NoopEventHandler)).await.unwrap();
+    transport_b.start(Arc::new(NoopEventHandler)).await.unwrap();
+
+    transport_a
+        .connect(&node_b)
+        .await
+        .expect("connect should succeed");
+    wait_until(
+        || transport_a.get_connection_state(&node_b) == ConnectionState::Connected,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90_000,
+            ..Default::default()
+        },
+        "video".to_string(),
+        "mistlink".to_string(),
+    ));
+    // Does the newest offer A sent carry a video section that sends?
+    let sending = || {
+        sig_a
+            .offers
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|sdp| video_section_sends(sdp))
+    };
+    let offers = || sig_a.offers.lock().unwrap().len();
+
+    // Registered, audience = nobody, then published: nothing is offered.
+    let before = offers();
+    transport_a
+        .register_local_track(video_track.clone())
+        .await
+        .unwrap();
+    transport_a
+        .set_local_track_audience("video", Some(vec![]))
+        .await
+        .unwrap();
+    transport_a
+        .publish_local_track(video_track.clone())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(offers(), before, "no offer for a peer outside the audience");
+
+    // Widen to B: an offer with a sending video section.
+    transport_a
+        .set_local_track_audience("video", Some(vec![node_b.clone()]))
+        .await
+        .unwrap();
+    wait_until(sending, Duration::from_secs(10)).await;
+
+    // Narrow to nobody: a later offer whose video section no longer sends.
+    let widened = offers();
+    transport_a
+        .set_local_track_audience("video", Some(vec![]))
+        .await
+        .unwrap();
+    wait_until(|| offers() > widened && !sending(), Duration::from_secs(10)).await;
+
+    // None restores everyone.
+    let narrowed = offers();
+    transport_a
+        .set_local_track_audience("video", None)
+        .await
+        .unwrap();
+    wait_until(|| offers() > narrowed && sending(), Duration::from_secs(10)).await;
+}
+
+fn video_section_sends(sdp: &str) -> bool {
+    sdp.split("m=")
+        .filter(|section| section.starts_with("video"))
+        .any(|section| section.contains("a=sendonly") || section.contains("a=sendrecv"))
 }
 
 async fn send_frame(track: &Arc<TrackLocalStaticRTP>, nal_byte: u8, timestamp: u32) {

@@ -1,4 +1,5 @@
 use super::{LocalTrack, Peer, WasmWebRtcTransport};
+use mistlib_core::transport::track_audience::TrackAudience;
 use mistlib_core::types::NodeId;
 use std::sync::Arc;
 use wasm_bindgen::JsValue;
@@ -14,7 +15,7 @@ impl WasmWebRtcTransport {
         let tracks: Vec<(String, MediaStreamTrack)> = {
             let lock = self.local_tracks.read().unwrap_or_else(|e| e.into_inner());
             lock.iter()
-                .filter(|(_, local)| local.published)
+                .filter(|(_, local)| local.published && local.audience.allows(remote_id))
                 .map(|(track_id, local)| (track_id.clone(), local.track.clone()))
                 .collect()
         };
@@ -22,6 +23,18 @@ impl WasmWebRtcTransport {
         let mut changed = false;
         let mut senders_lock = self.peer_senders.write().unwrap_or_else(|e| e.into_inner());
         let peer_senders = senders_lock.entry(remote_id.clone()).or_default();
+
+        let removed: Vec<String> = peer_senders
+            .keys()
+            .filter(|id| !tracks.iter().any(|(track_id, _)| track_id == *id))
+            .cloned()
+            .collect();
+        for id in removed {
+            if let Some(sender) = peer_senders.remove(&id) {
+                peer.pc.remove_track(&sender);
+                changed = true;
+            }
+        }
 
         for (track_id, track) in tracks {
             if peer_senders.contains_key(&track_id) {
@@ -79,12 +92,17 @@ impl WasmWebRtcTransport {
                 .get(&track_id)
                 .map(|entry| entry.published)
                 .unwrap_or(false);
+            let audience = lock
+                .get(&track_id)
+                .map(|entry| entry.audience.clone())
+                .unwrap_or_default();
             lock.insert(
                 track_id.clone(),
                 LocalTrack {
                     track: track.clone(),
                     kind,
                     published,
+                    audience,
                 },
             );
             published
@@ -94,6 +112,45 @@ impl WasmWebRtcTransport {
             self.replace_track_for_existing_senders(&track_id, &track);
         }
 
+        Ok(())
+    }
+
+    pub fn set_local_track_audience(
+        self: &Arc<Self>,
+        track_id: &str,
+        nodes: Option<Vec<NodeId>>,
+    ) -> mistlib_core::error::Result<()> {
+        {
+            let mut tracks = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
+            let entry = tracks.get_mut(track_id).ok_or_else(|| {
+                mistlib_core::error::MistError::Internal(format!(
+                    "Unknown local track: {}",
+                    track_id
+                ))
+            })?;
+            entry.audience = TrackAudience::new(nodes);
+            if !entry.published {
+                return Ok(());
+            }
+        }
+        let peers: Vec<_> = self
+            .peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .collect();
+        for (node, peer) in peers {
+            let changed = self
+                .attach_published_tracks_to_peer(&node, &peer)
+                .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
+            if changed {
+                let transport = self.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    transport.reconcile_peer_tracks(&node).await;
+                });
+            }
+        }
         Ok(())
     }
 
@@ -197,19 +254,20 @@ impl WasmWebRtcTransport {
         Ok(())
     }
 
-    /// `true` if at least one local track is currently published. Used by
+    /// `true` if at least one local track is currently published to `remote_id`
+    /// (published and the peer is in its audience). Used by
     /// `handle_offer` to decide whether a brand-new peer we just *answered*
     /// needs a follow-up offer of our own -- mirrors `mistlib-native`'s
     /// `has_published_tracks` (see `signaling::handle_offer` there for the
     /// JSEP reasoning: an answer cannot introduce m-lines beyond the remote's
     /// offer, so tracks attached in `create_pc` aren't negotiated by the
     /// answer alone).
-    pub(super) fn has_published_tracks(&self) -> bool {
+    pub(super) fn has_published_tracks(&self, remote_id: &NodeId) -> bool {
         self.local_tracks
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|track| track.published)
+            .any(|track| track.published && track.audience.allows(remote_id))
     }
 
     /// Recovery-path counterpart to the per-peer renegotiation in

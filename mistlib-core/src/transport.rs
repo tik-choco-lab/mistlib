@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 
+pub mod track_audience;
+
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub from: NodeId,

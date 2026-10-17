@@ -31,3 +31,5 @@ mod sdp_lines;
 mod send_queue;
 #[path = "guards/session_registry.rs"]
 mod session_registry;
+#[path = "guards/track_audience.rs"]
+mod track_audience;

@@ -491,6 +491,9 @@ impl WebRtcTransport {
                         let lock = handles.peers.read().await;
                         lock.get(&node).cloned()
                     };
+                    if let Some(peer) = &peer_opt {
+                        handles.reconcile_track_offer(&node, peer).await;
+                    }
 
                     let Some(peer) = peer_opt else {
                         // Sweeper livelock fix: a bare reservation with

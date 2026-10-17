@@ -978,6 +978,9 @@ pub struct WebRtcTransport {
     /// `WasmWebRtcTransport::local_tracks` (`published` bookkeeping) --
     /// see `mistlib-wasm/src/transport/webrtc.rs`.
     pub(crate) published_tracks: Arc<StdRwLock<HashMap<String, Arc<TrackLocalStaticRTP>>>>,
+    pub(crate) registered_tracks:
+        StdRwLock<HashMap<String, mistlib_core::transport::track_audience::TrackAudience>>,
+    pub(crate) media_changes: tokio::sync::Mutex<()>,
     /// Per-peer RTP senders created for published tracks, so
     /// `attach_published_tracks_to_peer` can skip a track already attached
     /// to a given peer and `unpublish_local_track` can find the sender to
@@ -1140,6 +1143,8 @@ impl WebRtcTransport {
             sweeper_started: AtomicBool::new(false),
             sweeper_cancel: Mutex::new(None),
             published_tracks: Arc::new(StdRwLock::new(HashMap::new())),
+            registered_tracks: StdRwLock::new(HashMap::new()),
+            media_changes: tokio::sync::Mutex::new(()),
             published_senders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }

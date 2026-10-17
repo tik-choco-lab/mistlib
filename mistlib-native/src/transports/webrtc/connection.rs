@@ -34,6 +34,7 @@ impl WebRtcTransport {
             channels,
             cancel_token: cancel_token.clone(),
             local_offer_unsent: std::sync::atomic::AtomicBool::new(false),
+            needs_track_reconcile: std::sync::atomic::AtomicBool::new(false),
             negotiating: tokio::sync::Mutex::new(()),
             send_tx,
         });
@@ -387,6 +388,7 @@ impl WebRtcTransport {
 
             self.setup_outgoing_data_channels(&peer, node).await?;
             self.replace_peer_and_close_old(node, peer.clone()).await;
+            self.resync_registered_peer(node, &peer).await;
             self.send_offer(node, &peer).await?;
             // Offer resend, initiator side: only the fresh connect_inner
             // attempt path opts into this -- `send_offer` is also called by

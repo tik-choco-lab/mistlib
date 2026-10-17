@@ -157,6 +157,48 @@ pub async fn unpublish_local_track(
     transport.unpublish_local_track(track).await
 }
 
+/// Registers (or replaces) a local track in `room_id` without publishing it,
+/// so its audience can be set before the first [`publish_local_track`].
+pub async fn register_local_track(
+    room_id: &str,
+    track: Arc<TrackLocalStaticRTP>,
+) -> crate::error::Result<()> {
+    let transport = resolve_room_webrtc_transport(room_id).await?;
+    transport.register_local_track(track).await
+}
+
+/// Limits a registered or published track to the peers in `nodes` (`None` =
+/// every peer, the default; `Some([])` = nobody). Peers that leave the
+/// audience lose the track (their remote side sees it removed), peers that
+/// join it get it, and peers connecting later are checked against it. Errors
+/// for an unknown track id or a room that isn't joined.
+pub async fn set_local_track_audience(
+    room_id: &str,
+    track_id: &str,
+    nodes: Option<Vec<NodeId>>,
+) -> crate::error::Result<()> {
+    let transport = resolve_room_webrtc_transport(room_id).await?;
+    transport.set_local_track_audience(track_id, nodes).await
+}
+
+/// Blocking form of [`set_local_track_audience`] for the C ABI; like the other
+/// sync app functions it must not be called from a tokio worker thread.
+pub fn set_local_track_audience_blocking(
+    room_id: &str,
+    track_id: &str,
+    nodes: Option<Vec<NodeId>>,
+) -> crate::error::Result<()> {
+    ENGINE
+        .runtime
+        .block_on(set_local_track_audience(room_id, track_id, nodes))
+}
+
+/// Unpublishes and forgets `track_id` in `room_id`; its audience is cleared.
+pub async fn remove_local_track(room_id: &str, track_id: &str) -> crate::error::Result<()> {
+    let transport = resolve_room_webrtc_transport(room_id).await?;
+    transport.remove_local_track(track_id).await
+}
+
 async fn resolve_room_webrtc_transport(
     room_id: &str,
 ) -> crate::error::Result<Arc<crate::transports::webrtc::WebRtcTransport>> {

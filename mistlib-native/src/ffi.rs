@@ -216,6 +216,61 @@ pub unsafe extern "C" fn send_message_in_room(
 }
 
 #[no_mangle]
+/// Limits a local media track of `room_id`'s session to a set of peers.
+/// `nodes_ptr` is a JSON array of node id strings (`["a","b"]`; `[]` = nobody);
+/// a null pointer restores the default of every peer. A published track is
+/// detached from peers that left the audience and attached to peers that
+/// joined it; peers connecting later are checked against it. The track must
+/// already be registered or published through the Rust API.
+///
+/// Returns 0 on success; 1 if the room isn't joined, the track is unknown or
+/// `nodes_ptr` is not a JSON array of strings (logged, nothing changes).
+///
+/// # Safety
+/// `room_ptr`, `track_ptr` must be valid for their `*_len` bytes; `nodes_ptr`
+/// must be null or valid for `nodes_len` bytes.
+pub unsafe extern "C" fn set_local_track_audience_in_room(
+    room_ptr: *const u8,
+    room_len: usize,
+    track_ptr: *const u8,
+    track_len: usize,
+    nodes_ptr: *const u8,
+    nodes_len: usize,
+) -> u32 {
+    let room_raw = unsafe { std::slice::from_raw_parts(room_ptr, room_len) };
+    let room_id = String::from_utf8_lossy(room_raw).to_string();
+    let track_raw = unsafe { std::slice::from_raw_parts(track_ptr, track_len) };
+    let track_id = String::from_utf8_lossy(track_raw).to_string();
+    let nodes = if nodes_ptr.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(nodes_ptr, nodes_len) };
+        match parse_node_id_array(raw) {
+            Some(nodes) => Some(nodes),
+            None => {
+                tracing::warn!(
+                    "set_local_track_audience_in_room: nodes is not a JSON string array"
+                );
+                return 1;
+            }
+        }
+    };
+    match crate::app::set_local_track_audience_blocking(&room_id, &track_id, nodes) {
+        Ok(()) => 0,
+        Err(err) => {
+            tracing::warn!("set_local_track_audience_in_room dropped: {err}");
+            1
+        }
+    }
+}
+
+/// `["a","b"]` -> node ids; anything but an array of strings -> `None`.
+fn parse_node_id_array(raw: &[u8]) -> Option<Vec<NodeId>> {
+    let ids: Vec<String> = serde_json::from_slice(raw).ok()?;
+    Some(ids.into_iter().map(NodeId).collect())
+}
+
+#[no_mangle]
 /// # Safety
 /// `buffer` must be valid for `buffer_len` bytes.
 pub unsafe extern "C" fn get_stats(buffer: *mut u8, buffer_len: usize) -> u32 {
@@ -370,4 +425,38 @@ pub unsafe extern "C" fn get_config(buffer: *mut u8, buffer_len: usize) -> u32 {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
     }
     bytes.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_id_array_accepts_only_string_arrays() {
+        let ids = parse_node_id_array(br#"["a","b"]"#).unwrap();
+        assert_eq!(ids, vec![NodeId("a".into()), NodeId("b".into())]);
+        assert_eq!(parse_node_id_array(b"[]").unwrap(), vec![]);
+        assert!(parse_node_id_array(b"[1]").is_none());
+        assert!(parse_node_id_array(br#"{"a":1}"#).is_none());
+        assert!(parse_node_id_array(b"").is_none());
+    }
+
+    #[test]
+    fn track_audience_export_reports_failures() {
+        let (room, track) = (b"room", b"track");
+        let call = |nodes: *const u8, len: usize| unsafe {
+            set_local_track_audience_in_room(
+                room.as_ptr(),
+                room.len(),
+                track.as_ptr(),
+                track.len(),
+                nodes,
+                len,
+            )
+        };
+        // malformed audience is rejected before the room is even looked up
+        assert_eq!(call(b"nope".as_ptr(), 4), 1);
+        // a null audience (everyone) on a room that isn't joined fails too
+        assert_eq!(call(std::ptr::null(), 0), 1);
+    }
 }

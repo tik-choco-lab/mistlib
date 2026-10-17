@@ -191,6 +191,10 @@ pub struct Peer {
     /// (`can_send_offer`'s `Stable` precondition), because the remote's
     /// answer to the first offer could then land on the replaced one.
     pub local_offer_unsent: std::sync::atomic::AtomicBool,
+    /// A published-track sender was added or removed but its renegotiation
+    /// offer has not been sent yet; `PeerSharedHandles::reconcile_track_offer`
+    /// sends it (sweeper retry). Mirrors mistlib-wasm's field of the same name.
+    pub needs_track_reconcile: std::sync::atomic::AtomicBool,
     /// Serializes this peer's negotiation steps -- `WebRtcTransport::send_offer`
     /// and `signaling::apply_offer` each take this for their *entire*
     /// create/apply(+send) sequence, not just the precondition check. Mirrors
@@ -290,6 +294,79 @@ pub struct PeerSharedHandles {
 }
 
 impl PeerSharedHandles {
+    /// Sends the renegotiation offer for a track change (a sender added or
+    /// removed) if `peer` is flagged `needs_track_reconcile` and currently able
+    /// to offer. Otherwise -- or on failure -- the flag stays set and the
+    /// sweeper retries. Mirrors mistlib-wasm's `reconcile_peer_tracks`.
+    pub(crate) async fn reconcile_track_offer(&self, node: &NodeId, peer: &Arc<Peer>) {
+        if !peer.needs_track_reconcile.load(Ordering::SeqCst) {
+            return;
+        }
+        let _negotiating = peer.negotiating.lock().await;
+        let signaling = peer.pc.signaling_state();
+        let unsent = peer.local_offer_unsent.load(Ordering::SeqCst);
+        let state_ok = matches!(
+            self.connection_states.read().unwrap().get(node),
+            Some(
+                ConnectionState::Connecting
+                    | ConnectionState::Connected
+                    | ConnectionState::Reconnecting
+            )
+        );
+        if !state_ok
+            || peer.cancel_token.is_cancelled()
+            || matches!(
+                peer.pc.connection_state(),
+                RTCPeerConnectionState::Failed
+                    | RTCPeerConnectionState::Closed
+                    | RTCPeerConnectionState::Disconnected
+            )
+            || !(signaling == RTCSignalingState::Stable
+                || (signaling == RTCSignalingState::HaveLocalOffer && unsent))
+        {
+            return;
+        }
+        peer.needs_track_reconcile.store(false, Ordering::SeqCst);
+        let result: mistlib_core::error::Result<()> = async {
+            let offer = peer
+                .pc
+                .create_offer(None)
+                .await
+                .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
+            if let Err(e) = peer.pc.set_local_description(offer).await {
+                super::rollback_to_stable_on_failure(&peer.pc, node).await;
+                return Err(mistlib_core::error::MistError::Internal(e.to_string()));
+            }
+            if let Some(desc) = peer.pc.local_description().await {
+                peer.local_offer_unsent.store(true, Ordering::SeqCst);
+                if let Err(e) = self
+                    .signaler
+                    .send_signaling(
+                        node,
+                        MessageContent::Data(SignalingData {
+                            sender_id: self.local_node_id.clone(),
+                            receiver_id: node.clone(),
+                            room_id: self.room_id.clone(),
+                            data: desc.sdp,
+                            signaling_type: SignalingType::Offer,
+                        }),
+                    )
+                    .await
+                {
+                    super::rollback_to_stable_on_failure(&peer.pc, node).await;
+                    return Err(e);
+                }
+                peer.local_offer_unsent.store(false, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            peer.needs_track_reconcile.store(true, Ordering::SeqCst);
+            tracing::info!("Deferred media renegotiation with {}: {}", node, error);
+        }
+    }
+
     /// Shared by the ICE `Disconnected` handler and `mark_suspect_disconnected`:
     /// moves a reserved peer into `Reconnecting` and starts (or leaves alone,
     /// if one is already running) its grace-period clock, tagged with `origin`.
@@ -1303,7 +1380,18 @@ impl Peer {
         &self,
         track: Arc<dyn TrackLocal + Send + Sync>,
     ) -> crate::error::Result<Arc<RTCRtpSender>> {
-        self.pc.add_track(track).await.map_err(Into::into)
+        // webrtc-rs reuses the transceiver of a previously removed sender for the
+        // same track id, but that sender was stopped by `remove_track` and
+        // cannot be revived (`replace_track` fails). Fall back to a fresh
+        // transceiver, so a track can be detached and attached again (audience
+        // changes, unpublish -> publish).
+        match self.pc.add_track(track.clone()).await {
+            Ok(sender) => Ok(sender),
+            Err(_) => {
+                let transceiver = self.pc.add_transceiver_from_track(track, None).await?;
+                Ok(transceiver.sender().await)
+            }
+        }
     }
 
     fn detach_data_channel_handlers(dc: &RTCDataChannel) {

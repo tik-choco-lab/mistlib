@@ -221,6 +221,31 @@ pub fn get_local_track(track_id: String) -> Result<Option<MediaStreamTrack>, JsV
 }
 
 #[wasm_bindgen]
+pub fn set_local_track_audience(
+    track_id: String,
+    #[wasm_bindgen(unchecked_param_type = "string[] | null | undefined")] node_ids: JsValue,
+) -> Result<(), JsValue> {
+    let nodes = if node_ids.is_null() || node_ids.is_undefined() {
+        None
+    } else {
+        if !js_sys::Array::is_array(&node_ids) {
+            return Err(JsValue::from_str(
+                "Track audience must be an array of strings or null/undefined",
+            ));
+        }
+        let mut nodes = Vec::new();
+        for value in js_sys::Array::from(&node_ids).iter() {
+            let id = value
+                .as_string()
+                .ok_or_else(|| JsValue::from_str("Track audience entries must be strings"))?;
+            nodes.push(mistlib_core::types::NodeId(id));
+        }
+        Some(nodes)
+    };
+    crate::app::set_local_track_audience(track_id, nodes)
+}
+
+#[wasm_bindgen]
 pub fn publish_local_track(track_id: String) -> Result<(), JsValue> {
     crate::app::publish_local_track(track_id)
 }
