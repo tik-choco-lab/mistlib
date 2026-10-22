@@ -28,14 +28,14 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: eligible
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
               ...context.repo, run_id: context.payload.workflow_run.id
             });
             core.setOutput('ready', artifacts.some(a => a.name === 'quality-receipt' && !a.expired));
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.eligible.outputs.ready == 'true'
         with:
           ref: ${{ github.event.workflow_run.head_sha }}

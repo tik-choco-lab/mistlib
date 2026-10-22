@@ -22,14 +22,14 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       publish: ${{ steps.existing.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - id: version
         run: python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print("version="+version())' >> "$GITHUB_OUTPUT"
       - id: existing
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           VERSION: ${{ steps.version.outputs.version }}
         with:
@@ -81,13 +81,14 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 'lts/*'
+          check-latest: true
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
@@ -107,7 +108,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
