@@ -3,6 +3,11 @@
 mod backpressure;
 #[path = "guards/candidate_delivery.rs"]
 mod candidate_delivery;
+#[path = "guards/disconnect_grace.rs"]
+mod disconnect_grace;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "guards/ice_callback.rs"]
+mod ice_callback;
 #[path = "guards/ice_config.rs"]
 mod ice_config;
 #[path = "guards/ice_restart.rs"]
@@ -31,5 +36,7 @@ mod sdp_lines;
 mod send_queue;
 #[path = "guards/session_registry.rs"]
 mod session_registry;
+#[path = "guards/storage_frame.rs"]
+mod storage_frame;
 #[path = "guards/track_audience.rs"]
 mod track_audience;

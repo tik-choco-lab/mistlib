@@ -2,7 +2,7 @@ use super::backend::{BlockStore, MetaStore, PeerResolver, SelfPositionSource};
 use super::cid::{compute_cid, verify_cid, MULTICODEC_DAG_CBOR, MULTICODEC_RAW};
 use super::pin::{PinRegistry, PIN_REGISTRY_META_KEY};
 use super::types::{FileManifest, StorageManager, CHUNK_SIZE};
-use crate::config::StorageConfig;
+use crate::config::{StorageConfig, StorageTransferConfig};
 use crate::error::{MistError, Result};
 use crate::types::Vector3;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +44,7 @@ pub struct StorageEngine<B: BlockStore, P: PeerResolver> {
     manager: Mutex<StorageManager>,
     position_source: Option<Arc<dyn SelfPositionSource>>,
     spatial: SpatialPolicy,
+    transfer: StorageTransferConfig,
     sweep_counter: AtomicU64,
     meta: Option<Arc<dyn MetaStore>>,
     // Pin registry state (SPEC-18). Loaded lazily from `meta` on first
@@ -65,12 +66,31 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         position_source: Option<Arc<dyn SelfPositionSource>>,
         spatial: SpatialPolicy,
     ) -> Self {
+        Self::new_with_transfer(
+            store,
+            resolver,
+            max_capacity_bytes,
+            position_source,
+            spatial,
+            StorageTransferConfig::default(),
+        )
+    }
+
+    pub fn new_with_transfer(
+        store: B,
+        resolver: P,
+        max_capacity_bytes: u64,
+        position_source: Option<Arc<dyn SelfPositionSource>>,
+        spatial: SpatialPolicy,
+        transfer: StorageTransferConfig,
+    ) -> Self {
         Self {
             store,
             resolver,
             manager: Mutex::new(StorageManager::new(max_capacity_bytes)),
             position_source,
             spatial,
+            transfer,
             sweep_counter: AtomicU64::new(0),
             meta: None,
             pin_registry: Mutex::new(PinRegistry::new()),
@@ -219,6 +239,14 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         let manifest: FileManifest = serde_cbor::from_slice(&manifest_bytes)
             .map_err(|e| MistError::Serialization(e.to_string()))?;
 
+        let mut missing = Vec::new();
+        for cid in &manifest.chunks {
+            if self.store.load_block(cid).await?.is_none() {
+                missing.push(cid.clone());
+            }
+        }
+        self.resolver.prefetch_providers(&missing).await;
+
         info!(
             "StorageEngine: downloading '{}' ({} bytes, {} chunks)",
             manifest.name,
@@ -229,7 +257,7 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         use futures_util::stream::{FuturesUnordered, StreamExt};
         use std::collections::BTreeMap;
 
-        let concurrency = 4;
+        let concurrency = self.transfer.get_concurrency.clamp(1, 64) as usize;
         let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         let mut futures = FuturesUnordered::new();
         let mut next_index = 0usize;
@@ -558,9 +586,16 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
             self.manager.lock().unwrap().touch(cid);
             return Ok(data);
         }
-        let data = self.resolver.resolve_block(cid).await.ok_or_else(|| {
-            MistError::Network(format!("Block not found locally or on peers: {}", cid))
-        })?;
+        let data = self
+            .resolver
+            .resolve_block_result(cid)
+            .await?
+            .ok_or_else(|| {
+                MistError::Network(format!(
+                    "Block unavailable locally; peer transfer failed or no provider answered: {}",
+                    cid
+                ))
+            })?;
         if !verify_cid(cid, &data, codec) {
             warn!("StorageEngine: Hash mismatch for {}", cid);
             return Err(MistError::Internal("Hash mismatch".into()));

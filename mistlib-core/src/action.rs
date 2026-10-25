@@ -2,12 +2,37 @@ use crate::overlay::OverlayEnvelope;
 use crate::types::{DeliveryMethod, NodeId};
 use bytes::Bytes;
 
+/// Local scheduling metadata; never serialized into an overlay envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendLane {
+    #[default]
+    General,
+    Control,
+    Bulk,
+}
+
+impl SendLane {
+    pub fn classify(content: &crate::signaling::MessageContent, broadcast: bool) -> Self {
+        use crate::signaling::MessageContent;
+        use crate::storage::protocol::{classify_storage_frame, StorageFrame};
+        match content {
+            MessageContent::Raw(data) => match classify_storage_frame(data) {
+                Some(StorageFrame::HaveChunk { .. }) if !broadcast => Self::Bulk,
+                Some(StorageFrame::HaveChunk { .. }) | None => Self::General,
+                Some(_) => Self::Control,
+            },
+            MessageContent::Overlay(_) | MessageContent::Data(_) => Self::Control,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum OverlayAction {
     SendMessage {
         to: NodeId,
         data: Bytes,
         method: DeliveryMethod,
+        lane: SendLane,
     },
 
     Connect {

@@ -51,6 +51,13 @@ pub struct CandidateAck {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NegotiationEnvelope {
+    /// Optional JSON-only capability; this DTO has no deny_unknown_fields.
+    #[serde(
+        rename = "reliableUnordered",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reliable_unordered: Option<u8>,
     #[serde(rename = "i")]
     pub id: u64,
     #[serde(rename = "s")]
@@ -118,5 +125,42 @@ mod tests {
         assert!(!SignalingType::CandidateAck.is_local_only());
         assert!(!SignalingType::NegotiationAck.is_local_only());
         assert!(!SignalingType::Request.is_local_only());
+    }
+}
+
+#[cfg(test)]
+mod reliable_unordered_tests {
+    use super::*;
+    #[derive(Deserialize)]
+    struct OldNegotiationEnvelope {
+        i: u64,
+        s: String,
+    }
+    #[test]
+    fn optional_capability_keeps_default_json_and_old_reader_compatibility() {
+        let plain = NegotiationEnvelope {
+            id: 7,
+            sdp: "sdp".into(),
+            reliable_unordered: None,
+        };
+        let bytes = serde_json::to_string(&plain).unwrap();
+        assert_eq!(bytes, r#"{"i":7,"s":"sdp"}"#);
+        assert_eq!(
+            serde_json::from_str::<NegotiationEnvelope>(&bytes).unwrap(),
+            plain
+        );
+        let capable = NegotiationEnvelope {
+            reliable_unordered: Some(1),
+            ..plain
+        };
+        let bytes = serde_json::to_string(&capable).unwrap();
+        let old: OldNegotiationEnvelope = serde_json::from_str(&bytes).unwrap();
+        assert_eq!((old.i, old.s.as_str()), (7, "sdp"));
+        assert_eq!(
+            serde_json::from_str::<NegotiationEnvelope>(&bytes)
+                .unwrap()
+                .reliable_unordered,
+            Some(1)
+        );
     }
 }

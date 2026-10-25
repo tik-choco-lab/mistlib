@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import { join, resolve, sep, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { nativeClient, browserClient, until } from './clients.mjs';
@@ -45,6 +46,24 @@ const report = {
 let browser, server, app;
 const resources = new Set();
 const nonce = randomUUID();
+const netemScript = fileURLToPath(new URL('./netem.sh', import.meta.url));
+const shapeWan = process.platform === 'linux' && process.env.MISTLIB_QA_NETEM === '1';
+const deepWanQueue = process.env.MISTLIB_QA_WAN_QUEUE === 'deep';
+let netemActive = false;
+// 90% of payload serialization time at the shaped rate, tolerating netem burst.
+const wanFloorMs = (bytes, rateKbit) => 0.9 * bytes * 8 / rateKbit;
+function disableNetem() {
+  if (!netemActive) return;
+  execFileSync('sudo', ['-n', netemScript, 'off'], { stdio: 'inherit' });
+  netemActive = false;
+}
+// Exit handlers must be synchronous; also cover interruption during a transfer.
+process.on('exit', () => {
+  try { disableNetem(); }
+  catch (error) { console.error('netem cleanup failed:', error); process.exitCode = 1; }
+});
+process.once('SIGINT', () => process.exit(130));
+process.once('SIGTERM', () => process.exit(143));
 
 async function hostPackage() {
   app = await mkdtemp(join(tmpdir(), 'mistlib-web-qa-'));
@@ -227,6 +246,49 @@ async function runPair(kinds, url) {
       }
       return { transfers: 2, corruptions: 0 };
     });
+    await phase('storage-wan', async () => {
+      const { bytes, delayMs, rateKbit, queueMs, deadlineMs } = policy.wanStorage;
+      // One shared band carries both directions. netem's limit includes delay-stage
+      // packets: reserve 2*delayMs propagation plus queueMs buffering at rateKbit.
+      // ceil((2*delayMs + queueMs)/1000 * rateKbit*1000/8 / 1200), assuming
+      // MTU-ish 1200 B packets; this is a packet budget, so overflow loss is allowed.
+      const limitPackets = Math.ceil((2 * delayMs + queueMs) / 1000 * rateKbit * 1000 / 8 / 1200);
+      // Five blocks cross get()'s four-way boundary. At 1 mbit even one 1 MiB
+      // block needs ~8.4 s, exceeding the old resolver's fixed 5 s deadline.
+      const transferMs = [], cids = new Set();
+      try {
+        if (shapeWan) {
+          netemActive = true; // Cleanup also covers a partially applied setup.
+          execFileSync('sudo', ['-n', netemScript, 'on', String(delayMs), String(rateKbit),
+            ...(deepWanQueue ? [] : [String(limitPackets)])], { stdio: 'inherit' });
+        }
+        for (let sender = 0; sender < 2; sender++) {
+          const stored = await clients[sender].command({ op: 'store-generated',
+            seed: 0x19a50001 + sender, size: bytes }, deadlineMs);
+          assert.equal(typeof stored.cid, 'string'); assert(stored.cid.length > 0);
+          assert(!cids.has(stored.cid), 'each direction must fetch fresh content');
+          cids.add(stored.cid);
+          assert.equal(stored.size, bytes);
+          assert.match(stored.sha256, /^[0-9a-f]{64}$/);
+          const started = performance.now();
+          const fetched = await clients[1 - sender].command({ op: 'get-digest', cid: stored.cid }, deadlineMs);
+          const elapsed = performance.now() - started;
+          assert(elapsed <= deadlineMs, 'WAN storage per-direction deadline');
+          // Faster than the shaped link's serialization time means the bytes never
+          // crossed it (e.g. a shared local block store); that is not a WAN pass.
+          if (shapeWan) assert(elapsed >= wanFloorMs(bytes, rateKbit),
+            `WAN transfer ${Math.round(elapsed)} ms is below the shaped-link floor`);
+          assert.deepEqual(fetched, { sha256: stored.sha256, size: stored.size }, 'WAN cross-peer size and digest');
+          transferMs.push(elapsed);
+        }
+        // Record only the shaping actually applied; unshaped runs report null.
+        return { transfers: 2, corruptions: 0, bytes, shaped: shapeWan,
+          delayMs: shapeWan ? delayMs : null, rateKbit: shapeWan ? rateKbit : null,
+          queueMs: shapeWan && !deepWanQueue ? queueMs : null,
+          limitPackets: shapeWan && !deepWanQueue ? limitPackets : null,
+          queueProfile: shapeWan ? (deepWanQueue ? 'deep' : 'bounded') : null, transferMs };
+      } finally { disableNetem(); }
+    });
     await phase('soak', async () => {
       const started = performance.now(), samples = [];
       let sent = 0, deliveryMs = 0, batch = 0;
@@ -261,6 +323,8 @@ try {
   report.error = String(error.stack || error);
   process.exitCode = 1;
 } finally {
+  try { disableNetem(); }
+  catch (error) { harnessErrors.push(`netem cleanup failed: ${error.stack || error}`); process.exitCode = 1; }
   for (const resource of resources) await resource.close().catch(() => {});
   if (server) await new Promise(resolve => server.close(resolve));
   if (app) await rm(app, { recursive: true, force: true });

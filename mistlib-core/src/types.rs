@@ -41,6 +41,7 @@ impl std::fmt::Display for NodeId {
 pub const DELIVERY_RELIABLE: u32 = 0;
 pub const DELIVERY_UNRELIABLE_ORDERED: u32 = 1;
 pub const DELIVERY_UNRELIABLE: u32 = 2;
+pub const DELIVERY_RELIABLE_UNORDERED: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[repr(u32)]
@@ -48,16 +49,18 @@ pub enum DeliveryMethod {
     ReliableOrdered = 0,
     UnreliableOrdered = 1,
     Unreliable = 2,
+    /// Fully reliable, with no ordering guarantee. Falls back to reliable ordered.
+    ReliableUnordered = 3,
 }
 
 impl DeliveryMethod {
     /// Converts a raw FFI `u32` delivery-method code into a `DeliveryMethod`,
-    /// falling back to `Unreliable` for any value other than the two
-    /// explicit codes above -- mirrors the native/wasm FFI boundary contract.
+    /// falling back to `Unreliable` for unknown values -- mirrors the native/wasm FFI boundary contract.
     pub fn from_u32(v: u32) -> Self {
         match v {
             DELIVERY_RELIABLE => DeliveryMethod::ReliableOrdered,
             DELIVERY_UNRELIABLE_ORDERED => DeliveryMethod::UnreliableOrdered,
+            DELIVERY_RELIABLE_UNORDERED => DeliveryMethod::ReliableUnordered,
             _ => DeliveryMethod::Unreliable,
         }
     }

@@ -33,6 +33,7 @@ pub struct OverlayRouter {
     pub strategies: Vec<Arc<dyn TopologyStrategy>>,
     pub local_node_id: NodeId,
     pub hop_count: u32,
+    pub transfer: crate::config::StorageTransferConfig,
     seen_envelopes: Mutex<OverlaySeenCache>,
     /// Per-destination monotonic sequence counters (sender side).
     seq_counters: Mutex<HashMap<NodeId, SeqCounter>>,
@@ -50,6 +51,7 @@ impl OverlayRouter {
             strategies: Vec::new(),
             local_node_id,
             hop_count: config.limits.hop_count,
+            transfer: config.storage.transfer.clone(),
             seen_envelopes: Mutex::new(OverlaySeenCache::new(
                 OVERLAY_SEEN_TTL,
                 OVERLAY_SEEN_MAX_ENTRIES,
@@ -59,7 +61,8 @@ impl OverlayRouter {
         }
     }
 
-    /// Returns the next per-destination sequence number (monotonic, starting at 1).
+    /// Hold the sequence lock through building and committing a frame, then
+    /// consume its per-destination number (starting at 1) only on success.
     /// Bounded: the least recently used counter is evicted past the cap, so a
     /// long-running node under destination churn cannot grow this map forever.
     pub(crate) fn with_next_seq<T>(
@@ -242,6 +245,40 @@ mod tests {
     }
 
     #[test]
+    fn inbound_relayed_data_clears_only_the_link_peer_once_even_if_duplicate() {
+        use crate::action::OverlayAction;
+        use crate::stats::{ping, STATS};
+        let router = router();
+        let link = NodeId("router-activity-link".into());
+        let source = NodeId("router-activity-source".into());
+        let frame = envelope(&source.0, router.local_node_id.clone(), 77, 1);
+        // Prime duplicate suppression before either peer becomes suspect.
+        assert!(
+            router
+                .handle_envelope(frame.clone(), link.clone())
+                .should_deliver
+        );
+        for _ in 0..=3 {
+            ping::tick_actions(&router.local_node_id, 1, &[link.clone(), source.clone()], 3);
+        }
+        STATS.set_rtt(link.clone(), 42.0);
+        let result = router.handle_envelope(frame.clone(), link.clone());
+        assert!(!result.should_deliver);
+        assert!(
+            matches!(result.actions.as_slice(), [OverlayAction::ClearSuspect { to }] if *to == link)
+        );
+        assert_eq!(STATS.ping_consecutive_misses(&link), 0);
+        assert_eq!(STATS.ping_consecutive_misses(&source), 3);
+        assert_eq!(STATS.rtt_millis.lock().unwrap().get(&link), Some(&42.0));
+        assert!(router
+            .handle_envelope(frame, link.clone())
+            .actions
+            .is_empty());
+        STATS.remove_node(&link);
+        STATS.remove_node(&source);
+    }
+
+    #[test]
     fn handle_envelope_drops_duplicate_msg_id() {
         let router = router();
         let peer = NodeId("peer-a".to_string());
@@ -362,6 +399,51 @@ mod tests {
         let envelope: OverlayEnvelope = crate::overlay::wire::deserialize(&data).unwrap();
         assert_eq!(envelope.seq, 251);
         assert_eq!(router.seen_envelopes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_commit_preserves_sequence_and_outgoing_state() {
+        use crate::error::MistError;
+        use crate::types::DeliveryMethod;
+        use bytes::Bytes;
+
+        let router = router();
+        let target = NodeId("target".into());
+        let dispatch = |commit| {
+            router.dispatch_data(
+                &target,
+                Bytes::new(),
+                DeliveryMethod::ReliableOrdered,
+                |_| Ok(()),
+                commit,
+            )
+        };
+        let reject: fn(crate::action::OverlayAction) -> crate::error::Result<u64> = |action| {
+            assert_eq!(seq_of(action), 1);
+            Err(MistError::Internal("queue full".into()))
+        };
+        assert!(dispatch(reject).is_err());
+        assert!(!router.seq_counters.lock().unwrap().contains_key(&target));
+        assert_eq!(router.seen_envelopes.lock().unwrap().len(), 0);
+        let accept: fn(crate::action::OverlayAction) -> crate::error::Result<u64> =
+            |action| Ok(seq_of(action));
+        assert_eq!(dispatch(accept).unwrap(), 1);
+        assert_eq!(router.seen_envelopes.lock().unwrap().len(), 1);
+        // Failure must also leave an existing counter unchanged.
+        assert!(router
+            .dispatch_data(
+                &target,
+                Bytes::new(),
+                DeliveryMethod::ReliableOrdered,
+                |_| Ok(()),
+                |action| {
+                    assert_eq!(seq_of(action), 2);
+                    Err::<(), _>(MistError::Internal("queue closed".into()))
+                },
+            )
+            .is_err());
+        assert_eq!(router.seen_envelopes.lock().unwrap().len(), 1);
+        assert_eq!(dispatch(accept).unwrap(), 2);
     }
 
     #[test]

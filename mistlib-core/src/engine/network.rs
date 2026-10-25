@@ -1,6 +1,5 @@
 use super::{EngineEvent, MistEngine};
 use crate::overlay::dnve3::Vector3;
-use crate::overlay::ActionHandler;
 use crate::overlay::OverlayEnvelope;
 use crate::signaling::MessageContent;
 use crate::transport::NetworkEvent;
@@ -64,7 +63,7 @@ impl MistEngine {
 
         if let Some(result) = result {
             for action in result.actions {
-                self.handle_action(action);
+                self.dispatch_received_action(action).await;
             }
         }
 

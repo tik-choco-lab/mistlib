@@ -56,6 +56,7 @@ async fn duplicate_answers_are_idempotent_and_acknowledged() {
         room_id: "answers".into(),
         signaling_type: SignalingType::Answer,
         data: serde_json::to_string(&mistlib_core::signaling::NegotiationEnvelope {
+            reliable_unordered: None,
             id: 42,
             sdp: answer.sdp.clone(),
         })
@@ -138,6 +139,7 @@ async fn duplicate_answers_are_idempotent_and_acknowledged() {
         room_id: "answers".into(),
         signaling_type: SignalingType::Answer,
         data: serde_json::to_string(&mistlib_core::signaling::NegotiationEnvelope {
+            reliable_unordered: None,
             id: 43,
             sdp: resent.clone(),
         })
@@ -1084,7 +1086,17 @@ async fn concurrent_offers_on_same_peer_are_serialized_not_interleaved() {
     // The crux of the fix: each answer's m-line count must correspond to
     // exactly one of the two offers, not a mix produced by an interleaved
     // set_remote_description/create_answer/set_local_description sequence.
-    let mut m_line_counts: Vec<usize> = answers.iter().map(|sdp| count_m_lines(sdp)).collect();
+    // Answers travel in the negotiation JSON envelope (SPEC-20 capability).
+    let mut m_line_counts: Vec<usize> = answers
+        .iter()
+        .map(|data| {
+            let sdp = serde_json::from_str::<serde_json::Value>(data)
+                .ok()
+                .and_then(|v| v.get("s").and_then(|s| s.as_str()).map(str::to_owned))
+                .unwrap_or_else(|| data.clone());
+            count_m_lines(&sdp)
+        })
+        .collect();
     m_line_counts.sort();
     assert_eq!(
         m_line_counts,

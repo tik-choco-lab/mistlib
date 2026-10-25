@@ -24,6 +24,7 @@ pub use events::{
     emit_peer_connected, emit_peer_disconnected, emit_room_join_failed, emit_room_joined,
     emit_room_left, register_event_callback,
 };
+pub(crate) use events::{reset_storage_room, reset_storage_senders};
 pub use media::{
     emit_media_track_added, emit_media_track_removed, get_local_track, publish_local_track,
     register_local_track, register_media_event_callback, remove_local_track,
@@ -85,6 +86,18 @@ pub(crate) fn all_session_transports() -> Vec<Arc<dyn Transport>> {
         .collect()
 }
 
+pub(crate) fn all_storage_session_transports() -> Vec<(String, Arc<dyn Transport>)> {
+    SESSIONS.with(|sessions| {
+        sessions
+            .borrow()
+            .iter_in_join_order()
+            .filter_map(|(room, session)| {
+                running_ctx(&session.engine).map(|ctx| (room.to_string(), ctx.transport.clone()))
+            })
+            .collect()
+    })
+}
+
 pub(crate) fn all_session_webrtc_transports() -> Vec<Arc<WasmWebRtcTransport>> {
     SESSIONS.with(|s| {
         s.borrow()
@@ -126,7 +139,8 @@ pub const EVENT_ROOM_LEFT: u32 = 10;
 pub const MEDIA_EVENT_TRACK_ADDED: u32 = 100;
 pub const MEDIA_EVENT_TRACK_REMOVED: u32 = 101;
 pub use mistlib_core::types::{
-    DELIVERY_RELIABLE, DELIVERY_UNRELIABLE, DELIVERY_UNRELIABLE_ORDERED,
+    DELIVERY_RELIABLE, DELIVERY_RELIABLE_UNORDERED, DELIVERY_UNRELIABLE,
+    DELIVERY_UNRELIABLE_ORDERED,
 };
 
 /// Overlay `message_type` for the app-level position-sync broadcast sent by
@@ -139,13 +153,30 @@ pub use mistlib_core::types::{
 /// is the only reader and assumes nothing else uses this message type.
 pub(crate) const MSG_TYPE_POSITION_SYNC_BIN: u32 = 200;
 
+static TRACING_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static LOG_LEVEL: std::cell::Cell<tracing::Level> = const { std::cell::Cell::new(tracing::Level::INFO) };
+}
+
+/// Set the browser logger's level before the first init/init_with_config.
+/// Returns false for an unknown level or once logging has been initialized.
+pub fn set_log_level(level: &str) -> bool {
+    if TRACING_INIT.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    let Ok(level) = level.parse::<tracing::Level>() else {
+        return false;
+    };
+    LOG_LEVEL.with(|configured| configured.set(level));
+    true
+}
+
 fn init_runtime_once() {
     console_error_panic_hook::set_once();
 
-    static TRACING_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !TRACING_INIT.swap(true, std::sync::atomic::Ordering::SeqCst) {
         let config = tracing_wasm::WASMLayerConfigBuilder::new()
-            .set_max_level(tracing::Level::INFO)
+            .set_max_level(LOG_LEVEL.with(|level| level.get()))
             .build();
         tracing_wasm::set_as_global_default_with_config(config);
     }
@@ -253,6 +284,7 @@ fn apply_update_position(engine: &Arc<MistEngine>, self_id: &NodeId, x: f32, y: 
             to: target,
             data: Bytes::from(data.clone()),
             method: DeliveryMethod::Unreliable,
+            lane: mistlib_core::action::SendLane::Control,
         });
     }
 }
@@ -406,38 +438,19 @@ fn delivery_from(method: u32) -> DeliveryMethod {
     DeliveryMethod::from_u32(method)
 }
 
-/// Sends `bytes` to `target` through `ctx`'s overlay (falling back to a raw
-/// send/broadcast if the overlay isn't up yet), routing through
-/// `overlay.wrap_data` so envelope framing stays consistent regardless of
-/// which session's transport ends up carrying it.
+/// Send original app bytes through the session transport. When an overlay is
+/// active, its router frames and commits into the same per-peer queue used by
+/// storage/control sends. Encoding here and sending raw would bypass that queue.
 async fn send_via_ctx(
     ctx: &Arc<RunningContext>,
     target: &NodeId,
     bytes: Bytes,
     delivery: DeliveryMethod,
 ) {
-    let Some(overlay) = ctx.overlay.as_ref() else {
-        if target.is_broadcast() {
-            let _ = ctx.transport.broadcast(bytes, delivery).await;
-        } else {
-            let _ = ctx.transport.send(target, bytes, delivery).await;
-        }
-        return;
-    };
-
-    let action = overlay.wrap_data(target, bytes, delivery);
-    let mistlib_core::action::OverlayAction::SendMessage { to, data, method } = action else {
-        return;
-    };
-
-    // `data` is already a serialized OverlayEnvelope (from wrap_data above), so it
-    // must go out over the raw network transport, not `ctx.transport`
-    // (`OverlayTransport`), which would wrap it a second time.
-    let transport = ctx.preferred_transport();
-    if to.is_broadcast() {
-        let _ = transport.broadcast(data, method).await;
+    if target.is_broadcast() {
+        let _ = ctx.transport.broadcast(bytes, delivery).await;
     } else {
-        let _ = transport.send(&to, data, method).await;
+        let _ = ctx.transport.send(target, bytes, delivery).await;
     }
 }
 
@@ -461,31 +474,10 @@ thread_local! {
     static SEND_DRAINER_RUNNING: Cell<bool> = Cell::new(false);
 }
 
-/// Queues `(ctx, target, bytes, delivery)` for `send_via_ctx` and ensures a
-/// single drainer task is (or stays) running to work through `SEND_QUEUE` in
-/// order.
-///
-/// `send_message`/`send_message_in_room` used to `.await` `send_via_ctx`
-/// directly from their own independently `spawn_local`-ed task per call.
-/// `wasm_bindgen_futures`'s executor (`queue.rs`'s `run_all`) does drain
-/// newly spawned tasks' *first* poll in strict FIFO order, and everything
-/// before `overlay.wrap_data` (seq assignment, synchronous) runs with no real
-/// `.await` in between -- so seq assignment itself stayed correctly ordered.
-/// But `send_via_ctx`'s own `.await` -- ultimately `WasmWebRtcTransport::send`
-/// -- genuinely yields under DataChannel backpressure
-/// (`wait_for_buffered_amount_low`). Once an earlier call's task yields
-/// there, a later call's already-queued task gets polled next in the same
-/// `run_all` batch and can finish its own `dc.send_with_u8_array` (the actual
-/// wire write) before the stalled earlier task resumes -- reordering bytes
-/// on the wire even though `seq` was assigned in call order. Funneling every
-/// send through this queue closes that window: the drainer never starts send
-/// N+1's `send_via_ctx` call until send N's has fully resolved (backpressure
-/// wait included), so both seq assignment and DataChannel writes stay in
-/// call order.
-///
-/// Enqueueing itself is synchronous, so `send_message`/`send_message_in_room`
-/// no longer need `spawn_local` at all for this part -- the call simply lands
-/// in `SEND_QUEUE` in exact JS call order.
+/// Capture app sends in JS call order and retain the chosen session until
+/// admission. `send_via_ctx` commits through the overlay's per-peer queue;
+/// its worker serializes transport writes and backpressure waits with sends
+/// originating in storage and control tasks too.
 fn enqueue_send(ctx: Arc<RunningContext>, target: NodeId, bytes: Bytes, delivery: DeliveryMethod) {
     SEND_QUEUE.with(|q| {
         q.borrow_mut().push_back(QueuedSend {
@@ -576,6 +568,30 @@ pub fn get_stats() -> String {
         .map(|(k, v)| (k.0.clone(), *v))
         .collect();
 
+    let nodes: Vec<_> = SESSIONS.with(|sessions| {
+        sessions
+            .borrow()
+            .iter_in_join_order()
+            .flat_map(|(_, session)| {
+                let queues = session.engine.bulk_queue_stats();
+                session
+                    .webrtc
+                    .peers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, peer)| {
+                        let mut transport = peer.storage_transport_stats();
+                        if let Some((bytes, budget)) = queues.get(&id.0) {
+                            transport["bulkQueuedBytes"] = serde_json::json!(bytes);
+                            transport["effectiveBulkBudgetBytes"] = serde_json::json!(budget);
+                        }
+                        serde_json::json!({"id": id.0, "transport": transport})
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    });
     let stats = serde_json::json!({
         "messageCount": snapshot.message_count,
         "sendBits": snapshot.send_bits,
@@ -587,7 +603,8 @@ pub fn get_stats() -> String {
         "relaySendBits": snapshot.relay_send_bits,
         "relayReceiveBits": snapshot.relay_receive_bits,
         "relayMessageCount": snapshot.relay_message_count,
-        "nodes": []
+        "storage": mistlib_core::storage::telemetry::STORAGE_COUNTERS.snapshot(),
+        "nodes": nodes
     });
     serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
 }

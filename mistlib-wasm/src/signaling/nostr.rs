@@ -218,7 +218,11 @@ impl WasmNostrSignaler {
     }
 
     fn publish_frame(&self, frame: String) -> mistlib_core::error::Result<()> {
-        let sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        let sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if sockets.is_empty() {
             return Err(mistlib_core::error::MistError::Signaling(
                 "WasmNostrSignaler: no relay connection is open".to_string(),
@@ -619,8 +623,11 @@ impl Signaler for WasmNostrSignaler {
         self.cancel_discovery_refresh();
         self.cancel_relay_keepalive();
         self.next_reconnect_epoch();
-        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
-        for ws in sockets.drain(..) {
+        let sockets = {
+            let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *sockets)
+        };
+        for ws in sockets {
             let _ = ws.close();
         }
         self.room_id

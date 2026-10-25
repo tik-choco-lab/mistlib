@@ -229,6 +229,7 @@ async fn duplicate_answers_are_idempotent_and_acknowledged() {
         room_id: String::new(),
         signaling_type: SignalingType::Answer,
         data: serde_json::to_string(&NegotiationEnvelope {
+            reliable_unordered: None,
             id: 42,
             sdp: augmented.replace("\r\n", "\n"),
         })

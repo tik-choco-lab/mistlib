@@ -1,0 +1,7 @@
+{
+  "clean": {"delayMs": null, "rateKbit": null, "tcArgs": []},
+  "wan150": {"delayMs": 150, "rateKbit": 1000, "tcArgs": ["150", "1000", "53"]},
+  "wan50": {"delayMs": 50, "rateKbit": 10000, "tcArgs": ["50", "10000", "313"]},
+  "loss1": {"delayMs": 50, "rateKbit": 10000, "tcArgs": ["50", "10000", "313", "loss", "random", "1%"]},
+  "burst": {"delayMs": 50, "rateKbit": 10000, "tcArgs": ["50", "10000", "313", "loss", "gemodel", "0.1%", "10%", "100%", "0%"]}
+}

@@ -1,12 +1,8 @@
 use super::*;
 use std::cell::RefCell;
 
-/// Regression coverage for the double-wrap bug fixed in `send_via_ctx`
-/// (see the `preferred_transport` doc comment in mistlib-core): a mock
-/// `Transport` on `ctx.transport` (the wrong, would-re-wrap path) must never
-/// be invoked, and the mock on `ctx.network_transport` (the correct raw path)
-/// must observe exactly one envelope layer per send, with the original app
-/// bytes intact and per-destination seq numbers assigned once each.
+/// App sends must enter the overlay once, preserving original payload bytes
+/// and assigning exactly one sequence before hand-off to the raw send queue.
 #[cfg(test)]
 mod send_via_ctx_tests {
     use super::*;
@@ -18,9 +14,7 @@ mod send_via_ctx_tests {
     use mistlib_core::Result as MistResult;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    /// Records every `send`/`broadcast` call it receives; used both as the
-    /// "wrong" transport (must stay empty) and the "right" one (must capture
-    /// the single-wrapped envelopes).
+    /// Records raw network frames after overlay encoding.
     #[derive(Default)]
     struct RecordingTransport {
         calls: RefCell<Vec<(NodeId, Bytes, DeliveryMethod)>>,
@@ -64,22 +58,37 @@ mod send_via_ctx_tests {
         }
     }
 
-    fn make_ctx(
-        wrong_transport: Arc<RecordingTransport>,
-        raw_transport: Arc<RecordingTransport>,
-        local_id: NodeId,
-    ) -> Arc<RunningContext> {
+    fn make_ctx(raw_transport: Arc<RecordingTransport>, local_id: NodeId) -> Arc<RunningContext> {
         let node_store = Arc::new(std::sync::Mutex::new(NodeStore::new()));
-        let router = OverlayRouter::new(&Config::new_default(), node_store, local_id);
-
+        let router = Arc::new(OverlayRouter::new(
+            &Config::new_default(),
+            node_store,
+            local_id,
+        ));
+        struct QueueRecorder(Arc<RecordingTransport>);
+        impl mistlib_core::overlay::ActionHandler for QueueRecorder {
+            fn handle_action(&self, action: mistlib_core::action::OverlayAction) {
+                let mistlib_core::action::OverlayAction::SendMessage {
+                    to, data, method, ..
+                } = action
+                else {
+                    panic!("expected send");
+                };
+                self.0.calls.borrow_mut().push((to, data, method));
+            }
+        }
+        let overlay = Arc::new(mistlib_core::overlay::OverlayTransport {
+            router: router.clone(),
+            action_handler: Arc::new(QueueRecorder(raw_transport.clone())),
+        });
         Arc::new(RunningContext {
-            transport: wrong_transport as Arc<dyn Transport>,
+            transport: overlay,
             network_transport: Some(raw_transport as Arc<dyn Transport>),
             signaling_handler: Arc::new(NoopSignalingHandler),
             p2p_signaling_handler: None,
             signaling_dispatch: None,
             websocket_signaler: None,
-            overlay: Some(Arc::new(router)),
+            overlay: Some(router),
         })
     }
 
@@ -87,9 +96,8 @@ mod send_via_ctx_tests {
     async fn send_via_ctx_dispatches_single_wrapped_envelope_over_network_transport() {
         let local_id = NodeId("local-node".to_string());
         let target = NodeId("peer-node".to_string());
-        let wrong_transport = Arc::new(RecordingTransport::default());
         let raw_transport = Arc::new(RecordingTransport::default());
-        let ctx = make_ctx(wrong_transport.clone(), raw_transport.clone(), local_id);
+        let ctx = make_ctx(raw_transport.clone(), local_id);
 
         for payload in ["m1", "m2", "m3"] {
             send_via_ctx(
@@ -100,11 +108,6 @@ mod send_via_ctx_tests {
             )
             .await;
         }
-
-        assert!(
-            wrong_transport.calls.borrow().is_empty(),
-            "send_via_ctx must never dispatch through ctx.transport (it would wrap the data a second time)"
-        );
 
         let calls = raw_transport.calls.borrow();
         assert_eq!(calls.len(), 3);
@@ -358,6 +361,23 @@ mod join_state_tests {
             webrtc,
             l1_transport,
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn session_engine_callbacks_can_remove_their_session() {
+        let room = "w18-registry-reentry";
+        let session = make_dummy_session(NodeId("w18-local".into()));
+        let expected = session.engine.clone();
+        insert_session(room.into(), session);
+        let mut called = false;
+        for_each_session_engine(|engine| {
+            if Arc::ptr_eq(engine, &expected) {
+                assert!(remove_session(room).is_some());
+                called = true;
+            }
+        });
+        assert!(called);
+        assert!(!session_exists(room));
     }
 
     #[wasm_bindgen_test]

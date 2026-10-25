@@ -132,6 +132,60 @@ pub struct StorageConfig {
     /// `4 * spatial_retention_radius`.
     #[serde(default = "default_spatial_decay_max_probability")]
     pub spatial_decay_max_probability: f32,
+    /// Block transfer pipeline settings (SPEC-20): CP50 defaults and experimental tuning.
+    #[serde(default)]
+    pub transfer: StorageTransferConfig,
+}
+
+/// SPEC-20 storage transfer pipeline. Defaults use CP50 (2026-10-25):
+/// unsequenced bulk, control priority, reliable unordered bulk, and 50 ms pacing.
+/// Every flag must interoperate with peers
+/// that use different values (or predate the flag), so A/B runs can mix them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StorageTransferConfig {
+    /// Send newly originated HAVE_CHUNK frames with overlay `seq = 0` so they
+    /// bypass the per-source ReorderBuffer (no HOL behind bulk, no gap-skip
+    /// drops). Receivers already accept unsequenced frames. Default: true.
+    pub unsequenced_bulk: bool,
+    /// Per-peer send scheduler: storage control and other small frames are
+    /// dispatched ahead of queued bulk HAVE_CHUNK frames. Default: true.
+    pub control_priority: bool,
+    /// Byte budget for queued + in-flight bulk frames per next-hop peer.
+    /// Storage responders wait for room instead of queueing unboundedly.
+    pub bulk_queue_bytes: u32,
+    /// Target bulk queue delay in milliseconds. Default: 50; 0 retains fixed watermarks.
+    pub bulk_target_delay_ms: u32,
+    /// Use DeliveryMethod::ReliableUnordered for seq-0 HAVE_CHUNK.
+    /// Requires unsequenced_bulk for locally originated chunks. The channel is
+    /// always advertised/opened for app use; unavailable channels fall back to reliable.
+    /// Default: true.
+    pub bulk_channel: bool,
+    /// Blocks fetched concurrently by one `get`.
+    pub get_concurrency: u32,
+    /// Upper bound on concurrent block attempts against one provider across
+    /// all gets in this process (0 = unbounded).
+    pub max_fetches_per_provider: u32,
+    /// Share one network fetch between concurrent requests for the same CID.
+    pub coalesce_fetches: bool,
+    /// Native SCTP receive buffer in bytes (0 = webrtc-rs default).
+    pub native_sctp_receive_buffer_bytes: u32,
+}
+
+impl Default for StorageTransferConfig {
+    fn default() -> Self {
+        Self {
+            unsequenced_bulk: true,
+            control_priority: true,
+            bulk_queue_bytes: 1024 * 1024,
+            bulk_target_delay_ms: 50,
+            bulk_channel: true,
+            get_concurrency: 4,
+            max_fetches_per_provider: 0,
+            coalesce_fetches: false,
+            native_sctp_receive_buffer_bytes: 0,
+        }
+    }
 }
 
 fn default_spatial_retention_radius() -> f32 {
@@ -158,6 +212,7 @@ impl Default for StorageConfig {
             spatial_decay_enabled: default_spatial_decay_enabled(),
             spatial_decay_interval_secs: default_spatial_decay_interval_secs(),
             spatial_decay_max_probability: default_spatial_decay_max_probability(),
+            transfer: StorageTransferConfig::default(),
         }
     }
 }

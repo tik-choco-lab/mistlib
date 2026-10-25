@@ -35,6 +35,7 @@ impl super::MistEngine {
 
         let sessions = self.sessions_snapshot().await;
 
+        let mut transport_stats = HashMap::new();
         let mut sctp_raw = HashMap::new();
         let mut connection_states = HashMap::new();
         let mut diag_peers = 0usize;
@@ -46,6 +47,7 @@ impl super::MistEngine {
                 continue;
             };
 
+            transport_stats.extend(wt.storage_transport_stats().await);
             let t_sctp = std::time::Instant::now();
             let stats_future = async {
                 let sctp = wt.get_sctp_stats().await;
@@ -147,7 +149,20 @@ impl super::MistEngine {
         };
 
         match serde_json::to_string(&stats) {
-            Ok(json) => json,
+            Ok(json) => {
+                let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                if let Some(nodes) = value["nodes"].as_array_mut() {
+                    for node in nodes {
+                        if let Some(transport) = node["id"]
+                            .as_str()
+                            .and_then(|id| transport_stats.remove(id))
+                        {
+                            node["transport"] = transport;
+                        }
+                    }
+                }
+                value.to_string()
+            }
             Err(e) => {
                 let nan_count = stats
                     .rtt_millis

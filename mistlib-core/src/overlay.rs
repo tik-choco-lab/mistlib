@@ -27,11 +27,65 @@ use std::sync::Arc;
 #[cfg(target_arch = "wasm32")]
 pub trait ActionHandler {
     fn handle_action(&self, action: OverlayAction);
+
+    /// Reserve bounded capacity before the router assigns a positive sequence.
+    fn reserve_send<'a>(
+        &'a self,
+        _to: &'a NodeId,
+        _bytes: usize,
+        _lane: crate::action::SendLane,
+    ) -> crate::transport::send::SendFuture<
+        'a,
+        crate::error::Result<crate::transport::send::SendReservation>,
+    > {
+        Box::pin(async {
+            Err(crate::error::MistError::Network(
+                "awaitable send admission is unsupported".into(),
+            ))
+        })
+    }
+
+    /// Synchronously hand a send action to an ordered transport queue.
+    /// Called inside the router's sequence critical section: implementations must
+    /// be non-blocking, must not re-enter the router, and must return an error if
+    /// admission fails. The default accepts the action through `handle_action`;
+    /// handlers with fallible queues must override this method.
+    fn try_dispatch_send(&self, action: OverlayAction) -> crate::error::Result<()> {
+        self.handle_action(action);
+        Ok(())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub trait ActionHandler: Send + Sync {
     fn handle_action(&self, action: OverlayAction);
+
+    /// Reserve bounded capacity before the router assigns a positive sequence.
+    fn reserve_send<'a>(
+        &'a self,
+        _to: &'a NodeId,
+        _bytes: usize,
+        _lane: crate::action::SendLane,
+    ) -> crate::transport::send::SendFuture<
+        'a,
+        crate::error::Result<crate::transport::send::SendReservation>,
+    > {
+        Box::pin(async {
+            Err(crate::error::MistError::Network(
+                "awaitable send admission is unsupported".into(),
+            ))
+        })
+    }
+
+    /// Synchronously hand a send action to an ordered transport queue.
+    /// Called inside the router's sequence critical section: implementations must
+    /// be non-blocking, must not re-enter the router, and must return an error if
+    /// admission fails. The default accepts the action through `handle_action`;
+    /// handlers with fallible queues must override this method.
+    fn try_dispatch_send(&self, action: OverlayAction) -> crate::error::Result<()> {
+        self.handle_action(action);
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

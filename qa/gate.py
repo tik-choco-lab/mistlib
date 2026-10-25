@@ -37,9 +37,14 @@ def evaluate(dist, reports, commit, version, policy_path):
     for field in ("nativeTargets", "browsers", "phases"):
         values = policy.get(field)
         require(type(values) is list and len(values) > 0 and len(values) == len(set(values)), f"empty/duplicate policy {field}")
-    require(set(policy["phases"]) == {"delivery", "aoi", "multi-room", "leave-rejoin", "relay-outage", "peer-restart", "storage", "soak"}, "incomplete phase policy")
+    require(set(policy["phases"]) == {"delivery", "aoi", "multi-room", "leave-rejoin", "relay-outage", "peer-restart", "storage", "storage-wan", "soak"}, "incomplete phase policy")
     for field in ("messagesPerDirection", "connectionDeadlineMs", "deliveryDeadlineMs", "negativeObservationMs", "soakSeconds", "rejoinCycles"):
         require(number(policy.get(field), 1), f"invalid policy {field}")
+    wan = policy.get("wanStorage", {})
+    for field in ("bytes", "delayMs", "rateKbit", "queueMs", "deadlineMs"):
+        require(type(wan.get(field)) is int and wan[field] > 0, f"invalid policy wanStorage.{field}")
+    # Same shared-band propagation + queue budget and 1200 B assumption as suite.mjs.
+    limit_packets = math.ceil((2 * wan["delayMs"] + wan["queueMs"]) / 1000 * wan["rateKbit"] * 1000 / 8 / 1200)
     require(re.fullmatch(r"[0-9a-f]{40}", commit), "expected a full commit SHA")
     manifests = {}
     for path in dist.glob("candidate-*.json"):
@@ -115,11 +120,34 @@ def evaluate(dist, reports, commit, version, policy_path):
             require(not case.get("error"), f"case contains an error {identity}/{case.get('id')}")
             phase = case["id"].split("/")[1]
             metrics = case.get("metrics", {})
-            for counter in ("sent", "received", "transfers", "corruptions", "samples", "missing", "false", "roomLeaks", "cycles", "disconnectedSockets", "restarts"):
+            for counter in ("sent", "received", "transfers", "corruptions", "bytes", "samples", "missing", "false", "roomLeaks", "cycles", "disconnectedSockets", "restarts"):
                 if counter in metrics:
                     require(type(metrics[counter]) is int and metrics[counter] >= 0, f"invalid counter {identity}/{phase}/{counter}")
             if phase == "storage":
                 require(metrics.get("transfers") == 2 and metrics.get("corruptions") == 0, f"storage contract {identity}")
+            elif phase == "storage-wan":
+                require(metrics.get("transfers") == 2 and metrics.get("corruptions") == 0 and
+                        metrics.get("bytes") == wan["bytes"], f"WAN storage contract {identity}")
+                require(type(metrics.get("shaped")) is bool and (platform != "linux" or metrics["shaped"] is True),
+                        f"WAN storage shaping required on Linux {identity}")
+                applied = (wan["delayMs"], wan["rateKbit"]) if metrics["shaped"] else (None, None)
+                require((metrics.get("delayMs"), metrics.get("rateKbit")) == applied,
+                        f"WAN storage shaping parameters {identity}")
+                queue_fields = ("queueMs", "limitPackets", "queueProfile")
+                require(all(field in metrics for field in queue_fields), f"missing WAN storage queue parameters {identity}")
+                if metrics["shaped"]:
+                    require(type(metrics["queueMs"]) is int and type(metrics["limitPackets"]) is int and
+                            (metrics["queueMs"], metrics["limitPackets"], metrics["queueProfile"]) ==
+                            (wan["queueMs"], limit_packets, "bounded"), f"WAN storage queue parameters {identity}")
+                else:
+                    require(all(metrics[field] is None for field in queue_fields), f"unshaped WAN storage queue parameters {identity}")
+                timings = metrics.get("transferMs")
+                require(type(timings) is list and len(timings) == 2 and
+                        all(number(value, 0.001) and value <= wan["deadlineMs"] for value in timings),
+                        f"WAN storage per-direction deadline {identity}")
+                if metrics["shaped"]:
+                    floor = 0.9 * wan["bytes"] * 8 / wan["rateKbit"]
+                    require(all(value >= floor for value in timings), f"WAN transfer below shaped-link floor {identity}")
             elif phase == "aoi":
                 require(metrics.get("samples") == 6 and metrics.get("missing") == 0 and metrics.get("false") == 0, f"AOI contract {identity}")
                 require(number(metrics.get("convergenceMs"), 0.001) and metrics["convergenceMs"] <= policy["connectionDeadlineMs"], f"AOI convergence deadline {identity}")

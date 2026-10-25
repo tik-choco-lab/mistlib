@@ -67,6 +67,8 @@ jobs:
       # Includes sim and WASM's host guards. No retries can turn a failure green.
       - run: cargo nextest run --workspace --features mistlib-core/sim --locked --profile qa
       - run: python qa/check_junit.py target/nextest/qa/junit.xml
+      # Excluded path dependencies with dev-dependencies require their own manifest.
+      - run: cargo test --manifest-path third_party/webrtc-sctp/Cargo.toml -p webrtc-sctp --locked
       - run: cargo test --workspace --features mistlib-core/sim --doc --locked
       - uses: actions/upload-artifact@v4
         if: always()
@@ -93,6 +95,7 @@ jobs:
             target: linux-x86_64
             rust-target: x86_64-unknown-linux-gnu
             binary: libmistlib.so
+            netem: '1'
           - os: windows-latest
             target: windows-x86_64
             rust-target: x86_64-pc-windows-msvc
@@ -124,6 +127,8 @@ jobs:
       - run: cargo build --release --locked -p mistlib-native --target ${{ matrix.rust-target }}
       - run: python qa/package.py native --binary target/${{ matrix.rust-target }}/release/${{ matrix.binary }} --target ${{ matrix.target }} --out dist
       - name: Load the packaged library, not a build-directory substitute
+        env:
+          MISTLIB_QA_NETEM: ${{ matrix.netem }}
         run: |
           python -c 'import glob,zipfile; zipfile.ZipFile(glob.glob("dist/*.zip")[0]).extractall("work/native")'
           version=$(python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print(version())')
@@ -241,6 +246,8 @@ jobs:
           name: candidate-native-linux-x86_64
           path: dist
       - name: Exercise the installed npm tarball and packaged native library
+        env:
+          MISTLIB_QA_NETEM: '1'
         run: |
           python -c 'import glob,zipfile; zipfile.ZipFile(glob.glob("dist/mistlib-native-*.zip")[0]).extractall("work/native")'
           version=$(python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print(version())')

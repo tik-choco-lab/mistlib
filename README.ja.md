@@ -129,6 +129,7 @@ Native の `get_version` / `get_build_info` は呼び出し側バッファへ書
 **配送モード** — `Delivery.Reliable`（`0`）は到達し順序も保つ。
 `Delivery.UnreliableOrdered`（`1`）は欠落しうるが順序は乱れない。
 `Delivery.Unreliable`（`2`）は欠落・順序入れ替わりを許す代わりに遅延が最小。
+`Delivery.ReliableUnordered`（`3`）は完全 reliable・順序保証なし。対応 channel が利用できない場合は reliable ordered に fallback する。
 イベント ID も同様に `MistEvent` から取れる。
 
 ## 設定

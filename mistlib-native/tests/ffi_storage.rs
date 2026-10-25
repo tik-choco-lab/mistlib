@@ -18,8 +18,10 @@ use mistlib_core::storage::{P2PStorage, SpatialPolicy};
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 
+use mistlib::runtime::TokioRuntime;
 use mistlib::storage::fs::NativeBlockStore;
-use mistlib::storage::resolver::{FixedTransportSource, NativePeerResolver, WantRegistry};
+use mistlib_core::storage::protocol::WantRegistry;
+use mistlib_core::storage::resolver::{FixedTransportSource, NetworkPeerResolver, ResolverTimings};
 
 /// Transport stub: storage add/get against the local block store never calls it.
 struct NoopTransport;
@@ -59,10 +61,11 @@ fn ensure_storage() {
     let store = rt
         .block_on(NativeBlockStore::new(&dir))
         .expect("block store init");
-    let resolver = NativePeerResolver::new(
+    let resolver = NetworkPeerResolver::new(
         Arc::new(FixedTransportSource(vec![Arc::new(NoopTransport)])),
+        Arc::new(TokioRuntime::new(rt.handle().clone())),
         WantRegistry::new(),
-        5000,
+        ResolverTimings::default(),
     );
     // No `SelfPositionSource` wired up here: add/get against the local store
     // never touches spatial eviction, so `None`/default policy keeps this a

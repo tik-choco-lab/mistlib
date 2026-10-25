@@ -72,14 +72,45 @@ pub fn on_connected_primary(node_id: NodeId) {
 }
 
 async fn mark_disconnected(ctx: Option<&Arc<SessionCtx>>, room_id: &str, node_id: &NodeId) {
+    reset_storage_senders(ctx, room_id, node_id);
+    mistlib_core::stats::STATS.remove_rtt(node_id);
+    dispatch_event(EVENT_LEAVE, room_id, node_id, b"left");
+}
+
+// Invalidate routes before waking resolvers, including WANTs to routed senders
+// whose next hop was lost. Do not keep the routing lock while notifying storage.
+fn reset_storage_senders(ctx: Option<&Arc<SessionCtx>>, room_id: &str, node_id: &NodeId) {
+    let mut affected = vec![node_id.clone()];
     if let Some(ctx) = ctx {
         if let Some(overlay) = ctx.overlay.as_ref() {
+            let senders = crate::storage::WANT_REGISTRY.outstanding_senders();
             let mut rt = overlay.routing_table.lock().unwrap();
+            affected.extend(senders.into_iter().filter(|sender| {
+                sender != node_id && rt.get_next_hop(sender).as_ref() == Some(node_id)
+            }));
             rt.on_disconnected(node_id);
         }
     }
-    mistlib_core::stats::STATS.remove_rtt(node_id);
-    dispatch_event(EVENT_LEAVE, room_id, node_id, b"left");
+    for sender in affected {
+        crate::storage::WANT_REGISTRY.sender_reset(&sender, room_id);
+    }
+}
+
+/// Full transport teardown also covers routed providers after session removal.
+pub(crate) fn reset_storage_room(room_id: &str) {
+    if let Some(ctx) = ENGINE.get_session_sync(room_id) {
+        if let Some(overlay) = ctx.overlay.as_ref() {
+            *overlay.routing_table.lock().unwrap() = Default::default();
+        }
+    }
+    crate::storage::WANT_REGISTRY.room_reset(room_id);
+}
+
+/// Replacement and room teardown detach old callbacks, so they must explicitly
+/// wake storage even when they do not emit a host disconnect event.
+pub(crate) async fn reset_storage_after_teardown(room_id: &str, node_id: &NodeId) {
+    let ctx = ENGINE.get_session(room_id).await;
+    reset_storage_senders(ctx.as_ref(), room_id, node_id);
 }
 
 /// Session-scoped counterpart to `on_connected_internal` (see there for why
@@ -127,7 +158,7 @@ fn request_immediate_rebalance(ctx: Option<Arc<SessionCtx>>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Condvar, LazyLock, Mutex};
     use std::time::{Duration, Instant};
@@ -138,13 +169,100 @@ mod tests {
         block_next: bool,
     }
 
-    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    pub(crate) static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static CALLBACK_STATE: LazyLock<(Mutex<CallbackState>, Condvar)> =
         LazyLock::new(|| (Mutex::new(CallbackState::default()), Condvar::new()));
 
     type RustCallbackSeen = Vec<(u32, String, Vec<u8>)>;
     static RUST_CALLBACK_STATE: LazyLock<(Mutex<RustCallbackSeen>, Condvar)> =
         LazyLock::new(|| (Mutex::new(Vec::new()), Condvar::new()));
+
+    #[test]
+    fn transport_disconnect_notifies_storage_even_without_a_session_or_host_callback() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let node = NodeId("w13-disconnected-provider".into());
+        let registry = &crate::storage::WANT_REGISTRY;
+        let scoped = registry.register_attempt("w13-disconnect-event", node.clone());
+        registry.track_path(scoped.id, "w13-missing-room");
+        let mut want = scoped.data;
+        let mut resets = scoped.resets;
+        on_disconnected_internal("w13-missing-room".into(), node);
+        ENGINE.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), resets.changed())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert_eq!(*resets.borrow(), 1);
+        // A disconnect wakes the resolver; it must not cancel its WANT.
+        assert!(matches!(
+            want.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(want);
+        registry.cancel_closed();
+        assert!(resets.has_changed().is_err());
+    }
+
+    #[test]
+    fn disconnect_invalidates_routes_and_notifies_affected_storage_senders() {
+        let registry = &crate::storage::WANT_REGISTRY;
+        let relay = NodeId("w13-relay".into());
+        let routed = NodeId("w13-routed-provider".into());
+        let other = NodeId("w13-other-provider".into());
+        let registration = registry.register_attempt("w13-route-reset", routed.clone());
+        registry.track_path(registration.id, "w13-route-room");
+        let want = registration.data;
+        let other_registration = registry.register_attempt("w13-other-reset", other.clone());
+        registry.track_path(other_registration.id, "w13-route-room");
+        let other_want = other_registration.data;
+        let resets = registration.resets;
+        let other_resets = other_registration.resets;
+        let mut ctx = crate::engine::tests::session_registry::fake_session("w13-route-room");
+        let overlay = Arc::new(mistlib_core::overlay::OverlayRouter::new(
+            &mistlib_core::config::Config::default(),
+            ctx.node_store.clone(),
+            NodeId("local".into()),
+        ));
+        Arc::get_mut(&mut ctx).unwrap().overlay = Some(overlay.clone());
+        {
+            let mut rt = overlay.routing_table.lock().unwrap();
+            rt.on_connected(relay.clone());
+            rt.add_route(routed.clone(), relay.clone());
+        }
+        reset_storage_senders(Some(&ctx), &ctx.room_id, &relay);
+        assert!(overlay
+            .routing_table
+            .lock()
+            .unwrap()
+            .get_next_hop(&routed)
+            .is_none());
+        assert_eq!(*resets.borrow(), 1);
+        assert!(!other_resets.has_changed().unwrap());
+        drop((want, other_want));
+        registry.cancel_closed();
+    }
+
+    #[test]
+    fn secondary_disconnect_preserves_main_room_storage_assembly() {
+        let registry = &crate::storage::WANT_REGISTRY;
+        let provider = NodeId("w15-shared-provider".into());
+        let cid = "w15-cross-room";
+        let mut main = registry.register_attempt(cid, provider.clone());
+        let mut secondary = registry.register_attempt(cid, provider.clone());
+        registry.track_path(main.id, "w15-main");
+        registry.track_path(secondary.id, "w15-secondary");
+        registry.fulfill_chunk_in("w15-main", cid, &provider, 0, 2, b"main-".to_vec());
+        registry.fulfill_chunk_in("w15-secondary", cid, &provider, 0, 3, b"old".to_vec());
+        reset_storage_senders(None, "w15-secondary", &provider);
+        assert!(!main.resets.has_changed().unwrap());
+        assert_eq!(*secondary.resets.borrow(), 1);
+        registry.fulfill_chunk_in("w15-main", cid, &provider, 1, 2, b"block".to_vec());
+        assert_eq!(main.data.try_recv().unwrap(), b"main-block");
+        registry.fulfill_chunk_in("w15-secondary", cid, &provider, 0, 1, b"replay".to_vec());
+        assert_eq!(secondary.data.try_recv().unwrap(), b"replay");
+        registry.cancel_closed();
+    }
 
     unsafe extern "C" fn blocking_test_callback(
         message_type: u32,

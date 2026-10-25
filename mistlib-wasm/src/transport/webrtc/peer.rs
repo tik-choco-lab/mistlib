@@ -1,9 +1,14 @@
 use super::candidate_delivery::{
     CandidateDelivery, TrackStatus, CANDIDATE_RETRY_DELAYS_MS, MAX_TRACKED_CANDIDATES_PER_NODE,
 };
+use super::disconnect_grace::InboundActivity;
 use super::negotiation_delivery::NegotiationDelivery;
 use super::send_queue::SendQueue;
-use super::{DisconnectGrace, GraceOrigin};
+use super::{
+    backpressure_action, drain_timeout_action, wait_for_buffered_amount_low, BackpressureAction,
+    DisconnectGrace, DrainTimeoutAction, GraceOrigin, BUFFERED_AMOUNT_HARD_LIMIT,
+    BUFFERED_AMOUNT_HIGH_WATERMARK,
+};
 use js_sys::Reflect;
 use mistlib_core::signaling::{
     CandidateEnvelope, MessageContent, Signaler, SignalingData, SignalingType,
@@ -121,7 +126,17 @@ async fn send_candidate_with_retries(
 }
 
 pub struct Peer {
+    pub bulk_telemetry: mistlib_core::transport::send::QueueTelemetry,
+    pub(super) pacing: RwLock<Option<Arc<super::pacing::WasmPacing>>>,
+    pub generation: u64,
+    pub unordered_capability:
+        mistlib_core::transport::reliable_unordered::ReliableUnorderedCapability,
+    pub unordered_channel: Arc<RwLock<Option<RtcDataChannel>>>,
+    pub(crate) inbound_activity: InboundActivity,
     pub pc: RtcPeerConnection,
+    /// Reuse the same future after timeout, including its Promise callbacks;
+    /// at most one browser request and one callback pair are pending per peer.
+    pub(super) liveness_stats: Mutex<Option<std::pin::Pin<Box<wasm_bindgen_futures::JsFuture>>>>,
     /// Belongs to this PC generation, not NodeId. ICE may enter Reconnecting
     /// before any DataChannel opens, so transport state alone cannot tell
     /// whether cleanup owes the host a matching disconnect notification.
@@ -148,6 +163,7 @@ pub struct Peer {
     /// Tokio's FIFO mutex leaves at most one task waiting on the browser event;
     /// the others wait here and re-check bufferedAmount when their turn starts.
     pub reliable_send_gate: tokio::sync::Mutex<()>,
+    pub bulk_send_gate: tokio::sync::Mutex<()>,
     /// Serializes every operation that advances this peer's
     /// `RTCPeerConnection` signaling state via `createOffer`/`createAnswer`
     /// + `setLocalDescription`/`setRemoteDescription` --
@@ -191,9 +207,8 @@ pub struct Peer {
     /// removal path.
     pub negotiated_max_message_bytes: AtomicU32,
     /// Bounded FIFO of `ReliableOrdered` sends deferred by
-    /// `WasmWebRtcTransport::send` while this peer exists but isn't
-    /// `Connected` yet/still (fresh connection pre-`onopen`, or mid
-    /// ICE-restart grace -- see `send_queue::should_queue_reliable_send`).
+    /// `WasmWebRtcTransport::send` while its channel is not open and the
+    /// peer is Connecting/Reconnecting (see `send_queue::send_action`).
     /// Lives on `Peer` itself (rather than a separate `NodeId`-keyed map on
     /// the transport) so it's torn down for free whenever the peer is:
     /// dropping the `Arc<Peer>` drops this too, with no separate cleanup
@@ -205,13 +220,33 @@ pub struct Peer {
 }
 
 impl Peer {
+    pub fn configure_bulk_pacing(&self, config: &mistlib_core::config::StorageTransferConfig) {
+        let pacing = super::pacing::WasmPacing::new(config);
+        if let Some(pacing) = &pacing {
+            pacing.spawn_observer(self.channels.clone(), self.unordered_channel.clone());
+        }
+        *self.pacing.write().unwrap() = pacing;
+    }
+
     pub fn new(pc: RtcPeerConnection) -> Self {
         Self {
+            pacing: RwLock::new(None),
+            generation: {
+                static NEXT_GENERATION: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+            },
+            unordered_capability: Default::default(),
+            bulk_telemetry: Default::default(),
+            unordered_channel: Arc::new(RwLock::new(None)),
             pc,
+            liveness_stats: Mutex::new(None),
+            inbound_activity: InboundActivity::new(),
             connection_announced: AtomicBool::new(false),
             channels: Arc::new(RwLock::new(HashMap::new())),
             buffered_amount_waiters: Arc::new(RwLock::new(HashMap::new())),
             reliable_send_gate: tokio::sync::Mutex::new(()),
+            bulk_send_gate: tokio::sync::Mutex::new(()),
             negotiating: tokio::sync::Mutex::new(()),
             applied_answer_sdp: Mutex::new(None),
             needs_track_reconcile: std::sync::atomic::AtomicBool::new(false),
@@ -254,61 +289,266 @@ impl Peer {
         queue.clear()
     }
 
-    /// Replays every message queued in `send_queue` onto the
-    /// `ReliableOrdered` DataChannel, in FIFO order -- but only if that
-    /// channel is actually `Open` right now. Called from two places, both
-    /// with no lock of the caller's own held at the call site (per the WASM
-    /// no-reentrant-mutex constraint, see the comment on the `onmessage`
-    /// handler below): the DC `onopen` handler (this same file) once the
-    /// `ReliableOrdered` channel itself opens, and the ICE `Connected`/
-    /// `Completed` arm once `super::recovery::state_after_ice_recovery` says
-    /// the repaired state is `Connected` (spawned via `spawn_local` there
-    /// rather than called inline, since that arm's caller is a synchronous
-    /// event handler still holding its own lock at the point it decides to
-    /// flush).
-    ///
-    /// If the channel isn't there or isn't `Open` (shouldn't normally happen
-    /// -- both call sites only fire once the reliable channel is actually
-    /// usable -- but this is defensive rather than assumed-safe), this is a
-    /// no-op and the queue is left untouched for a later flush attempt.
-    pub fn flush_send_queue(&self, node: &NodeId) {
-        let dc = {
-            let channels = self.channels.read().unwrap_or_else(|e| e.into_inner());
-            channels.get(&DeliveryMethod::ReliableOrdered).cloned()
-        };
-        let Some(dc) = dc else { return };
-        if dc.ready_state() != web_sys::RtcDataChannelState::Open {
-            return;
-        }
-
-        let messages = {
-            let mut queue = self.send_queue.lock().unwrap_or_else(|e| e.into_inner());
-            queue.drain()
-        };
-        if messages.is_empty() {
-            return;
-        }
-
-        tracing::debug!(
-            "Flushing {} queued reliable message(s) to {}",
-            messages.len(),
-            node.0
-        );
-        for data in messages {
-            if let Err(err) = dc.send_with_u8_array(&data) {
-                tracing::warn!(
-                    "Failed to flush a queued reliable message to {}: {:?}",
-                    node.0,
-                    err
-                );
-                continue;
+    /// Event-driven flushes share the same gate and backpressure as new sends.
+    /// A closed channel leaves the FIFO intact for the next open/recovery event.
+    pub async fn flush_send_queue(&self, node: &NodeId) {
+        let _guard = self.reliable_send_gate.lock().await;
+        let dc = self
+            .channels
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&DeliveryMethod::ReliableOrdered)
+            .cloned();
+        if let Some(dc) = dc {
+            if dc.ready_state() == web_sys::RtcDataChannelState::Open {
+                if let Err(error) = self.flush_send_queue_locked(node, &dc).await {
+                    tracing::warn!(
+                        "Failed to flush queued reliable messages to {}: {}",
+                        node.0,
+                        error
+                    );
+                }
             }
-            STATS.add_send(data.len() as u64);
-            STATS.add_world_send_frame(&data);
         }
     }
 
+    /// Caller must hold `reliable_send_gate` through this flush and its new write.
+    pub(super) async fn flush_send_queue_locked(
+        &self,
+        node: &NodeId,
+        dc: &RtcDataChannel,
+    ) -> mistlib_core::error::Result<()> {
+        loop {
+            let data = self
+                .send_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .front()
+                .cloned();
+            let Some(data) = data else { return Ok(()) };
+            self.write_data_channel(node, dc, &data, DeliveryMethod::ReliableOrdered)
+                .await?;
+            self.send_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+        }
+    }
+
+    /// Shared write path; reliable callers hold `reliable_send_gate` across
+    /// the complete bufferedAmount check, optional wait, and browser write.
+    pub(super) async fn write_data_channel(
+        &self,
+        node: &NodeId,
+        dc: &RtcDataChannel,
+        data: &bytes::Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        self.write_data_channel_with_limit(node, dc, data, method, BUFFERED_AMOUNT_HIGH_WATERMARK)
+            .await
+    }
+
+    pub(super) async fn write_data_channel_with_limit(
+        &self,
+        node: &NodeId,
+        dc: &RtcDataChannel,
+        data: &bytes::Bytes,
+        method: DeliveryMethod,
+        high_watermark: u32,
+    ) -> mistlib_core::error::Result<()> {
+        self.write_data_channel_tracked(
+            node,
+            dc,
+            data,
+            method,
+            high_watermark,
+            &std::cell::Cell::new(false),
+        )
+        .await
+    }
+
+    pub(super) async fn write_optional_unordered(
+        &self,
+        node: &NodeId,
+        dc: &RtcDataChannel,
+        data: &bytes::Bytes,
+    ) -> Result<(), mistlib_core::transport::send::WriteFailure> {
+        use mistlib_core::transport::send::WriteFailure;
+        let submitted = std::cell::Cell::new(false);
+        self.write_data_channel_tracked(
+            node,
+            dc,
+            data,
+            DeliveryMethod::ReliableUnordered,
+            BUFFERED_AMOUNT_HIGH_WATERMARK - 64 * 1024,
+            &submitted,
+        )
+        .await
+        .map_err(|err| {
+            if submitted.get() {
+                WriteFailure::Failed(err)
+            } else {
+                WriteFailure::Uncommitted(err)
+            }
+        })
+    }
+
+    async fn write_data_channel_tracked(
+        &self,
+        node: &NodeId,
+        dc: &RtcDataChannel,
+        data: &bytes::Bytes,
+        method: DeliveryMethod,
+        high_watermark: u32,
+        submitted: &std::cell::Cell<bool>,
+    ) -> mistlib_core::error::Result<()> {
+        if dc.ready_state() != web_sys::RtcDataChannelState::Open {
+            return Err(mistlib_core::error::MistError::Internal(
+                "Not connected".to_string(),
+            ));
+        }
+        let pacing = self.pacing.read().unwrap().clone();
+        let is_bulk = mistlib_core::transport::send::SendClass::from_wire(data).lane
+            == mistlib_core::action::SendLane::Bulk;
+        loop {
+            if is_bulk {
+                if let Some(pacing) = &pacing {
+                    if !pacing.ready(dc, data.len()) {
+                        wait_for_buffered_amount_low(
+                            node,
+                            &self.buffered_amount_waiters,
+                            dc,
+                            method,
+                            mistlib_core::transport::bulk_pacing::SAMPLE_INTERVAL_MS as u32,
+                        )
+                        .await;
+                        if dc.ready_state() != web_sys::RtcDataChannelState::Open {
+                            return Err(mistlib_core::transport::send::closed_send());
+                        }
+                        continue;
+                    }
+                    break;
+                }
+            }
+            match backpressure_action(dc.buffered_amount(), high_watermark, method) {
+                BackpressureAction::SendNow => break,
+                BackpressureAction::WaitThenSend => {
+                    tracing::warn!(
+                        "DataChannel to {} congested (bufferedAmount over {}B); waiting for drain",
+                        node.0,
+                        high_watermark
+                    );
+                    // Only ReliableOrdered waits here. The send gate
+                    // ensures this is the channel's sole event waiter.
+                    let drained = wait_for_buffered_amount_low(
+                        node,
+                        &self.buffered_amount_waiters,
+                        dc,
+                        method,
+                        super::BUFFERED_AMOUNT_WAIT_TIMEOUT_MS,
+                    )
+                    .await;
+
+                    // Re-check state after either wait outcome. A low
+                    // event is an edge notification, not a send permit;
+                    // re-check bufferedAmount before writing too. The
+                    // gate prevents sibling refills.
+                    if dc.ready_state() != web_sys::RtcDataChannelState::Open {
+                        return Err(mistlib_core::error::MistError::Internal(
+                            "DataChannel closed while waiting for backpressure drain".to_string(),
+                        ));
+                    }
+
+                    match drain_timeout_action(
+                        dc.buffered_amount(),
+                        data.len(),
+                        high_watermark,
+                        BUFFERED_AMOUNT_HARD_LIMIT,
+                    ) {
+                        DrainTimeoutAction::SendNow => break,
+                        DrainTimeoutAction::KeepWaiting => {
+                            tracing::debug!(peer = %node.0, drained,
+                                buffered_amount = dc.buffered_amount(),
+                                "WebRTC: drain wake without capacity; continuing to wait");
+                        }
+                        DrainTimeoutAction::RejectOversized => {
+                            return Err(mistlib_core::error::MistError::Internal(format!(
+                                "Backpressure: message exceeds defensive buffer limit {}B",
+                                BUFFERED_AMOUNT_HARD_LIMIT
+                            )));
+                        }
+                    }
+                }
+                BackpressureAction::Drop => {
+                    tracing::warn!(
+                        "Dropping {:?} message to {} (bufferedAmount over {}B)",
+                        method,
+                        node.0,
+                        high_watermark
+                    );
+                    return Err(mistlib_core::error::MistError::Internal(
+                        "Backpressure: dropped unreliable message under congestion".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Normal pacing bounds the queue to high watermark + one legal frame.
+        // Keep the browser safety bound for unexpectedly large direct writes.
+        if u64::from(dc.buffered_amount()).saturating_add(data.len() as u64)
+            > u64::from(BUFFERED_AMOUNT_HARD_LIMIT)
+        {
+            return Err(mistlib_core::error::MistError::Internal(
+                "Backpressure: defensive buffer limit exceeded".to_string(),
+            ));
+        }
+        submitted.set(true);
+        dc.send_with_u8_array(data).map_err(|e| {
+            // send() rejects a closed channel with InvalidStateError before
+            // enqueueing data. Other thrown errors remain conservative.
+            if Reflect::get(&e, &JsValue::from_str("name"))
+                .ok()
+                .and_then(|name| name.as_string())
+                .as_deref()
+                == Some("InvalidStateError")
+            {
+                submitted.set(false);
+            }
+            tracing::error!("DataChannel send failed for {}: {:?}", node.0, e);
+            mistlib_core::error::MistError::Internal(format!("{:?}", e))
+        })?;
+        if is_bulk {
+            self.bulk_telemetry
+                .submitted_on(method == DeliveryMethod::ReliableUnordered);
+        }
+        if let Some(pacing) = &pacing {
+            pacing.submitted(dc, data.len(), is_bulk);
+        }
+        tracing::debug!(peer = %node.0, len = data.len(), ?method, buffered_after = dc.buffered_amount(), "WebRTC: DataChannel write completed");
+        STATS.add_send(data.len() as u64);
+        STATS.add_world_send_frame(data);
+        Ok(())
+    }
+
+    pub fn disable_unordered_channel(&self) {
+        self.unordered_capability.disable();
+        let channel = self.unordered_channel.write().unwrap().take();
+        if let Some(dc) = channel {
+            Self::detach_data_channel_handlers(&dc);
+            dc.close();
+        }
+        // Wake a writer waiting on this optional channel immediately.
+        self.buffered_amount_waiters
+            .write()
+            .unwrap()
+            .remove(&DeliveryMethod::ReliableUnordered);
+    }
+
     pub fn close_all(&self, node: &NodeId) {
+        if let Some(pacing) = self.pacing.read().unwrap().as_ref() {
+            pacing.budget.close();
+        }
+        self.disable_unordered_channel();
         self.detach_peer_handlers();
 
         let channels = {
@@ -323,13 +563,17 @@ impl Peer {
 
         // Wakes any in-flight `wait_for_buffered_amount_low` callers right
         // away instead of leaving them to sit out the full timeout: dropping
-        // their `oneshot::Sender` here surfaces as a recv error, which
-        // `wait_for_buffered_amount_low` treats the same as a timeout (drop
-        // the message) -- correct either way since the channel is closing.
-        self.buffered_amount_waiters
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // their `oneshot::Sender` here surfaces as a recv error. The caller
+        // rechecks the closed channel and fails the write. A FIFO
+        // flush retains its head until successful write or explicit teardown.
+        let waiters = {
+            let mut waiters = self
+                .buffered_amount_waiters
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *waiters)
+        };
+        drop(waiters);
 
         self.pc.close();
 
@@ -355,6 +599,7 @@ impl Peer {
         dc.set_onclose(None);
         dc.set_onmessage(None);
         dc.set_onbufferedamountlow(None);
+        dc.set_onerror(None);
     }
 
     pub fn setup_handlers(
@@ -408,200 +653,186 @@ impl Peer {
                 remote_id_state.0,
                 state
             );
-            let mut states = conn_states.write().unwrap_or_else(|e| e.into_inner());
-            match state {
+            // Browser getters and all effects run outside the state-map guard.
+            let has_open_channel = matches!(
+                state,
                 web_sys::RtcIceConnectionState::Connected
-                | web_sys::RtcIceConnectionState::Completed => {
-                    // Decide the repaired state up front, before anything
-                    // else in this arm, so this insertion stays
-                    // position-independent with respect to whatever else
-                    // this arm may also do on recovery (e.g. a possible
-                    // deferred-renegotiation trigger). Replaces the old
-                    // unconditional `ConnectionState::Connecting` -- see
-                    // `recovery::state_after_ice_recovery`'s doc comment for
-                    // the confirmed bug this fixes: after an ICE restart,
-                    // the existing (still-open) DataChannels never re-fire
-                    // `onopen`, so unconditionally demoting to `Connecting`
-                    // here left the peer stuck failing every `send()` with
-                    // "Not connected" forever.
-                    let trigger = if state == web_sys::RtcIceConnectionState::Connected {
-                        super::recovery::IceRecoveryTrigger::Connected
-                    } else {
-                        super::recovery::IceRecoveryTrigger::Completed
-                    };
-                    let has_open_channel = peer_state.has_open_channel();
-                    let new_state =
-                        super::recovery::state_after_ice_recovery(trigger, has_open_channel);
-                    states.insert(remote_id_state.clone(), new_state);
+                    | web_sys::RtcIceConnectionState::Completed
+            ) && peer_state.has_open_channel();
+            super::ice_state::handle_ice_state_change(
+                &conn_states,
+                &remote_id_state,
+                state,
+                has_open_channel,
+                |new_state| match state {
+                    web_sys::RtcIceConnectionState::Connected
+                    | web_sys::RtcIceConnectionState::Completed => {
+                        let new_state =
+                            new_state.expect("ICE recovery supplies a connection state");
 
-                    let recovered = disconnected_since_state
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&remote_id_state)
-                        .is_some();
-                    if recovered {
-                        tracing::info!(
+                        let recovered = disconnected_since_state
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&remote_id_state)
+                            .is_some();
+                        if recovered {
+                            tracing::info!(
                             "ICE recovered for {} during disconnected grace (state repaired to {:?}).",
                             remote_id_state.0,
                             new_state
                         );
-                    }
-
-                    // Flush any `ReliableOrdered` sends deferred while this
-                    // peer wasn't `Connected` (see `send_queue` /
-                    // `WasmWebRtcTransport::send`). Spawned rather than
-                    // called inline: this whole closure is a synchronous
-                    // browser event handler and `states` above is still
-                    // locked at this point in the arm -- `spawn_local`'s
-                    // future only actually runs after this closure returns
-                    // (and drops the lock), same reasoning as any other
-                    // deferred-work spawn in this handler. Deliberately does
-                    // NOT call `crate::app::emit_peer_connected` here even
-                    // though `new_state` may be `Connected`: see
-                    // `state_after_ice_recovery`'s doc comment for why the
-                    // app already considers this peer connected in that
-                    // case -- only the DC `onopen` path's own
-                    // `prev != Connected` check decides whether to emit.
-                    if new_state == ConnectionState::Connected {
-                        let peer_flush = peer_state.clone();
-                        let remote_id_flush = remote_id_state.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            peer_flush.flush_send_queue(&remote_id_flush);
-                        });
-                    }
-                    // A publish/unpublish that hit this peer while it was in
-                    // a transient state (e.g. the ICE-disconnected grace we
-                    // may just have recovered from) changed the senders but
-                    // deferred its renegotiation (see
-                    // `Peer::needs_track_reconcile`). Now that ICE is back,
-                    // run that renegotiation so the track change actually
-                    // reaches the remote instead of being lost forever. Looked
-                    // up via the session registry (`crate::app`) because this
-                    // closure only captures individual maps, not the owning
-                    // `WasmWebRtcTransport` -- same pattern as the
-                    // `emit_peer_disconnected` call in the Failed arm below.
-                    // Spawned, not awaited: this is a sync event handler, and
-                    // the spawned future takes `Peer::negotiating` internally.
-                    if peer_state
-                        .needs_track_reconcile
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                    {
-                        let remote_id = remote_id_state.clone();
-                        let room_id = room_id_state.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let Some(transport) = crate::app::session_webrtc(&room_id) else {
-                                return;
-                            };
-                            transport.reconcile_peer_tracks(&remote_id).await;
-                        });
-                    }
-                }
-                web_sys::RtcIceConnectionState::Disconnected => {
-                    states.insert(remote_id_state.clone(), ConnectionState::Reconnecting);
-                    // `Entry` (rather than `or_insert_with`'s return value, which
-                    // doesn't say whether it inserted) tells us whether this is
-                    // the transition that *started* the grace period, as
-                    // opposed to a state flicker while one is already running --
-                    // the ICE restart below fires at most once per grace period.
-                    let is_new_grace = match disconnected_since_state
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(remote_id_state.clone())
-                    {
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(DisconnectGrace {
-                                started_at: web_time::Instant::now(),
-                                origin: GraceOrigin::Ice,
-                            });
-                            true
                         }
-                        std::collections::hash_map::Entry::Occupied(_) => false,
-                    };
-                    tracing::warn!(
-                        "ICE disconnected for {}. keeping peer for recovery grace.",
-                        remote_id_state.0
-                    );
 
-                    // Only the initiator (lower NodeId) restarts, so both
-                    // sides don't race to send competing restart offers; the
-                    // other side's restart offer arrives as a normal Offer
-                    // and is applied in-place (offer_guard::OfferAction::ApplyInPlace).
-                    let is_initiator = local_id_ice_restart.0 < remote_id_state.0;
-                    let signaling_is_stable =
-                        peer_state.pc.signaling_state() == web_sys::RtcSignalingState::Stable;
-                    if super::ice_restart::should_trigger_ice_restart(
-                        is_new_grace,
-                        is_initiator,
-                        signaling_is_stable,
-                    ) {
-                        let restart_peer = peer_state.clone();
-                        let signaler = signaler_ice_restart.clone();
-                        let local_id = local_id_ice_restart.clone();
-                        let remote_id = remote_id_state.clone();
-                        let room_id = room_id_state.clone();
-                        let negotiation_delivery = negotiation_delivery_ice_restart.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            super::trigger_ice_restart(
-                                restart_peer,
-                                signaler,
-                                local_id,
-                                remote_id,
-                                room_id,
-                                negotiation_delivery,
-                            )
-                            .await;
-                        });
+                        // Flush any `ReliableOrdered` sends deferred while this
+                        // peer's channel wasn't open (see `send_queue` /
+                        // `WasmWebRtcTransport::send`). Spawned rather than
+                        // called inline because flushing can wait for backpressure.
+                        // The state mutation above has already released its guard.
+                        // Do not call `crate::app::emit_peer_connected` here even
+                        // though `new_state` may be `Connected`: see
+                        // `state_after_ice_recovery`'s doc comment for why the
+                        // app already considers this peer connected in that
+                        // case -- only the DC `onopen` path's own
+                        // `prev != Connected` check decides whether to emit.
+                        if new_state == ConnectionState::Connected {
+                            let peer_flush = peer_state.clone();
+                            let remote_id_flush = remote_id_state.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                peer_flush.flush_send_queue(&remote_id_flush).await;
+                            });
+                        }
+                        // A publish/unpublish that hit this peer while it was in
+                        // a transient state (e.g. the ICE-disconnected grace we
+                        // may just have recovered from) changed the senders but
+                        // deferred its renegotiation (see
+                        // `Peer::needs_track_reconcile`). Now that ICE is back,
+                        // run that renegotiation so the track change actually
+                        // reaches the remote instead of being lost forever. Looked
+                        // up via the session registry (`crate::app`) because this
+                        // closure only captures individual maps, not the owning
+                        // `WasmWebRtcTransport` -- same pattern as the
+                        // `emit_peer_disconnected` call in the Failed arm below.
+                        // Spawned, not awaited: this is a sync event handler, and
+                        // the spawned future takes `Peer::negotiating` internally.
+                        if peer_state
+                            .needs_track_reconcile
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            let remote_id = remote_id_state.clone();
+                            let room_id = room_id_state.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let Some(transport) = crate::app::session_webrtc(&room_id) else {
+                                    return;
+                                };
+                                transport.reconcile_peer_tracks(&remote_id).await;
+                            });
+                        }
                     }
-                }
-                web_sys::RtcIceConnectionState::Failed | web_sys::RtcIceConnectionState::Closed => {
-                    states.insert(remote_id_state.clone(), ConnectionState::Disconnected);
-                    {
-                        let mut disconnected = disconnected_since_state
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        disconnected.remove(&remote_id_state);
-                    }
-                    {
-                        let mut peers = peers_state.write().unwrap_or_else(|e| e.into_inner());
-                        peers.remove(&remote_id_state);
-                    }
-                    {
-                        let mut senders = senders_state.write().unwrap_or_else(|e| e.into_inner());
-                        senders.remove(&remote_id_state);
-                    }
-                    {
-                        let mut pending = pending_state.write().unwrap_or_else(|e| e.into_inner());
-                        pending.remove(&remote_id_state);
-                    }
-                    {
-                        candidate_delivery_state
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove_node(&remote_id_state);
-                        negotiation_delivery_state
+                    web_sys::RtcIceConnectionState::Disconnected => {
+                        // `Entry` (rather than `or_insert_with`'s return value, which
+                        // doesn't say whether it inserted) tells us whether this is
+                        // the transition that *started* the grace period, as
+                        // opposed to a state flicker while one is already running --
+                        // the ICE restart below fires at most once per grace period.
+                        let is_new_grace = match disconnected_since_state
                             .write()
                             .unwrap_or_else(|e| e.into_inner())
-                            .remove_node(&remote_id_state);
+                            .entry(remote_id_state.clone())
+                        {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(DisconnectGrace {
+                                    started_at: web_time::Instant::now(),
+                                    origin: GraceOrigin::Ice,
+                                });
+                                true
+                            }
+                            std::collections::hash_map::Entry::Occupied(_) => false,
+                        };
+                        tracing::warn!(
+                            "ICE disconnected for {}. keeping peer for recovery grace.",
+                            remote_id_state.0
+                        );
+
+                        // Only the initiator (lower NodeId) restarts, so both
+                        // sides don't race to send competing restart offers; the
+                        // other side's restart offer arrives as a normal Offer
+                        // and is applied in-place (offer_guard::OfferAction::ApplyInPlace).
+                        let is_initiator = local_id_ice_restart.0 < remote_id_state.0;
+                        let signaling_is_stable =
+                            peer_state.pc.signaling_state() == web_sys::RtcSignalingState::Stable;
+                        if super::ice_restart::should_trigger_ice_restart(
+                            is_new_grace,
+                            is_initiator,
+                            signaling_is_stable,
+                        ) {
+                            let restart_peer = peer_state.clone();
+                            let signaler = signaler_ice_restart.clone();
+                            let local_id = local_id_ice_restart.clone();
+                            let remote_id = remote_id_state.clone();
+                            let room_id = room_id_state.clone();
+                            let negotiation_delivery = negotiation_delivery_ice_restart.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                super::trigger_ice_restart(
+                                    restart_peer,
+                                    signaler,
+                                    local_id,
+                                    remote_id,
+                                    room_id,
+                                    negotiation_delivery,
+                                )
+                                .await;
+                            });
+                        }
                     }
-                    // Detach every forgotten browser callback and close the
-                    // DataChannels even though ICE itself is already terminal.
-                    // Besides draining the send queue, this breaks the
-                    // Peer -> RTCPeerConnection -> callback -> Peer reference
-                    // cycle and prevents terminal peers from continuing to
-                    // emit candidates or media events after removal.
-                    peer_state.close_all(&remote_id_state);
-                    // The Sweeper skips isolation-recovery when the peer is already
-                    // gone from the map, so we trigger it here directly.
-                    crate::app::emit_peer_disconnected(
-                        remote_id_state.clone(),
-                        room_id_state.clone(),
-                    );
-                }
-                web_sys::RtcIceConnectionState::Checking => {
-                    states.insert(remote_id_state.clone(), ConnectionState::Connecting);
-                }
-                _ => {}
-            }
+                    web_sys::RtcIceConnectionState::Failed
+                    | web_sys::RtcIceConnectionState::Closed => {
+                        {
+                            let mut disconnected = disconnected_since_state
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner());
+                            disconnected.remove(&remote_id_state);
+                        }
+                        {
+                            let mut peers = peers_state.write().unwrap_or_else(|e| e.into_inner());
+                            peers.remove(&remote_id_state);
+                        }
+                        {
+                            let mut senders =
+                                senders_state.write().unwrap_or_else(|e| e.into_inner());
+                            senders.remove(&remote_id_state);
+                        }
+                        {
+                            let mut pending =
+                                pending_state.write().unwrap_or_else(|e| e.into_inner());
+                            pending.remove(&remote_id_state);
+                        }
+                        {
+                            candidate_delivery_state
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove_node(&remote_id_state);
+                            negotiation_delivery_state
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove_node(&remote_id_state);
+                        }
+                        // Detach every forgotten browser callback and close the
+                        // DataChannels even though ICE itself is already terminal.
+                        // Besides draining the send queue, this breaks the
+                        // Peer -> RTCPeerConnection -> callback -> Peer reference
+                        // cycle and prevents terminal peers from continuing to
+                        // emit candidates or media events after removal.
+                        peer_state.close_all(&remote_id_state);
+                        // The Sweeper skips isolation-recovery when the peer is already
+                        // gone from the map, so we trigger it here directly.
+                        crate::app::emit_peer_disconnected(
+                            remote_id_state.clone(),
+                            room_id_state.clone(),
+                        );
+                    }
+                    _ => {}
+                },
+            );
         }) as Box<dyn FnMut(web_sys::Event)>);
         self.pc
             .set_oniceconnectionstatechange(Some(onstatechange.as_ref().unchecked_ref()));
@@ -721,15 +952,33 @@ impl Peer {
         let ondatachannel = Closure::wrap(Box::new(move |ev: web_sys::RtcDataChannelEvent| {
             let dc = ev.channel();
             let label = dc.label();
-            let method = match label.as_str() {
-                "reliable" => DeliveryMethod::ReliableOrdered,
-                "unreliable-ordered" => DeliveryMethod::UnreliableOrdered,
-                "unreliable" => DeliveryMethod::Unreliable,
-                _ => DeliveryMethod::ReliableOrdered,
+            use mistlib_core::transport::reliable_unordered::{channel_label, ChannelLabel};
+            let method = match channel_label(&label) {
+                Some(ChannelLabel::Reliable) => DeliveryMethod::ReliableOrdered,
+                Some(ChannelLabel::UnreliableOrdered) => DeliveryMethod::UnreliableOrdered,
+                Some(ChannelLabel::Unreliable) => DeliveryMethod::Unreliable,
+                Some(ChannelLabel::ReliableUnordered)
+                    if peer_dc.unordered_capability.accepts_channel() =>
+                {
+                    let mut bulk = peer_dc.unordered_channel.write().unwrap();
+                    if bulk.is_some() {
+                        dc.close();
+                        return;
+                    }
+                    *bulk = Some(dc.clone());
+                    DeliveryMethod::ReliableUnordered
+                }
+                _ => {
+                    tracing::debug!(%label, "Rejecting unknown or unnegotiated DataChannel");
+                    dc.close();
+                    return;
+                }
             };
             {
                 let mut channels = peer_dc.channels.write().unwrap_or_else(|e| e.into_inner());
-                channels.insert(method, dc.clone());
+                if label != mistlib_core::transport::reliable_unordered::RELIABLE_UNORDERED_LABEL {
+                    channels.insert(method, dc.clone());
+                }
             }
             Peer::setup_dc_handlers(
                 dc,
@@ -798,6 +1047,18 @@ impl Peer {
         pending_candidates: Arc<RwLock<crate::transport::webrtc::PendingCandidates>>,
         config_max_message_bytes: u32,
     ) {
+        let is_bulk =
+            dc.label() == mistlib_core::transport::reliable_unordered::RELIABLE_UNORDERED_LABEL;
+        if is_bulk {
+            let weak = Arc::downgrade(&peer);
+            let onerror = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+                if let Some(peer) = weak.upgrade() {
+                    peer.disable_unordered_channel();
+                }
+            }) as Box<dyn FnMut(web_sys::Event)>);
+            dc.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+            onerror.forget();
+        }
         // Takes the whole `Arc<Peer>` (rather than just its
         // `buffered_amount_waiters`, as before) so `onopen` below can flush
         // `peer.send_queue` directly once the ReliableOrdered channel opens,
@@ -851,7 +1112,7 @@ impl Peer {
             // Marking the peer Connected when either best-effort channel opens
             // can suppress the connection watchdog while the required channel
             // is still unusable.
-            if method != DeliveryMethod::ReliableOrdered {
+            if is_bulk || method != DeliveryMethod::ReliableOrdered {
                 return;
             }
             let is_current = {
@@ -912,7 +1173,11 @@ impl Peer {
                 peer_open.connection_announced.store(true, Ordering::SeqCst);
                 crate::app::emit_peer_connected(from_msg.clone(), room_id_open.clone());
             }
-            peer_open.flush_send_queue(&from_msg);
+            let peer_flush = peer_open.clone();
+            let from_flush = from_msg.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                peer_flush.flush_send_queue(&from_flush).await;
+            });
         }) as Box<dyn FnMut(web_sys::Event)>);
         dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -927,6 +1192,10 @@ impl Peer {
         let pending_close = pending_candidates.clone();
         let room_id_close = room_id.clone();
         let onclose = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
+            if is_bulk {
+                peer_close_identity.disable_unordered_channel();
+                return;
+            }
             tracing::warn!(
                 "DataChannel to {} closed, triggering immediate disconnect.",
                 from_close.0
@@ -971,7 +1240,9 @@ impl Peer {
         dc.set_onclose(Some(onclose.as_ref().unchecked_ref()));
         onclose.forget();
 
+        let inbound_peer = peer.clone();
         let onmessage = Closure::wrap(Box::new(move |ev: MessageEvent| {
+            inbound_peer.inbound_activity.record();
             if let Ok(ab) = ev.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let array = js_sys::Uint8Array::new(&ab);
                 let vec = array.to_vec();
@@ -1029,4 +1300,30 @@ fn read_negotiated_max_message_size(pc: &RtcPeerConnection) -> Option<u32> {
     }
 
     Some(value.min(u32::MAX as f64) as u32)
+}
+
+impl Peer {
+    pub fn storage_transport_stats(&self) -> serde_json::Value {
+        let channels = self.channels.read().unwrap();
+        let reliable = channels
+            .get(&DeliveryMethod::ReliableOrdered)
+            .map(|dc| dc.buffered_amount());
+        let unordered = self
+            .unordered_channel
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|dc| dc.buffered_amount());
+        let budget = self
+            .pacing
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.budget.limit());
+        serde_json::json!({
+            "reliableBufferedAmount": reliable, "reliableUnorderedBufferedAmount": unordered,
+            "effectiveBulkBudgetBytes": budget, "bulkChannel": self.bulk_telemetry.bulk_channel(),
+            "bulkQueuedBytes": 0,
+        })
+    }
 }

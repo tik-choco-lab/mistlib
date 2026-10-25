@@ -74,7 +74,8 @@ impl WasmWebSocketSignaler {
     pub async fn connect(&self, tx: mpsc::UnboundedSender<MessageContent>) -> Result<(), JsValue> {
         *self.incoming_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
         let epoch = self.next_epoch();
-        if let Some(ws) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let ws = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(ws) = ws {
             let _ = ws.close();
         }
         self.open_socket(tx, epoch, false).await
@@ -139,7 +140,8 @@ impl WasmWebSocketSignaler {
         let open_tx_cb = open_tx.clone();
         let onerror_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
             web_sys::console::error_1(&e);
-            if let Some(tx) = open_tx_cb.borrow_mut().take() {
+            let tx = open_tx_cb.borrow_mut().take();
+            if let Some(tx) = tx {
                 let _ = tx.send(Err("websocket failed to open".to_string()));
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
@@ -148,7 +150,8 @@ impl WasmWebSocketSignaler {
 
         let open_tx_cb = open_tx.clone();
         let onopen_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            if let Some(tx) = open_tx_cb.borrow_mut().take() {
+            let tx = open_tx_cb.borrow_mut().take();
+            if let Some(tx) = tx {
                 let _ = tx.send(Ok(()));
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
@@ -160,7 +163,8 @@ impl WasmWebSocketSignaler {
         let reconnect_tx = tx.clone();
         let reconnect_ws = ws.clone();
         let onclose_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            if let Some(tx) = open_tx_cb.borrow_mut().take() {
+            let tx = open_tx_cb.borrow_mut().take();
+            if let Some(tx) = tx {
                 let _ = tx.send(Err("websocket closed before opening".to_string()));
                 return;
             }
@@ -250,7 +254,8 @@ impl WasmWebSocketSignaler {
 
         tracing::info!("WasmWebSocketSignaler: resetting signaling session");
         let epoch = self.next_epoch();
-        if let Some(ws) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let ws = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(ws) = ws {
             let _ = ws.close();
         }
 
@@ -379,8 +384,8 @@ impl Signaler for WasmWebSocketSignaler {
     async fn close(&self) -> mistlib_core::error::Result<()> {
         *self.incoming_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.next_epoch();
-        let mut lock = self.socket.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ws) = lock.take() {
+        let ws = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(ws) = ws {
             ws.close().map_err(|e| {
                 mistlib_core::error::MistError::Network(format!(
                     "WasmWebSocketSignaler: websocket close failed: {:?}",

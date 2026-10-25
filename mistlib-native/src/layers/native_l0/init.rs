@@ -117,12 +117,52 @@ fn build_webrtc_transport(
         local_id.clone(),
     ));
     transport.set_room_id(room_id);
+    transport.set_storage_transfer(config.storage.transfer.clone());
     transport.set_max_connections(config.limits.max_connection_count);
     transport.set_max_message_bytes(config.limits.max_message_bytes);
     transport.set_ice_servers(crate::transports::webrtc::map_ice_servers(
         &config.webrtc.ice_servers,
     ));
     transport
+}
+
+// Bind the action handler to the same session as the router. Send admission
+// stays synchronous all the way from `dispatch_data` to the peer queue.
+pub(crate) struct SessionActionHandler {
+    pub(crate) room_id: String,
+}
+
+impl mistlib_core::overlay::ActionHandler for SessionActionHandler {
+    fn handle_action(&self, action: mistlib_core::action::OverlayAction) {
+        ENGINE.handle_action_in_room(self.room_id.clone(), action);
+    }
+
+    fn try_dispatch_send(
+        &self,
+        action: mistlib_core::action::OverlayAction,
+    ) -> mistlib_core::error::Result<()> {
+        ENGINE.try_dispatch_send_in_room(&self.room_id, action)
+    }
+    fn reserve_send<'a>(
+        &'a self,
+        to: &'a NodeId,
+        bytes: usize,
+        lane: mistlib_core::action::SendLane,
+    ) -> mistlib_core::transport::send::SendFuture<
+        'a,
+        mistlib_core::error::Result<mistlib_core::transport::send::SendReservation>,
+    > {
+        Box::pin(async move {
+            let ctx = ENGINE
+                .get_session_sync(&self.room_id)
+                .ok_or_else(mistlib_core::transport::send::closed_send)?;
+            let transport = ctx
+                .webrtc_transport
+                .as_ref()
+                .ok_or_else(mistlib_core::transport::send::closed_send)?;
+            transport.reserve_overlay_send(to, bytes, lane).await
+        })
+    }
 }
 
 fn build_overlay_transport(
@@ -139,18 +179,6 @@ fn build_overlay_transport(
         router.routing_table.clone(),
     )));
     let router_arc = Arc::new(router);
-
-    // mistlib-core's `ActionHandler` trait has no room parameter, so this
-    // session's own room_id has to be carried by the handler instance itself
-    // -- it resolves back to this session via `ENGINE.handle_action_in_room`.
-    struct SessionActionHandler {
-        room_id: String,
-    }
-    impl mistlib_core::overlay::ActionHandler for SessionActionHandler {
-        fn handle_action(&self, action: mistlib_core::action::OverlayAction) {
-            ENGINE.handle_action_in_room(self.room_id.clone(), action);
-        }
-    }
 
     let transport = Arc::new(OverlayTransport {
         router: router_arc.clone(),

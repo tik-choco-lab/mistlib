@@ -20,30 +20,41 @@ impl WasmWebRtcTransport {
                 .collect()
         };
 
-        let mut changed = false;
-        let mut senders_lock = self.peer_senders.write().unwrap_or_else(|e| e.into_inner());
-        let peer_senders = senders_lock.entry(remote_id.clone()).or_default();
-
-        let removed: Vec<String> = peer_senders
-            .keys()
-            .filter(|id| !tracks.iter().any(|(track_id, _)| track_id == *id))
-            .cloned()
-            .collect();
-        for id in removed {
-            if let Some(sender) = peer_senders.remove(&id) {
-                peer.pc.remove_track(&sender);
-                changed = true;
-            }
+        // Extract mutations before calling browser APIs; negotiation/media
+        // callbacks must be able to consult the sender registry.
+        let (removed, existing) = {
+            let mut senders = self.peer_senders.write().unwrap_or_else(|e| e.into_inner());
+            let peer_senders = senders.entry(remote_id.clone()).or_default();
+            let removed_ids: Vec<_> = peer_senders
+                .keys()
+                .filter(|id| !tracks.iter().any(|(track_id, _)| track_id == *id))
+                .cloned()
+                .collect();
+            let removed: Vec<_> = removed_ids
+                .into_iter()
+                .filter_map(|id| peer_senders.remove(&id))
+                .collect();
+            let existing: std::collections::HashSet<_> = peer_senders.keys().cloned().collect();
+            (removed, existing)
+        };
+        let mut changed = !removed.is_empty();
+        for sender in removed {
+            peer.pc.remove_track(&sender);
         }
 
         for (track_id, track) in tracks {
-            if peer_senders.contains_key(&track_id) {
+            if existing.contains(&track_id) {
                 continue;
             }
             let stream = MediaStream::new()?;
             stream.add_track(&track);
             let sender = peer.pc.add_track_0(&track, &stream);
-            peer_senders.insert(track_id, sender);
+            self.peer_senders
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(remote_id.clone())
+                .or_default()
+                .insert(track_id, sender);
             changed = true;
         }
 

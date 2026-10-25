@@ -388,6 +388,24 @@ async fn build_session(
         fn handle_action(&self, action: mistlib_core::action::OverlayAction) {
             self.0.handle_action(action);
         }
+
+        fn try_dispatch_send(
+            &self,
+            action: mistlib_core::action::OverlayAction,
+        ) -> mistlib_core::error::Result<()> {
+            self.0.try_dispatch_send(action)
+        }
+        fn reserve_send<'a>(
+            &'a self,
+            to: &'a NodeId,
+            bytes: usize,
+            lane: mistlib_core::action::SendLane,
+        ) -> mistlib_core::transport::send::SendFuture<
+            'a,
+            mistlib_core::error::Result<mistlib_core::transport::send::SendReservation>,
+        > {
+            self.0.reserve_send(to, bytes, lane)
+        }
     }
     let action_handler = Arc::new(EngineActionHandler(engine.clone()));
 
@@ -415,6 +433,7 @@ async fn build_session(
     webrtc.set_room_id(room_id.clone());
     webrtc.set_max_connections(config.limits.max_connection_count);
     webrtc.set_max_message_bytes(config.limits.max_message_bytes);
+    webrtc.set_storage_transfer(config.storage.transfer.clone());
     webrtc.set_ice_servers(config.webrtc.ice_servers.clone());
     webrtc.set_connection_experiment(
         config.webrtc.connection_timeout_ms,

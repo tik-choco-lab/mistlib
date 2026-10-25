@@ -14,6 +14,16 @@ pub trait BlockStore: HostSendSync {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait PeerResolver: HostSendSync {
     async fn resolve_block(&self, cid: &str) -> Option<Vec<u8>>;
+
+    /// Preserves network failure context for the engine. Existing embedders
+    /// may retain the Option-only method; no FFI error codes change.
+    async fn resolve_block_result(&self, cid: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.resolve_block(cid).await)
+    }
+
+    /// Optionally warm provider caches before fetching a batch of missing blocks.
+    /// Implementations may bound the batch; resolving must also work without it.
+    async fn prefetch_providers(&self, _cids: &[String]) {}
 }
 
 /// Small mutable named metadata, persisted outside the content-addressed

@@ -1,3 +1,5 @@
+mod lane_policy;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use js_sys::Reflect;
@@ -6,7 +8,6 @@ use mistlib_core::signaling::{
     CandidateAck, CandidateEnvelope, MessageContent, NegotiationAck, NegotiationEnvelope, Signaler,
     SignalingData, SignalingHandler, SignalingType,
 };
-use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
@@ -16,8 +17,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStreamTrack, RtcConfiguration, RtcDataChannelInit, RtcIceCandidateInit,
-    RtcIceConnectionState, RtcOfferOptions, RtcPeerConnection, RtcRtpSender, RtcSdpType,
-    RtcSessionDescriptionInit, RtcSignalingState,
+    RtcIceConnectionState, RtcPeerConnection, RtcRtpSender, RtcSdpType, RtcSessionDescriptionInit,
+    RtcSignalingState,
 };
 use web_time::Instant;
 
@@ -32,7 +33,11 @@ async fn send_negotiation_reliably(
     sdp: String,
 ) {
     let id = rand::random::<u64>();
-    let Ok(payload) = serde_json::to_string(&NegotiationEnvelope { id, sdp }) else {
+    let Ok(payload) = serde_json::to_string(&NegotiationEnvelope {
+        id,
+        sdp,
+        reliable_unordered: Some(1),
+    }) else {
         tracing::error!(
             "Failed to serialize {:?} transaction for {}",
             signaling_type,
@@ -189,8 +194,12 @@ mod answer_sdp;
 mod answer_tests;
 pub mod backpressure;
 pub mod candidate_delivery;
+mod disconnect_grace;
+#[cfg(test)]
+mod ice_callback_tests;
 pub mod ice_config;
 pub mod ice_restart;
+mod ice_state;
 pub mod isolation;
 mod media;
 pub mod message_guard;
@@ -200,14 +209,20 @@ mod offer_failure;
 #[path = "webrtc/offer_failure_tests.rs"]
 mod offer_failure_tests;
 pub mod offer_guard;
+pub mod pacing;
 pub mod peer;
 pub mod pending_candidates;
 pub mod recovery;
 pub mod request_guard;
+mod restart;
+use restart::trigger_ice_restart;
 pub mod sctp_limit;
 pub mod sdp_lines;
 pub mod send_queue;
-use backpressure::{backpressure_action, BackpressureAction};
+mod transport_activity;
+use backpressure::{
+    backpressure_action, drain_timeout_action, BackpressureAction, DrainTimeoutAction,
+};
 use candidate_delivery::{CandidateDelivery, CANDIDATE_ACK_DEBOUNCE_MS};
 use ice_config::{build_ice_server_plans, ice_server_plans_to_js};
 use isolation::is_isolated;
@@ -229,7 +244,7 @@ pub use request_guard::RequestAction;
 use request_guard::{request_action_for_snapshot, RequestState};
 use sctp_limit::effective_message_limit;
 use sdp_lines::mline_signature;
-use send_queue::{should_queue_reliable_send, MAX_QUEUED_BYTES, MAX_QUEUED_MESSAGES};
+use send_queue::{send_action, SendAction, MAX_QUEUED_BYTES, MAX_QUEUED_MESSAGES};
 
 /// Backpressure watermarks for a DataChannel's `bufferedAmount`
 /// (`RTCDataChannel::send()` is fire-and-forget and never surfaces this on
@@ -239,8 +254,12 @@ use send_queue::{should_queue_reliable_send, MAX_QUEUED_BYTES, MAX_QUEUED_MESSAG
 /// the queue drains back down to it.
 const BUFFERED_AMOUNT_HIGH_WATERMARK: u32 = 1024 * 1024; // 1 MiB
 const BUFFERED_AMOUNT_LOW_THRESHOLD: u32 = 256 * 1024; // 256 KiB
-/// Upper bound on how long a Reliable send waits for `onbufferedamountlow`
-/// before giving up and dropping the message.
+/// Browsers can fail/close a channel around 16 MiB of `bufferedAmount` (Chrome),
+/// so keep this defensive limit well below that. Normal pacing waits until
+/// bufferedAmount is at most the high watermark before every reliable write.
+const BUFFERED_AMOUNT_HARD_LIMIT: u32 = 8 * 1024 * 1024; // 8 MiB
+/// Recheck interval if Firefox misses `onbufferedamountlow`. An expiry never
+/// grants permission to send while still above the high watermark.
 const BUFFERED_AMOUNT_WAIT_TIMEOUT_MS: u32 = 3000;
 
 #[derive(Clone)]
@@ -252,6 +271,7 @@ pub struct LocalTrack {
 }
 
 pub struct WasmWebRtcTransport {
+    storage_transfer: RwLock<mistlib_core::config::StorageTransferConfig>,
     pub signaler: Arc<dyn Signaler>,
     pub local_node_id: NodeId,
     pub peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
@@ -325,6 +345,7 @@ pub struct WasmWebRtcTransport {
 impl WasmWebRtcTransport {
     pub fn new(signaler: Arc<dyn Signaler>, local_node_id: NodeId) -> Self {
         Self {
+            storage_transfer: RwLock::new(Default::default()),
             signaler,
             local_node_id,
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -406,6 +427,75 @@ impl WasmWebRtcTransport {
                     continue;
                 }
 
+                // Sample at the existing cleanup cadence, in parallel under one
+                // bounded wait. No timers or stats tasks accumulate per peer.
+                let established: Vec<_> = peers
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(_, peer)| peer.connection_announced.load(Ordering::Relaxed))
+                    .map(|(node, peer)| (node.clone(), peer.clone()))
+                    .collect();
+                let sample_started = web_time::Instant::now();
+                let samples = futures::future::join_all(established.into_iter().map(
+                    |(node, peer)| async move {
+                        let pending = peer
+                            .liveness_stats
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
+                        let reused = pending.is_some();
+                        let stats = pending
+                            .unwrap_or_else(|| Box::pin(JsFuture::from(peer.pc.get_stats())));
+                        let timeout = gloo_timers::future::TimeoutFuture::new(250);
+                        futures::pin_mut!(timeout);
+                        let (sample, outcome) = match futures::future::select(stats, timeout).await
+                        {
+                            futures::future::Either::Left((Ok(stats), _)) => {
+                                (transport_activity::received_bytes(&stats), "result")
+                            }
+                            futures::future::Either::Left((Err(_), _)) => (None, "rejection"),
+                            futures::future::Either::Right((_, pending)) => {
+                                *peer
+                                    .liveness_stats
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = Some(pending);
+                                (None, "timeout")
+                            }
+                        };
+                        (node, peer, sample, outcome, reused)
+                    },
+                ))
+                .await;
+                if sweeper_generation.load(Ordering::Relaxed) != generation {
+                    break;
+                }
+                tracing::debug!(room = %*room_id.read().unwrap_or_else(|e| e.into_inner()), peers = samples.len(),
+                    results = samples.iter().filter(|sample| sample.3 == "result").count(),
+                    with_counters = samples.iter().filter(|sample| sample.2.is_some()).count(),
+                    timeouts = samples.iter().filter(|sample| sample.3 == "timeout").count(),
+                    rejections = samples.iter().filter(|sample| sample.3 == "rejection").count(),
+                    reused = samples.iter().filter(|sample| sample.4).count(),
+                    elapsed_ms = sample_started.elapsed().as_millis(), "WebRTC: getStats sweep");
+                for (node, peer, sample, _, _) in samples {
+                    // getStats may finish after a same-NodeId replacement. Never
+                    // credit the old association's bytes to the replacement.
+                    let is_current = {
+                        let current = peers.read().unwrap_or_else(|e| e.into_inner());
+                        current.get(&node).is_some_and(|p| Arc::ptr_eq(p, &peer))
+                    };
+                    if !is_current {
+                        continue;
+                    }
+                    if let Some((id, bytes)) = sample {
+                        if peer.inbound_activity.record_transport_bytes(&id, bytes)
+                            && mistlib_core::stats::STATS.note_inbound_activity(&node)
+                        {
+                            cancel_suspect_grace(&node, &states, &disconnected_since);
+                        }
+                    }
+                }
+
                 let nodes: Vec<NodeId> = {
                     let lock = states.read().unwrap_or_else(|e| e.into_inner());
                     lock.keys().cloned().collect()
@@ -466,22 +556,34 @@ impl WasmWebRtcTransport {
                         })
                     };
 
+                    let grace_start = disconnected_since
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&node)
+                        .map(|grace| grace.started_at);
+                    let grace_decision = disconnect_grace::decide_grace_expiry(
+                        ice_state,
+                        state_snapshot,
+                        grace_start,
+                        peer.inbound_activity.last_rx(),
+                        Instant::now(),
+                        DISCONNECTED_GRACE_MS,
+                    );
+                    if grace_decision == disconnect_grace::GraceExpiryDecision::ExtendedByTraffic
+                        && grace_start
+                            .is_some_and(|start| peer.inbound_activity.log_extension_once(start))
+                    {
+                        tracing::debug!(
+                            "[Sweeper] disconnected grace extended by inbound traffic for {}",
+                            node.0
+                        );
+                    }
                     let failed_or_closed = matches!(
                         ice_state,
-                        web_sys::RtcIceConnectionState::Failed
-                            | web_sys::RtcIceConnectionState::Closed
+                        RtcIceConnectionState::Failed | RtcIceConnectionState::Closed
                     );
-                    let disconnected_grace_expired =
-                        (matches!(ice_state, web_sys::RtcIceConnectionState::Disconnected)
-                            || state_snapshot == ConnectionState::Reconnecting)
-                            && disconnected_since
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get(&node)
-                                .is_some_and(|grace| {
-                                    grace.started_at.elapsed().as_millis()
-                                        >= DISCONNECTED_GRACE_MS as u128
-                                });
+                    let disconnected_grace_expired = !failed_or_closed
+                        && grace_decision == disconnect_grace::GraceExpiryDecision::Reap;
                     let missing_channel =
                         state_snapshot == ConnectionState::Connected && !has_open_channel;
 
@@ -594,6 +696,10 @@ impl WasmWebRtcTransport {
     /// Called once from `build_session` with `config.limits.max_message_bytes`
     /// -- not live-reactive to a later `set_config()` mid-session, same as
     /// `set_max_connections`/`set_ice_servers`.
+    pub fn set_storage_transfer(&self, transfer: mistlib_core::config::StorageTransferConfig) {
+        *self.storage_transfer.write().unwrap() = transfer;
+    }
+
     pub fn set_max_message_bytes(&self, max: u32) {
         self.max_message_bytes.store(max, Ordering::Relaxed);
     }
@@ -728,6 +834,49 @@ impl WasmWebRtcTransport {
         self.buffer_candidate_if_allowed(node, cand_json);
     }
 
+    fn open_reliable_unordered(&self, remote: &NodeId, peer: &Arc<Peer>) {
+        if !peer.unordered_capability.begin_open() {
+            return;
+        }
+        let init = RtcDataChannelInit::new();
+        init.set_ordered(false);
+        init.set_negotiated(false);
+        let created = (|| -> Result<web_sys::RtcDataChannel, JsValue> {
+            let create = Reflect::get(peer.pc.as_ref(), &"createDataChannel".into())?
+                .dyn_into::<js_sys::Function>()?;
+            create
+                .call2(
+                    peer.pc.as_ref(),
+                    &mistlib_core::transport::reliable_unordered::RELIABLE_UNORDERED_LABEL.into(),
+                    init.as_ref(),
+                )?
+                .dyn_into()
+        })();
+        match created {
+            Ok(dc) => {
+                *peer.unordered_channel.write().unwrap() = Some(dc.clone());
+                Peer::setup_dc_handlers(
+                    dc,
+                    DeliveryMethod::ReliableUnordered,
+                    peer.clone(),
+                    self.event_handler.clone(),
+                    remote.clone(),
+                    self.room_id.read().unwrap().clone(),
+                    self.connection_states.clone(),
+                    self.disconnected_since.clone(),
+                    self.peers.clone(),
+                    self.peer_senders.clone(),
+                    self.pending_candidates.clone(),
+                    self.max_message_bytes.load(Ordering::Relaxed),
+                );
+            }
+            Err(error) => {
+                peer.unordered_capability.disable();
+                tracing::debug!(?error, "Storage bulk setup failed; using reliable");
+            }
+        }
+    }
+
     async fn send_negotiation(
         &self,
         remote_id: &NodeId,
@@ -764,7 +913,7 @@ impl WasmWebRtcTransport {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .is_received(remote_id, envelope.id);
-        (envelope.sdp, Some(envelope.id), duplicate)
+        (payload, Some(envelope.id), duplicate)
     }
 
     fn acknowledge_negotiation(&self, remote_id: NodeId, id: u64) {
@@ -888,18 +1037,22 @@ impl WasmWebRtcTransport {
 
         let pc = RtcPeerConnection::new_with_configuration(&config)?;
         let peer = Arc::new(Peer::new(pc));
+        peer.configure_bulk_pacing(&self.storage_transfer.read().unwrap());
+        peer.unordered_capability.set_local(true);
         let candidate_generation = self
             .next_candidate_generation
             .fetch_add(1, Ordering::Relaxed);
 
+        let room_id = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         peer.setup_handlers(
             remote_id.clone(),
             self.signaler.clone(),
             self.local_node_id.clone(),
-            self.room_id
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            room_id,
             self.connection_states.clone(),
             self.disconnected_since.clone(),
             self.event_handler.clone(),
@@ -956,6 +1109,15 @@ impl WasmWebRtcTransport {
             let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
             peers.remove(node)
         };
+
+        if removed_peer.is_some() {
+            let room = self
+                .room_id
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            crate::app::reset_storage_senders(&room, node);
+        }
 
         if close_pc {
             if let Some(peer) = removed_peer {
@@ -1323,6 +1485,12 @@ impl WasmWebRtcTransport {
             std::mem::take(&mut *lock)
         };
 
+        let room = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        crate::app::reset_storage_room(&room);
         for (node, peer) in peers {
             peer.close_all(&node);
         }
@@ -1672,6 +1840,12 @@ impl WasmWebRtcTransport {
             peers.insert(remote_id.clone(), peer.clone())
         };
         if let Some(old_peer) = old_peer {
+            let room = self
+                .room_id
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            crate::app::reset_storage_senders(&room, &remote_id);
             old_peer.close_all(&remote_id);
         }
 
@@ -1703,6 +1877,11 @@ impl WasmWebRtcTransport {
                 .await
                 .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
 
+            peer.unordered_capability.accept_remote(
+                serde_json::from_str::<NegotiationEnvelope>(&payload)
+                    .ok()
+                    .and_then(|e| e.reliable_unordered),
+            );
             let answer = JsFuture::from(peer.pc.create_answer())
                 .await
                 .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
@@ -1879,6 +2058,11 @@ impl WasmWebRtcTransport {
             return Err(mistlib_core::error::MistError::Internal(error));
         }
 
+        peer.unordered_capability.accept_remote(
+            serde_json::from_str::<NegotiationEnvelope>(&payload)
+                .ok()
+                .and_then(|e| e.reliable_unordered),
+        );
         let answer = match JsFuture::from(peer.pc.create_answer()).await {
             Ok(answer) => answer,
             Err(e) => {
@@ -1948,6 +2132,41 @@ impl WasmWebRtcTransport {
     }
 }
 
+// Shared with transport stats sampling; ICE-originated grace is never cleared.
+fn cancel_suspect_grace(
+    node: &NodeId,
+    connection_states: &RwLock<HashMap<NodeId, ConnectionState>>,
+    disconnected_since: &RwLock<HashMap<NodeId, DisconnectGrace>>,
+) -> bool {
+    let is_suspect_origin = {
+        let disconnected = disconnected_since.read().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            disconnected.get(node),
+            Some(DisconnectGrace {
+                origin: GraceOrigin::LivenessSuspect,
+                ..
+            })
+        )
+    };
+    if !is_suspect_origin {
+        return false;
+    }
+
+    {
+        let mut states = connection_states.write().unwrap_or_else(|e| e.into_inner());
+        if !states.contains_key(node) {
+            return false;
+        }
+        states.insert(node.clone(), ConnectionState::Connected);
+    }
+    disconnected_since
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(node);
+    tracing::info!("[CS] cleared liveness-suspect grace, recovered: {}", node.0);
+    true
+}
+
 // --- Liveness / reconnect grace ---
 impl WasmWebRtcTransport {
     /// Entry point for `OverlayAction::SuspectDisconnected`: only transitions a
@@ -1997,39 +2216,7 @@ impl WasmWebRtcTransport {
     /// period started by ICE `Disconnected` is left alone -- only ICE's own
     /// recovery signal is allowed to end that one.
     pub(crate) fn cancel_suspect_grace(&self, node: &NodeId) -> bool {
-        let is_suspect_origin = {
-            let disconnected = self
-                .disconnected_since
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            matches!(
-                disconnected.get(node),
-                Some(DisconnectGrace {
-                    origin: GraceOrigin::LivenessSuspect,
-                    ..
-                })
-            )
-        };
-        if !is_suspect_origin {
-            return false;
-        }
-
-        {
-            let mut states = self
-                .connection_states
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            if !states.contains_key(node) {
-                return false;
-            }
-            states.insert(node.clone(), ConnectionState::Connected);
-        }
-        self.disconnected_since
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(node);
-        tracing::info!("[CS] cleared liveness-suspect grace, recovered: {}", node.0);
-        true
+        cancel_suspect_grace(node, &self.connection_states, &self.disconnected_since)
     }
 
     pub fn get_active_connection_states(&self) -> Vec<(NodeId, ConnectionState)> {
@@ -2106,16 +2293,21 @@ fn schedule_isolation_recovery(
 ///
 /// Returns `true` if the drain fired in time, `false` on timeout or if the
 /// peer closed while waiting (`Peer::close_all` clears `waiters`, which
-/// surfaces here as the receiver's sender having been dropped) -- either way
-/// the caller (`send`) drops the message rather than sending into a channel
-/// that's still congested (or gone). Only touches `waiters` through brief,
-/// synchronous lock scopes, so no `RwLock` borrow is held across the
-/// `.await` below.
+/// surfaces here as the receiver's sender having been dropped). The caller
+/// (`send`) re-checks that the channel is Open and has capacity after every
+/// wake; a timeout alone never permits a congested write. Only touches
+/// `waiters` through brief, synchronous lock scopes, so no `RwLock` borrow is
+/// held across the `.await` below.
 async fn wait_for_buffered_amount_low(
+    node: &NodeId,
     waiters: &Arc<RwLock<HashMap<DeliveryMethod, Vec<tokio::sync::oneshot::Sender<()>>>>>,
     dc: &web_sys::RtcDataChannel,
     method: DeliveryMethod,
+    timeout_ms: u32,
 ) -> bool {
+    let started = web_time::Instant::now();
+    let before = dc.buffered_amount();
+    tracing::debug!(peer = %node.0, channel = %dc.label(), ?method, buffered_before = before, "WebRTC: bufferedAmount wait started");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
         let mut lock = waiters.write().unwrap_or_else(|e| e.into_inner());
@@ -2132,105 +2324,21 @@ async fn wait_for_buffered_amount_low(
     // browser may already have emitted the only edge event we were waiting
     // for, so do not sleep until the timeout. The sender left in waiters is
     // closed when rx is dropped and is pruned by the next waiter/event.
-    if dc.buffered_amount() <= BUFFERED_AMOUNT_LOW_THRESHOLD {
-        return true;
-    }
-
-    let timeout = gloo_timers::future::TimeoutFuture::new(BUFFERED_AMOUNT_WAIT_TIMEOUT_MS);
-    matches!(
-        futures::future::select(rx, timeout).await,
-        futures::future::Either::Left((Ok(()), _))
-    )
-}
-
-/// Fires an ICE-restart offer on `peer`'s existing connection: `createOffer`
-/// with `iceRestart: true` -> `setLocalDescription` -> send it through the
-/// normal offer signaling envelope. Called from `Peer::setup_handlers`'s
-/// `oniceconnectionstatechange` handler when `ice_restart::should_trigger_ice_restart`
-/// says so (new disconnected-grace period, we're the initiator, signaling
-/// still stable). Deliberately does not go through `renegotiate_peer` --
-/// that function rejects a `Disconnected` ice_state on purpose, but this
-/// path exists precisely because ice_state just became `Disconnected`.
-///
-/// Takes `Peer::negotiating` for the same reason `renegotiate_peer` and
-/// `apply_offer_in_place` do -- an ICE restart's createOffer/setLocalDescription
-/// pair mutates signaling state just like theirs, so it must not race a
-/// renegotiation triggered concurrently by, say, a `publish_local_track` call
-/// landing at the same moment as the ICE disconnect.
-///
-/// The remote side receives this as an ordinary `Offer`; since its signaling
-/// state is still `Stable`, `handle_offer` takes the `ApplyInPlace` branch
-/// and answers it in-place, same as any other renegotiation. A failure here
-/// (createOffer/setLocalDescription rejected, or the signaling send fails)
-/// is left to the existing disconnected-grace expiry/cleanup as a safety
-/// net -- no separate rollback is attempted (unlike `renegotiate_peer`'s),
-/// since a stuck-non-Stable state here is subsumed by that same expiry path
-/// eventually tearing down and recreating the peer regardless.
-async fn trigger_ice_restart(
-    peer: Arc<Peer>,
-    signaler: Arc<dyn Signaler>,
-    local_id: NodeId,
-    remote_id: NodeId,
-    room_id: String,
-    negotiation_delivery: Arc<RwLock<NegotiationDelivery>>,
-) {
-    let _negotiating = peer.negotiating.lock().await;
-    let pc = &peer.pc;
-
-    if pc.signaling_state() != RtcSignalingState::Stable {
-        tracing::debug!(
-            "Skipping ICE restart for {}: signaling state no longer stable",
-            remote_id.0
-        );
-        return;
-    }
-
-    let options = RtcOfferOptions::new();
-    options.set_ice_restart(true);
-    let offer = match JsFuture::from(pc.create_offer_with_rtc_offer_options(&options)).await {
-        Ok(offer) => offer,
-        Err(err) => {
-            tracing::warn!(
-                "ICE restart createOffer failed for {}: {:?}",
-                remote_id.0,
-                err
-            );
-            return;
+    let (drained, reason) = if dc.buffered_amount() <= dc.buffered_amount_low_threshold() {
+        (true, "already low")
+    } else {
+        let timeout = gloo_timers::future::TimeoutFuture::new(timeout_ms);
+        match futures::future::select(rx, timeout).await {
+            futures::future::Either::Left((Ok(()), _)) => (true, "low event"),
+            futures::future::Either::Left((Err(_), _)) => (false, "peer closed"),
+            futures::future::Either::Right(_) => (false, "timer"),
         }
     };
-    let sdp = match Reflect::get(&offer, &JsValue::from_str("sdp"))
-        .ok()
-        .and_then(|v| v.as_string())
-    {
-        Some(sdp) => sdp,
-        None => {
-            tracing::warn!("ICE restart offer for {} had no SDP field", remote_id.0);
-            return;
-        }
-    };
-
-    let sdp_init = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-    sdp_init.set_sdp(&sdp);
-    if let Err(err) = JsFuture::from(pc.set_local_description(&sdp_init)).await {
-        tracing::warn!(
-            "ICE restart setLocalDescription failed for {}: {:?}",
-            remote_id.0,
-            err
-        );
-        return;
-    }
-
-    tracing::info!("Sending ICE restart offer to {}", remote_id.0);
-    send_negotiation_reliably(
-        signaler,
-        local_id,
-        remote_id,
-        room_id,
-        negotiation_delivery,
-        SignalingType::Offer,
-        sdp,
-    )
-    .await;
+    tracing::debug!(peer = %node.0, channel = %dc.label(), ?method, buffered_before = before,
+        buffered_after = dc.buffered_amount(), reason,
+        elapsed_ms = started.elapsed().as_millis(), state = ?dc.ready_state(),
+        "WebRTC: bufferedAmount wait ended");
+    drained
 }
 
 /// Best-effort recovery for a failed renegotiation on `pc`: if the failure
@@ -2330,6 +2438,9 @@ async fn rollback_to_stable_on_failure(
 }
 
 fn sdp_from_signaling_payload(payload: &str) -> String {
+    if let Ok(envelope) = serde_json::from_str::<NegotiationEnvelope>(payload) {
+        return envelope.sdp;
+    }
     js_sys::JSON::parse(payload)
         .ok()
         .and_then(|value| Reflect::get(&value, &JsValue::from_str("sdp")).ok())
@@ -2429,12 +2540,129 @@ impl Transport for WasmWebRtcTransport {
         Ok(())
     }
 
+    fn bulk_admission_budget(
+        &self,
+        node: &NodeId,
+    ) -> Option<Arc<mistlib_core::transport::send::ByteBudget>> {
+        self.peers.read().unwrap().get(node).and_then(|peer| {
+            peer.pacing
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|p| p.budget.clone())
+        })
+    }
+
+    fn send_generation(&self, node: &NodeId) -> Option<u64> {
+        self.peers
+            .read()
+            .unwrap()
+            .get(node)
+            .map(|peer| peer.generation)
+    }
+
+    async fn send_wait(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        let lane = mistlib_core::transport::send::SendClass::from_wire(&data).lane;
+        self.send_in_lane(node, data, method, lane, true).await
+    }
+
+    async fn send_in_lane(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+        lane: mistlib_core::action::SendLane,
+        written: bool,
+    ) -> mistlib_core::error::Result<()> {
+        use mistlib_core::transport::send::closed_send;
+        let priority = self.storage_transfer.read().unwrap().control_priority;
+        let (peer, limit) = self.resolve_peer_and_effective_limit(node);
+        check_message_size(data.len(), limit)?;
+        let peer = peer.ok_or_else(closed_send)?;
+        let bulk_dc = if method == DeliveryMethod::ReliableUnordered
+            && peer.unordered_capability.accepts_channel()
+        {
+            peer.unordered_channel
+                .read()
+                .unwrap()
+                .clone()
+                .filter(|dc| dc.ready_state() == web_sys::RtcDataChannelState::Open)
+        } else {
+            None
+        };
+        let method = lane_policy::physical_method(method, bulk_dc.is_some());
+        let bulk = lane_policy::use_bulk_writer(priority, &data) || bulk_dc.is_some();
+        if !bulk && !written {
+            return self.send(node, data, method).await;
+        }
+
+        if let Some(dc) = bulk_dc {
+            return mistlib_core::transport::send::with_reliable_fallback(
+                async {
+                    let _guard = peer.bulk_send_gate.lock().await;
+                    peer.write_optional_unordered(node, &dc, &data).await
+                },
+                || async {
+                    let _guard = peer.reliable_send_gate.lock().await;
+                    let reliable = peer
+                        .channels
+                        .read()
+                        .unwrap()
+                        .get(&DeliveryMethod::ReliableOrdered)
+                        .cloned()
+                        .ok_or_else(closed_send)?;
+                    peer.flush_send_queue_locked(node, &reliable).await?;
+                    peer.write_data_channel(node, &reliable, &data, DeliveryMethod::ReliableOrdered)
+                        .await
+                },
+            )
+            .await;
+        }
+
+        let _guard = if bulk {
+            peer.bulk_send_gate.lock().await
+        } else {
+            peer.reliable_send_gate.lock().await
+        };
+        let dc = peer
+            .channels
+            .read()
+            .unwrap()
+            .get(&method)
+            .cloned()
+            .ok_or_else(closed_send)?;
+        if dc.ready_state() != web_sys::RtcDataChannelState::Open {
+            return Err(closed_send());
+        }
+        // Written sends never enter the legacy enqueue-only deferred queue.
+        if lane_policy::flush_reliable_queue(method, bulk) {
+            peer.flush_send_queue_locked(node, &dc).await?;
+        }
+        let high = if bulk {
+            BUFFERED_AMOUNT_HIGH_WATERMARK - 64 * 1024
+        } else {
+            BUFFERED_AMOUNT_HIGH_WATERMARK
+        };
+        let _ = lane;
+        peer.write_data_channel_with_limit(node, &dc, &data, method, high)
+            .await
+    }
+
     async fn send(
         &self,
         node: &NodeId,
         data: Bytes,
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
+        if method == DeliveryMethod::ReliableUnordered {
+            let lane = mistlib_core::transport::send::SendClass::from_wire(&data).lane;
+            return Box::pin(self.send_in_lane(node, data, method, lane, false)).await;
+        }
         // Resolve the peer once for both the negotiated limit and the later
         // queue/channel path. The size check still runs even when this is
         // `None`, preserving the pre-lookup rejection behavior from SPEC-13.
@@ -2463,170 +2691,88 @@ impl Transport for WasmWebRtcTransport {
             Ok(SizeCheck::Ok) => {}
         }
 
-        let node_state = self.get_connection_state(node);
-        if node_state != ConnectionState::Connected {
-            // The peer may still exist and be usable in a moment (mid
-            // ICE-restart grace, or a fresh connection whose DataChannel
-            // hasn't opened yet) rather than actually gone -- defer
-            // `ReliableOrdered` sends onto the peer's own bounded queue
-            // instead of failing them outright, so a burst of sends racing
-            // an ICE restart doesn't just get dropped on the floor (see the
-            // field report this addresses: 7+3 failed "Not connected" sends
-            // around one ICE-restart recovery). Unreliable methods keep the
-            // existing fail-fast behavior -- see
-            // `send_queue::should_queue_reliable_send`'s doc comment for why.
-            if let Some(peer) = &peer {
-                if should_queue_reliable_send(method, true, node_state) {
-                    let dropped_oldest = {
-                        let mut queue = peer.send_queue.lock().unwrap_or_else(|e| e.into_inner());
-                        queue.push(data)
-                    };
-                    if dropped_oldest {
-                        tracing::warn!(
-                            "Reliable send queue for {} exceeded {} messages/{}B; dropped oldest queued message",
-                            node.0,
-                            MAX_QUEUED_MESSAGES,
-                            MAX_QUEUED_BYTES
-                        );
-                    }
-                    tracing::debug!(
-                        "Deferring reliable send to {} (state={:?}, peer mid-recovery); queued for flush on DC reopen/ICE recovery",
-                        node.0,
-                        node_state
-                    );
-                    return Ok(());
-                }
-            }
-
+        let Some(peer) = peer else {
             return Err(mistlib_core::error::MistError::Internal(
                 "Not connected".to_string(),
             ));
-        }
-
-        // A Reliable DataChannel is one shared browser send queue even when
-        // several storage/control tasks call send concurrently. Serialize the
-        // complete check -> optional drain wait -> write sequence so only one
-        // task can wait on onbufferedamountlow. Queued tasks acquire Tokio's
-        // FIFO gate one by one and observe the latest bufferedAmount.
-        let _reliable_send_guard = match (&peer, method) {
-            (Some(peer), DeliveryMethod::ReliableOrdered) => {
-                Some(peer.reliable_send_gate.lock().await)
-            }
-            _ => None,
         };
-
-        let dc_opt = peer.as_ref().and_then(|peer| {
-            let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
-            channels
-                .get(&method)
-                .cloned()
-                .or_else(|| {
-                    if method == DeliveryMethod::UnreliableOrdered {
-                        channels.get(&DeliveryMethod::Unreliable).cloned()
-                    } else {
-                        None
-                    }
-                })
-                .map(|dc| (dc, peer.buffered_amount_waiters.clone()))
-        });
-
-        if let Some((dc, buffered_amount_waiters)) = dc_opt {
-            let ready_state = dc.ready_state();
-            if ready_state == web_sys::RtcDataChannelState::Open {
-                loop {
-                    match backpressure_action(
-                        dc.buffered_amount(),
-                        BUFFERED_AMOUNT_HIGH_WATERMARK,
-                        method,
-                    ) {
-                        BackpressureAction::SendNow => break,
-                        BackpressureAction::WaitThenSend => {
-                            tracing::warn!(
-                                "DataChannel to {} congested (bufferedAmount over {}B); waiting for drain",
-                                node.0,
-                                BUFFERED_AMOUNT_HIGH_WATERMARK
-                            );
-                            // Only ReliableOrdered waits here. The send gate
-                            // ensures this is the channel's sole event waiter.
-                            if !wait_for_buffered_amount_low(&buffered_amount_waiters, &dc, method)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "DataChannel to {} still congested after {}ms; dropping reliable message",
-                                    node.0,
-                                    BUFFERED_AMOUNT_WAIT_TIMEOUT_MS
-                                );
-                                return Err(mistlib_core::error::MistError::Internal(
-                                    "Backpressure: bufferedAmount drain timed out".to_string(),
-                                ));
-                            }
-
-                            // A low event is an edge notification, not a send
-                            // permit. Re-check state and bufferedAmount before
-                            // writing; the gate prevents sibling refills.
-                            if dc.ready_state() != web_sys::RtcDataChannelState::Open {
-                                return Err(mistlib_core::error::MistError::Internal(
-                                    "DataChannel closed while waiting for backpressure drain"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                        BackpressureAction::Drop => {
-                            tracing::warn!(
-                                "Dropping {:?} message to {} (bufferedAmount over {}B)",
-                                method,
-                                node.0,
-                                BUFFERED_AMOUNT_HIGH_WATERMARK
-                            );
-                            return Err(mistlib_core::error::MistError::Internal(
-                                "Backpressure: dropped unreliable message under congestion"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-
-                dc.send_with_u8_array(&data).map_err(|e| {
-                    tracing::error!("DataChannel send failed for {}: {:?}", node.0, e);
-                    mistlib_core::error::MistError::Internal(format!("{:?}", e))
-                })?;
-                STATS.add_send(data.len() as u64);
-                STATS.add_world_send_frame(&data);
-                return Ok(());
-            } else {
-                if ready_state == web_sys::RtcDataChannelState::Closed
-                    || ready_state == web_sys::RtcDataChannelState::Closing
-                {
-                    let mut states = self
-                        .connection_states
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner());
-                    states.insert(node.clone(), ConnectionState::Connecting);
-                }
-                tracing::warn!(
-                    "DataChannel for {} is not Open (state={:?})",
-                    node.0,
-                    ready_state
-                );
-            }
+        // Serialize the decision as well as writes/flushes. Event-driven
+        // flushes take this same FIFO gate, so a new frame cannot overtake
+        // an older deferred frame, even while that flush waits for drain.
+        let _reliable_send_guard = if method == DeliveryMethod::ReliableOrdered {
+            Some(peer.reliable_send_gate.lock().await)
         } else {
-            let has_peer = {
-                let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-                peers.contains_key(node)
-            };
-            if has_peer {
-                tracing::warn!(
-                    "No DataChannel for {:?} for node {} (transient; peer kept)",
-                    method,
-                    node.0
+            None
+        };
+        let dc = {
+            let channels = peer.channels.read().unwrap_or_else(|e| e.into_inner());
+            channels.get(&method).cloned().or_else(|| {
+                if method == DeliveryMethod::UnreliableOrdered {
+                    channels.get(&DeliveryMethod::Unreliable).cloned()
+                } else {
+                    None
+                }
+            })
+        };
+        let node_state = self.get_connection_state(node);
+        let channel_open = dc
+            .as_ref()
+            .is_some_and(|dc| dc.ready_state() == web_sys::RtcDataChannelState::Open);
+        let has_queued = method == DeliveryMethod::ReliableOrdered
+            && !peer
+                .send_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+        match send_action(method, true, node_state, channel_open, has_queued) {
+            SendAction::Defer => {
+                let dropped_oldest = peer
+                    .send_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(data);
+                if dropped_oldest {
+                    tracing::warn!(
+                        "Reliable send queue for {} exceeded {} messages/{}B; dropped oldest queued message",
+                        node.0, MAX_QUEUED_MESSAGES, MAX_QUEUED_BYTES
+                    );
+                }
+                tracing::debug!(
+                    "Deferring reliable send to {} (state={:?}, channel not open)",
+                    node.0,
+                    node_state
                 );
-            } else if node_state != ConnectionState::Disconnected {
-                tracing::warn!("No Peer for node {}", node.0);
+                Ok(())
+            }
+            action @ (SendAction::Write | SendAction::FlushThenWrite) => {
+                let dc = dc.ok_or_else(|| {
+                    mistlib_core::error::MistError::Internal("Not connected".to_string())
+                })?;
+                if action == SendAction::FlushThenWrite {
+                    peer.flush_send_queue_locked(node, &dc).await?;
+                }
+                peer.write_data_channel(node, &dc, &data, method).await
+            }
+            SendAction::Fail => {
+                if node_state == ConnectionState::Connected
+                    && dc.as_ref().is_some_and(|dc| {
+                        matches!(
+                            dc.ready_state(),
+                            web_sys::RtcDataChannelState::Closed
+                                | web_sys::RtcDataChannelState::Closing
+                        )
+                    })
+                {
+                    self.connection_states
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(node.clone(), ConnectionState::Connecting);
+                }
+                Err(mistlib_core::error::MistError::Internal(
+                    "Not connected".to_string(),
+                ))
             }
         }
-        Err(mistlib_core::error::MistError::Internal(
-            "Not connected".to_string(),
-        ))
     }
 
     fn message_size_limit(&self, node: &NodeId) -> Option<u32> {
@@ -2715,6 +2861,7 @@ impl Transport for WasmWebRtcTransport {
             .create_pc(node.clone())
             .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
 
+        peer.unordered_capability.set_initial_offerer();
         let dc_init = RtcDataChannelInit::new();
         dc_init.set_ordered(true);
         let reliable = peer
@@ -2816,6 +2963,12 @@ impl Transport for WasmWebRtcTransport {
             peers.insert(node.clone(), peer.clone())
         };
         if let Some(old_peer) = old_peer {
+            let room = self
+                .room_id
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            crate::app::reset_storage_senders(&room, node);
             old_peer.close_all(node);
         }
 
@@ -2855,6 +3008,17 @@ impl Transport for WasmWebRtcTransport {
     }
 
     fn get_connected_nodes(&self) -> Vec<NodeId> {
+        // Diagnose re-entry before wasm's no_threads RwLock aborts. Keep the
+        // normal read below in every build: never silently skip notifications.
+        #[cfg(debug_assertions)]
+        if matches!(
+            self.connection_states.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            tracing::error!(
+                "get_connected_nodes re-entered while connection_states is write-locked"
+            );
+        }
         let states = self
             .connection_states
             .read()
@@ -3037,6 +3201,12 @@ impl SignalingHandler for WasmWebRtcTransport {
                         .applied_answer_sdp
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(sdp);
+                    peer.unordered_capability.accept_remote(
+                        serde_json::from_str::<NegotiationEnvelope>(&answer_payload)
+                            .ok()
+                            .and_then(|e| e.reliable_unordered),
+                    );
+                    self.open_reliable_unordered(&data.sender_id, &peer);
                     answer_applied = true;
                     self.apply_pending_candidates(&data.sender_id, &peer);
                     self.spawn_connectivity_watchdog_if_needed(&data.sender_id, &peer);

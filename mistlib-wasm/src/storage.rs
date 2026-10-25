@@ -10,7 +10,7 @@ use std::sync::Arc;
 use js_sys::Uint8Array;
 use mistlib_core::config::StorageConfig;
 use mistlib_core::layers::l2::L2Storage;
-use mistlib_core::storage::protocol::{build_have_payload, chunk_size_for_limit, have_chunk_count};
+use mistlib_core::storage::protocol::{chunk_size_for_limit, have_chunk_count};
 use mistlib_core::storage::{P2PStorage, SpatialPolicy};
 use mistlib_core::types::Vector3;
 use wasm_bindgen::prelude::*;
@@ -20,8 +20,6 @@ use meta::WasmMetaStore;
 use opfs::WasmBlockStore;
 use position::WasmSelfPositions;
 use resolver::{WantRegistry, WasmPeerResolver};
-
-const DEFAULT_PEER_TIMEOUT_MS: u32 = 5_000;
 
 type StorageInstance = P2PStorage<WasmBlockStore, WasmPeerResolver>;
 
@@ -40,14 +38,15 @@ pub fn init_storage(config: &StorageConfig) {
     let capacity = config.max_capacity_mb * 1024 * 1024;
 
     let registry = WANT_REGISTRY.with(|r| r.clone());
-    let resolver = WasmPeerResolver::new(registry, DEFAULT_PEER_TIMEOUT_MS);
+    let resolver = WasmPeerResolver::new(registry);
 
-    let storage = P2PStorage::new(
+    let storage = P2PStorage::new_with_transfer(
         WasmBlockStore,
         resolver,
         capacity,
         Some(Arc::new(WasmSelfPositions)),
         SpatialPolicy::from(config),
+        config.transfer.clone(),
     )
     .with_meta_store(Arc::new(WasmMetaStore));
 
@@ -99,93 +98,130 @@ fn start_decay_sweep(config: &StorageConfig) {
 /// process-wide (rule 10), but the reply must go back through that specific
 /// session's transport, which is the only one guaranteed to have a route to
 /// `from`.
+type WantJob = (
+    Arc<mistlib_core::engine::RunningContext>,
+    String,
+    mistlib_core::types::NodeId,
+    String,
+);
+type WantKey = (usize, mistlib_core::types::NodeId);
+thread_local! {
+    static SERVING: RefCell<mistlib_core::storage::responder::WantQueue<WantKey, WantJob>> = RefCell::new(Default::default());
+}
+
 pub fn handle_want(room_id: String, from: mistlib_core::types::NodeId, cid: String) {
-    spawn_local(async move {
-        use mistlib_core::types::DeliveryMethod;
-
-        let data_opt = STORAGE.with(|s| s.borrow().is_some());
-
-        if !data_opt {
-            return;
+    use mistlib_core::storage::responder::WantAdmission;
+    let Some(ctx) = crate::app::session_running_ctx(&room_id) else {
+        return;
+    };
+    let limited = ctx
+        .overlay
+        .as_ref()
+        .is_some_and(|router| mistlib_core::transport::send::pipeline_enabled(&router.transfer));
+    let key = (Arc::as_ptr(&ctx) as usize, from.clone());
+    let job = (ctx, room_id, from, cid);
+    let first = if limited {
+        SERVING.with(|q| q.borrow_mut().enqueue(key.clone(), job))
+    } else {
+        WantAdmission::Start(job)
+    };
+    let WantAdmission::Start(mut job) = first else {
+        if matches!(first, WantAdmission::Dropped) {
+            tracing::debug!(peer = %key.1, "Storage: dropping WANT: 64 pending descriptors");
         }
-
-        let block = {
-            let store = WasmBlockStore;
-            mistlib_core::storage::BlockStore::load_block(&store, &cid)
-                .await
-                .ok()
-                .flatten()
-        };
-
-        if let Some(data) = block {
-            let ctx = crate::app::session_running_ctx(&room_id);
-
-            if let Some(ctx) = ctx {
-                let limit = ctx.preferred_transport().message_size_limit(&from);
-                let chunk_size = chunk_size_for_limit(&cid, limit);
-                let Some(total_chunks) = have_chunk_count(data.len(), chunk_size) else {
-                    tracing::warn!(
-                        "Storage: refusing to serve oversized block {} ({} bytes, {} chunks)",
-                        cid,
-                        data.len(),
-                        data.len().div_ceil(chunk_size)
-                    );
-                    return;
-                };
-
-                if total_chunks <= 1 {
-                    let msg = build_have_payload(&cid, &data, 0, total_chunks, chunk_size);
-                    let _ = ctx
-                        .transport
-                        .send(
-                            &from,
-                            bytes::Bytes::from(msg),
-                            DeliveryMethod::ReliableOrdered,
-                        )
-                        .await;
-                } else {
-                    for chunk_index in 0..total_chunks {
-                        let msg =
-                            build_have_payload(&cid, &data, chunk_index, total_chunks, chunk_size);
-
-                        let _ = ctx
-                            .transport
-                            .send(
-                                &from,
-                                bytes::Bytes::from(msg),
-                                DeliveryMethod::ReliableOrdered,
-                            )
-                            .await;
-
-                        if chunk_index % 8 == 0 {
-                            gloo_timers::future::TimeoutFuture::new(0).await;
-                        }
-                    }
-                }
-
-                tracing::debug!(
-                    "Storage: served `have` for {} to {} ({} bytes, {} chunks)",
-                    cid,
-                    from.0,
-                    data.len(),
-                    total_chunks.max(1)
-                );
+        return;
+    };
+    spawn_local(async move {
+        loop {
+            serve_want(job.0, job.1, job.2, job.3).await;
+            let next = if limited {
+                SERVING.with(|q| q.borrow_mut().next(&key))
+            } else {
+                None
+            };
+            match next {
+                Some(next) => job = next,
+                None => break,
             }
         }
     });
 }
 
+async fn serve_want(
+    ctx: Arc<mistlib_core::engine::RunningContext>,
+    room_id: String,
+    from: mistlib_core::types::NodeId,
+    cid: String,
+) {
+    tracing::debug!(%cid, peer = %from.0, room = %room_id, "Storage: WANT received");
+
+    let data_opt = STORAGE.with(|s| s.borrow().is_some());
+
+    if !data_opt {
+        tracing::debug!(%cid, room = %room_id, "Storage: WANT response ended: storage unavailable");
+        return;
+    }
+
+    let block = {
+        let store = WasmBlockStore;
+        let loaded = mistlib_core::storage::BlockStore::load_block(&store, &cid).await;
+        tracing::debug!(%cid, peer = %from.0, room = %room_id, found = loaded.as_ref().is_ok_and(|block| block.is_some()), error = ?loaded.as_ref().err(), "Storage: WANT load result");
+        loaded.ok().flatten()
+    };
+
+    if let Some(data) = block {
+        {
+            let limit = ctx.preferred_transport().message_size_limit(&from);
+            let chunk_size = chunk_size_for_limit(&cid, limit);
+            let Some(total_chunks) = have_chunk_count(data.len(), chunk_size) else {
+                tracing::warn!(
+                    "Storage: refusing to serve oversized block {} ({} bytes, {} chunks)",
+                    cid,
+                    data.len(),
+                    data.len().div_ceil(chunk_size)
+                );
+                return;
+            };
+
+            tracing::debug!(%cid, peer = %from.0, room = %room_id, bytes = data.len(), chunk_size, total_chunks, "Storage: WANT response layout");
+            if let Err(error) = mistlib_core::storage::responder::send_block(
+                ctx.transport.as_ref(),
+                &from,
+                &cid,
+                &data,
+                chunk_size,
+                total_chunks,
+                |_| Box::pin(async {}),
+            )
+            .await
+            {
+                tracing::debug!(%cid, peer = %from, %error, "Storage: WANT response stopped after send failure");
+                return;
+            }
+
+            tracing::debug!(
+                "Storage: WANT response ended for {} to {} ({} bytes, {} chunks queued)",
+                cid,
+                from.0,
+                data.len(),
+                total_chunks.max(1)
+            );
+        }
+    } else {
+        tracing::debug!(%cid, room = %room_id, "Storage: WANT response ended: block unavailable");
+    }
+}
+
 pub fn handle_query(room_id: String, from: mistlib_core::types::NodeId, cid: String) {
+    tracing::debug!(%cid, peer = %from.0, room = %room_id, "Storage: QUERY received");
     spawn_local(async move {
         use mistlib_core::types::DeliveryMethod;
 
         let block_exists = {
             let store = WasmBlockStore;
-            mistlib_core::storage::BlockStore::load_block(&store, &cid)
-                .await
-                .ok()
-                .flatten()
-                .is_some()
+            let loaded = mistlib_core::storage::BlockStore::load_block(&store, &cid).await;
+            tracing::debug!(%cid, peer = %from.0, room = %room_id, found = loaded.as_ref().is_ok_and(|block| block.is_some()), error = ?loaded.as_ref().err(), "Storage: QUERY load result");
+            loaded.ok().flatten().is_some()
         };
 
         if block_exists {
@@ -193,7 +229,7 @@ pub fn handle_query(room_id: String, from: mistlib_core::types::NodeId, cid: Str
             let ctx = crate::app::session_running_ctx(&room_id);
 
             if let Some(ctx) = ctx {
-                let _ = ctx
+                let result = ctx
                     .transport
                     .send(
                         &from,
@@ -201,7 +237,12 @@ pub fn handle_query(room_id: String, from: mistlib_core::types::NodeId, cid: Str
                         DeliveryMethod::ReliableOrdered,
                     )
                     .await;
+                tracing::debug!(%cid, peer = %from.0, room = %room_id, ?result, "Storage: QUERY response ended");
+            } else {
+                tracing::debug!(%cid, room = %room_id, "Storage: QUERY response ended: session unavailable");
             }
+        } else {
+            tracing::debug!(%cid, room = %room_id, "Storage: QUERY response ended: block unavailable");
         }
     });
 }
@@ -348,11 +389,13 @@ pub async fn storage_add_pinned(name: String, data: &[u8]) -> Result<String, JsV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mistlib_core::storage::protocol::build_have_payload;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[wasm_bindgen_test]
     fn one_mib_have_payload_is_split_into_datachannel_safe_chunks() {
         let data = vec![7u8; 1024 * 1024];
+        let expected_cid = mistlib_core::storage::compute_cid(&data, 0x55);
         let total =
             have_chunk_count(data.len(), resolver::HAVE_CHUNK_SIZE).expect("1MiB block should fit");
 
@@ -365,7 +408,7 @@ mod tests {
         let mut reassembled = Vec::with_capacity(data.len());
         for chunk_index in 0..total {
             let msg = build_have_payload(
-                "cid-large",
+                &expected_cid,
                 &data,
                 chunk_index,
                 total,
@@ -375,7 +418,7 @@ mod tests {
 
             let (cid, parsed_index, parsed_total, payload) =
                 resolver::parse_have_chunk_message(&msg).expect("chunk HAVE should parse");
-            assert_eq!(cid, "cid-large");
+            assert_eq!(cid, expected_cid);
             assert_eq!(parsed_index, chunk_index);
             assert_eq!(parsed_total, total);
             assert!(payload.len() <= resolver::HAVE_CHUNK_SIZE);

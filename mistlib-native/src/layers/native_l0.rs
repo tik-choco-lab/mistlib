@@ -1,4 +1,4 @@
-mod init;
+pub(crate) mod init;
 mod room;
 mod storage;
 

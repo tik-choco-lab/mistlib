@@ -4,6 +4,7 @@ use mistlib_core::types::NodeId;
 pub const DELIVERY_RELIABLE: u32 = crate::app::DELIVERY_RELIABLE;
 pub const DELIVERY_UNRELIABLE_ORDERED: u32 = crate::app::DELIVERY_UNRELIABLE_ORDERED;
 pub const DELIVERY_UNRELIABLE: u32 = crate::app::DELIVERY_UNRELIABLE;
+pub const DELIVERY_RELIABLE_UNORDERED: u32 = crate::app::DELIVERY_RELIABLE_UNORDERED;
 
 unsafe fn copy_build_string(value: &str, buffer: *mut u8, buffer_len: usize) -> u32 {
     let bytes = value.as_bytes();
@@ -458,5 +459,34 @@ mod tests {
         assert_eq!(call(b"nope".as_ptr(), 4), 1);
         // a null audience (everyone) on a room that isn't joined fails too
         assert_eq!(call(std::ptr::null(), 0), 1);
+    }
+}
+
+#[cfg(test)]
+mod delivery_mapping_tests {
+    use super::*;
+    #[test]
+    fn ffi_delivery_codes_preserve_legacy_and_add_reliable_unordered() {
+        use mistlib_core::types::DeliveryMethod;
+        for (code, method) in [
+            (DELIVERY_RELIABLE, DeliveryMethod::ReliableOrdered),
+            (
+                DELIVERY_UNRELIABLE_ORDERED,
+                DeliveryMethod::UnreliableOrdered,
+            ),
+            (DELIVERY_UNRELIABLE, DeliveryMethod::Unreliable),
+            (
+                DELIVERY_RELIABLE_UNORDERED,
+                DeliveryMethod::ReliableUnordered,
+            ),
+        ] {
+            assert_eq!(DeliveryMethod::from_u32(code), method);
+            assert_eq!(method as u32, code);
+        }
+        assert_eq!(DELIVERY_RELIABLE_UNORDERED, 3);
+        assert_eq!(
+            DeliveryMethod::from_u32(u32::MAX),
+            DeliveryMethod::Unreliable
+        );
     }
 }

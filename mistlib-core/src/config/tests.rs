@@ -178,3 +178,75 @@ fn default_ice_servers_are_usable_stun_only() {
         );
     }
 }
+
+#[test]
+fn storage_transfer_defaults_are_cp50_in_rust_flat_and_full_json() {
+    let expected = super::StorageTransferConfig {
+        unsequenced_bulk: true,
+        control_priority: true,
+        bulk_channel: true,
+        bulk_target_delay_ms: 50,
+        bulk_queue_bytes: 1024 * 1024,
+        get_concurrency: 4,
+        max_fetches_per_provider: 0,
+        coalesce_fetches: false,
+        native_sctp_receive_buffer_bytes: 0,
+    };
+    assert_eq!(super::StorageTransferConfig::default(), expected);
+    assert_eq!(
+        serde_json::from_str::<super::StorageTransferConfig>("{}").unwrap(),
+        expected
+    );
+    for json in ["{}", r#"{"aoiRange":20}"#, r#"{"storageTransfer":{}}"#] {
+        let mut config = Config::default();
+        config.update_from_json(json).unwrap();
+        assert_eq!(config.storage.transfer, expected);
+    }
+    let mut full = serde_json::to_value(Config::default()).unwrap();
+    full["storage"].as_object_mut().unwrap().remove("transfer");
+    let mut config = Config::default();
+    config.update_from_json(&full.to_string()).unwrap();
+    assert_eq!(config.storage.transfer, expected);
+}
+
+#[test]
+fn storage_transfer_explicit_false_and_zero_override_cp50() {
+    for key in [
+        "unsequencedBulk",
+        "controlPriority",
+        "bulkChannel",
+        "bulkTargetDelayMs",
+    ] {
+        let mut expected = serde_json::to_value(super::StorageTransferConfig::default()).unwrap();
+        let disabled = if key == "bulkTargetDelayMs" {
+            serde_json::json!(0)
+        } else {
+            serde_json::json!(false)
+        };
+        expected[key] = disabled.clone();
+        let mut transfer = serde_json::json!({});
+        transfer[key] = disabled;
+        let flat = serde_json::json!({"storageTransfer": transfer});
+        let mut full = serde_json::to_value(Config::default()).unwrap();
+        full["storage"]["transfer"] = transfer;
+        for json in [flat, full] {
+            let mut config = Config::default();
+            config.update_from_json(&json.to_string()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&config.storage.transfer).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_legacy_storage_transfer_disables_pipeline() {
+    let transfer: super::StorageTransferConfig = serde_json::from_str(
+        r#"{"unsequencedBulk":false,"controlPriority":false,"bulkChannel":false,"bulkTargetDelayMs":0}"#,
+    ).unwrap();
+    assert!(!crate::transport::send::pipeline_enabled(&transfer));
+    assert!(crate::transport::send::pipeline_enabled(
+        &super::StorageTransferConfig::default()
+    ));
+}

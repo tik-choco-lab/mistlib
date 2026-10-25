@@ -4,4 +4,8 @@ members = [
     "mistlib-native",
     "mistlib-wasm",
 ]
+exclude = ["third_party/webrtc-sctp"]
 resolver = "2"
+
+[patch.crates-io]
+webrtc-sctp = { path = "third_party/webrtc-sctp" }

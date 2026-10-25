@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use mistlib_core::action::{OverlayAction, SendLane};
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingData, SignalingType};
+use mistlib_core::transport::send::{
+    closed_send, pipeline_enabled, shrink_permit, ByteBudget, SendClass, SendReservation,
+};
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
@@ -336,13 +340,10 @@ const CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS: u64 = 4_000;
 /// occupied (see `backoff::tests::connect_request_default_schedule_totals_within_the_intended_ballpark`),
 /// while sending far less often at the start of a cluster disconnect.
 const DEFAULT_CONNECT_REQUEST_RETRIES: u32 = 10;
-/// Default for the `disconnected_grace_ms` instance field (how long a peer
-/// stays in `Reconnecting` -- e.g. mid ICE-restart -- before the sweeper
-/// reaps it) -- overridable via `MIST_WEBRTC_DISCONNECTED_GRACE_MS`, read
-/// once at construction (see `WebRtcTransport::new`). The architecture notes
-/// documents `REORDER_GAP_TIMEOUT` (8s) as chosen to outlive *this default*
-/// (5s) -- an env override changes a single process's own grace window, not
-/// the documented default relationship.
+/// Default maximum inbound silence during reconnect grace before reaping.
+/// Overridable via `MIST_WEBRTC_DISCONNECTED_GRACE_MS`, read once at
+/// construction (see `WebRtcTransport::new`). Traffic can extend grace beyond
+/// this window; failed/closed peer connections are still reaped immediately.
 #[cfg(test)]
 pub(crate) const DISCONNECTED_GRACE_MS: u64 = 50;
 #[cfg(not(test))]
@@ -654,6 +655,8 @@ pub struct DisconnectGrace {
 pub(crate) mod backoff;
 pub(crate) mod conn_timing;
 pub mod connection;
+mod disconnect_grace;
+mod pacing;
 pub mod peer;
 pub mod publish;
 pub mod signaling;
@@ -791,7 +794,14 @@ fn register_h264_opus_codecs(engine: &mut MediaEngine) -> webrtc::error::Result<
 pub(crate) static GLOBAL_MEDIA_TX: Mutex<Option<mpsc::UnboundedSender<MediaTrackEvent>>> =
     Mutex::new(None);
 
+type BulkBudgetGeneration = (mpsc::WeakSender<peer::QueuedSend>, Arc<ByteBudget>);
+type BulkBudgets = Mutex<HashMap<NodeId, Vec<BulkBudgetGeneration>>>;
+
 pub struct WebRtcTransport {
+    storage_transfer: StdRwLock<mistlib_core::config::StorageTransferConfig>,
+    bulk_budgets: BulkBudgets,
+    queue_telemetry: Mutex<HashMap<NodeId, Arc<mistlib_core::transport::send::QueueTelemetry>>>,
+    retained_send_tails: Mutex<HashMap<NodeId, tokio::sync::oneshot::Receiver<()>>>,
     pub signaler: Arc<dyn Signaler>,
     pub local_node_id: NodeId,
     pub api: API,
@@ -817,8 +827,6 @@ pub struct WebRtcTransport {
     /// drains into nothing -- the same "queue full / stuck disconnected"
     /// outcome an actually-gone peer already produces today.
     pub(crate) send_queues: Arc<StdRwLock<HashMap<NodeId, mpsc::Sender<peer::QueuedSend>>>>,
-    // Serialize lazy frame stamping and enqueueing after capacity has been reserved.
-    send_wait_admission: Mutex<()>,
     pub event_handler: Mutex<Option<Arc<dyn NetworkEventHandler>>>,
     /// Sender for remote media track (audio/video) arrival events. `None` by
     /// default (data-channel-only mode); set via `set_media_track_handler`
@@ -846,8 +854,8 @@ pub struct WebRtcTransport {
     /// the `last_disconnect_at` map's TTL by the periodic sweeper. Read once
     /// at construction; see `env_override_u64_ms`.
     pub(crate) reconnect_cooldown_ms: u64,
-    /// How long a peer stays in `Reconnecting` (e.g. mid ICE-restart) before
-    /// the sweeper reaps it (default [`DISCONNECTED_GRACE_MS`], overridable
+    /// Maximum inbound silence during reconnect grace before the sweeper
+    /// reaps a peer (default [`DISCONNECTED_GRACE_MS`], overridable
     /// via `MIST_WEBRTC_DISCONNECTED_GRACE_MS`). Read once at construction;
     /// see `env_override_u64_ms`.
     pub(crate) disconnected_grace_ms: u64,
@@ -991,6 +999,10 @@ pub struct WebRtcTransport {
 /// Per-peer map of published-track RTP senders, keyed by peer then track id.
 pub(crate) type PublishedSenders = HashMap<NodeId, HashMap<String, Arc<RTCRtpSender>>>;
 
+/// One synchronous hand-off through an already reserved peer queue permit.
+type SendCommit<'a> =
+    Box<dyn FnOnce(Bytes, DeliveryMethod) -> mistlib_core::error::Result<()> + 'a>;
+
 impl WebRtcTransport {
     pub fn new(signaler: Arc<dyn Signaler>, local_node_id: NodeId) -> Self {
         let mut m = MediaEngine::default();
@@ -1098,12 +1110,15 @@ impl WebRtcTransport {
             env_override_u64_ms("MIST_WEBRTC_CONNECTION_TIMEOUT_MS", CONNECTION_TIMEOUT_MS);
 
         Self {
+            storage_transfer: StdRwLock::new(Default::default()),
+            bulk_budgets: Mutex::new(HashMap::new()),
+            queue_telemetry: Mutex::new(HashMap::new()),
+            retained_send_tails: Mutex::new(HashMap::new()),
             signaler,
             local_node_id,
             api,
             peers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             send_queues: Arc::new(StdRwLock::new(HashMap::new())),
-            send_wait_admission: Mutex::new(()),
             event_handler: Mutex::new(None),
             media_tx: Mutex::new(GLOBAL_MEDIA_TX.lock().unwrap().clone()),
             connection_states: Arc::new(StdRwLock::new(HashMap::new())),
@@ -1290,6 +1305,8 @@ impl WebRtcTransport {
         };
         self.send_queues.write().unwrap().clear();
 
+        let room = self.room_id.read().unwrap().clone();
+        crate::events::reset_storage_room(&room);
         for (node, peer) in peers {
             tracing::warn!("[WebRTC Close] reason=room_close_all node={}", node);
             peer.close_all().await;
@@ -1311,21 +1328,238 @@ impl WebRtcTransport {
         self.disconnected_since.write().unwrap().clear();
     }
 
-    /// Pushes `data` onto a peer's ordered send queue (`Peer::send_tx`,
-    /// drained by `Peer::spawn_send_queue`). Takes the queue sender directly
-    /// -- rather than a `&Peer` -- so both producers can hand it whatever
-    /// they resolved: the async `Transport::send` (an awaited read of
-    /// `self.peers`) and `try_enqueue_send` (a blocking read of
-    /// `self.send_queues`; see its doc comment) ultimately just need to push
-    /// onto the same single-writer-per-peer queue.
+    pub fn set_storage_transfer(&self, transfer: mistlib_core::config::StorageTransferConfig) {
+        // The application config is process-wide across rooms. The pinned
+        // webrtc-rs API hardcodes a zero association receive buffer; the
+        // vendor hook supplies that default without changing explicit values.
+        sctp::association::set_default_receive_buffer_size(
+            transfer.native_sctp_receive_buffer_bytes,
+        );
+        *self.storage_transfer.write().unwrap() = transfer;
+    }
+
+    fn queue_telemetry(&self, node: &NodeId) -> Arc<mistlib_core::transport::send::QueueTelemetry> {
+        let mut peers = self.queue_telemetry.lock().unwrap();
+        if let Some(telemetry) = peers.get(node) {
+            return telemetry.clone();
+        }
+        let telemetry = Arc::new(mistlib_core::transport::send::QueueTelemetry::default());
+        peers.insert(node.clone(), telemetry.clone());
+        telemetry
+    }
+
+    fn bulk_budget(
+        &self,
+        node: &NodeId,
+        tx: &mpsc::Sender<peer::QueuedSend>,
+    ) -> Option<Arc<ByteBudget>> {
+        let transfer = self.storage_transfer.read().unwrap();
+        if !pipeline_enabled(&transfer) {
+            return None;
+        }
+        let mut budgets = self.bulk_budgets.lock().unwrap();
+        budgets.retain(|_, generations| {
+            generations.retain(|(sender, budget)| {
+                let live = sender.upgrade().is_some_and(|tx| !tx.is_closed());
+                if !live {
+                    budget.close();
+                }
+                live
+            });
+            !generations.is_empty()
+        });
+        let generations = budgets.entry(node.clone()).or_default();
+        if let Some((_, budget)) = generations
+            .iter()
+            .find(|(sender, _)| sender.upgrade().is_some_and(|old| old.same_channel(tx)))
+        {
+            return Some(budget.clone());
+        }
+        let budget = Arc::new(ByteBudget::new(transfer.bulk_queue_bytes));
+        generations.push((tx.downgrade(), budget.clone()));
+        Some(budget)
+    }
+
+    pub(crate) async fn reserve_overlay_send(
+        &self,
+        node: &NodeId,
+        bytes: usize,
+        lane: SendLane,
+    ) -> mistlib_core::error::Result<SendReservation> {
+        let tx = self
+            .send_queues
+            .read()
+            .unwrap()
+            .get(node)
+            .cloned()
+            .ok_or_else(|| mistlib_core::error::MistError::RouteNotFound(node.clone()))?;
+        let budget = (lane == SendLane::Bulk)
+            .then(|| self.bulk_budget(node, &tx))
+            .flatten();
+        let mut permit = if let Some(budget) = budget {
+            Some(tokio::select! {
+                _ = tx.closed() => return Err(closed_send()),
+                permit = budget.reserve(bytes) => permit?,
+            })
+        } else {
+            None
+        };
+        let slot = tx.reserve_owned().await.map_err(|_| closed_send())?;
+        let telemetry = self.queue_telemetry(node);
+        let node = node.clone();
+        let limit = self.max_message_bytes.load(Ordering::Relaxed);
+        Ok(Box::new(move |action| {
+            let OverlayAction::SendMessage {
+                to, data, method, ..
+            } = action
+            else {
+                return Err(closed_send());
+            };
+            if to != node {
+                return Err(closed_send());
+            }
+            if data.len() > limit as usize {
+                return Err(mistlib_core::error::MistError::MessageTooLarge {
+                    size: data.len(),
+                    limit,
+                });
+            }
+            shrink_permit(&mut permit, data.len());
+            let (completion, receipt) = tokio::sync::oneshot::channel();
+            slot.send(peer::QueuedSend {
+                _telemetry: telemetry.charge(data.len(), lane),
+                data,
+                method,
+                completion: Some(completion),
+                _bulk_permit: permit,
+            });
+            Ok(receipt)
+        }))
+    }
+
+    /// Received frames already belong to the reliable stream. Await both byte
+    /// and queue capacity, retaining this PC's sender across suspension.
+    pub(crate) async fn enqueue_received_send(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        self.check_message_size(data.len())?;
+        let tx = self
+            .send_queues
+            .read()
+            .unwrap()
+            .get(node)
+            .cloned()
+            .ok_or_else(closed_send)?;
+        let budget = self.bulk_budget(node, &tx);
+        let telemetry = self.queue_telemetry(node);
+        Self::enqueue_received_on(tx, budget, telemetry, data, method).await
+    }
+
+    /// Synchronous action callbacks cannot backpressure their caller. Chain
+    /// admissions in call order and pin the sender to the current PC instead.
+    pub(crate) fn retain_received_send(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::transport::send::SendFuture<'static, mistlib_core::error::Result<()>> {
+        if let Err(err) = self.check_message_size(data.len()) {
+            return Box::pin(async move { Err(err) });
+        }
+        if node.is_broadcast() {
+            let sends: Vec<_> = self
+                .get_connected_nodes()
+                .iter()
+                .map(|target| self.retain_received_send(target, data.clone(), method))
+                .collect();
+            return Box::pin(async move {
+                futures_util::future::join_all(sends)
+                    .await
+                    .into_iter()
+                    .collect::<mistlib_core::error::Result<Vec<_>>>()
+                    .map(|_| ())
+            });
+        }
+        let tx = self.send_queues.read().unwrap().get(node).cloned();
+        let budget = tx.as_ref().and_then(|tx| self.bulk_budget(node, tx));
+        let telemetry = self.queue_telemetry(node);
+        let (done, next) = tokio::sync::oneshot::channel();
+        let previous = {
+            let mut tails = self.retained_send_tails.lock().unwrap();
+            tails.retain(|_, tail| {
+                matches!(
+                    tail.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                )
+            });
+            tails.insert(node.clone(), next)
+        };
+        Box::pin(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let result = match tx {
+                Some(tx) => Self::enqueue_received_on(tx, budget, telemetry, data, method).await,
+                None => Err(closed_send()),
+            };
+            drop(done);
+            result
+        })
+    }
+
+    async fn enqueue_received_on(
+        tx: mpsc::Sender<peer::QueuedSend>,
+        budget: Option<Arc<ByteBudget>>,
+        telemetry: Arc<mistlib_core::transport::send::QueueTelemetry>,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        let lane = SendClass::from_wire(&data).lane;
+        let budget = if lane == SendLane::Bulk {
+            match budget {
+                Some(b) => Some(tokio::select! {
+                    _ = tx.closed() => return Err(closed_send()),
+                    permit = b.reserve_received(data.len()) => permit?,
+                }),
+                None => None,
+            }
+        } else {
+            None
+        };
+        tx.send(peer::QueuedSend {
+            _telemetry: telemetry.charge(data.len(), lane),
+            data,
+            method,
+            completion: None,
+            _bulk_permit: budget,
+        })
+        .await
+        .map_err(|_| closed_send())
+    }
+
+    /// Local admission inside the router's sequence lock. Rejection here must
+    /// happen before the sequence is consumed; received frames use the waiting
+    /// admission path above.
     fn enqueue_on_peer(
+        &self,
         node: &NodeId,
         send_tx: &mpsc::Sender<peer::QueuedSend>,
         data: Bytes,
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
+        let lane = SendClass::from_wire(&data).lane;
+        let budget = if lane == SendLane::Bulk {
+            self.bulk_budget(node, send_tx)
+                .map(|b| b.try_reserve(data.len()))
+                .transpose()?
+        } else {
+            None
+        };
         send_tx
-            .try_send(peer::QueuedSend { data, method, completion: None })
+            .try_send(peer::QueuedSend { _telemetry: self.queue_telemetry(node).charge(data.len(), lane), data, method, completion: None, _bulk_permit: budget })
             .map_err(|_| {
                 mistlib_core::error::MistError::Internal(format!(
                     "Send queue full for {:?} method {:?} (peer not keeping up or stuck disconnected)",
@@ -1344,21 +1578,34 @@ impl WebRtcTransport {
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
         self.check_message_size(data.len())?;
-        self.send_wait_with(node, |validate| {
+        let lane = SendClass::from_wire(&data).lane;
+        if lane == SendLane::Bulk && pipeline_enabled(&self.storage_transfer.read().unwrap()) {
+            let reserved = self.reserve_overlay_send(node, data.len(), lane).await?;
+            let receipt = reserved(OverlayAction::SendMessage {
+                to: node.clone(),
+                data,
+                method,
+                lane,
+            })?;
+            return receipt.await.map_err(|_| closed_send())?;
+        }
+        self.send_wait_with(node, |validate, commit| {
             validate(data.len())?;
-            Ok((data, method))
+            commit(data, method)
         })
         .await
     }
 
-    /// Build the frame only after queue admission is guaranteed. In particular,
-    /// callers must not stamp reliable overlay sequences before this callback.
+    /// Reserve capacity before building. The caller must invoke `commit` inside
+    /// the router's sequence critical section; it sends through the reserved
+    /// permit synchronously, without a cancellable wait after sequence stamping.
     pub(crate) async fn send_wait_with(
         &self,
         node: &NodeId,
         build: impl FnOnce(
             &dyn Fn(usize) -> mistlib_core::error::Result<()>,
-        ) -> mistlib_core::error::Result<(Bytes, DeliveryMethod)>,
+            SendCommit<'_>,
+        ) -> mistlib_core::error::Result<()>,
     ) -> mistlib_core::error::Result<()> {
         let send_tx = self
             .send_queues
@@ -1369,20 +1616,32 @@ impl WebRtcTransport {
             .ok_or_else(|| {
                 mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
             })?;
+        let permit_sender = send_tx.clone();
         let permit = send_tx.reserve_owned().await.map_err(|_| {
             mistlib_core::error::MistError::Internal(format!("Send queue closed for {}", node))
         })?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let _admission = self.send_wait_admission.lock().unwrap();
-            let (data, method) = build(&|size| self.check_message_size(size))?;
-            // No cancellable wait may occur between sequence stamping and this send.
-            permit.send(peer::QueuedSend {
-                data,
-                method,
-                completion: Some(tx),
-            });
-        }
+        build(
+            &|size| self.check_message_size(size),
+            Box::new(move |data, method| {
+                let lane = SendClass::from_wire(&data).lane;
+                let budget = if lane == SendLane::Bulk {
+                    self.bulk_budget(node, &permit_sender)
+                        .map(|b| b.try_reserve(data.len()))
+                        .transpose()?
+                } else {
+                    None
+                };
+                permit.send(peer::QueuedSend {
+                    _telemetry: self.queue_telemetry(node).charge(data.len(), lane),
+                    data,
+                    method,
+                    completion: Some(tx),
+                    _bulk_permit: budget,
+                });
+                Ok(())
+            }),
+        )?;
         rx.await.map_err(|_| {
             mistlib_core::error::MistError::Internal(format!(
                 "Peer {} torn down before send completion",
@@ -1391,13 +1650,16 @@ impl WebRtcTransport {
         })?
     }
 
-    /// Reserve queue capacity before building and committing an overlay frame.
+    /// Reserve capacity without waiting, then let the router commit the frame
+    /// through the permit while holding its sequence lock. No separate admission
+    /// lock is needed: every sequenced app/overlay send uses that same router lock.
     pub(crate) fn try_enqueue_send_with(
         &self,
         node: &NodeId,
         build: impl FnOnce(
             &dyn Fn(usize) -> mistlib_core::error::Result<()>,
-        ) -> mistlib_core::error::Result<(Bytes, DeliveryMethod)>,
+            SendCommit<'_>,
+        ) -> mistlib_core::error::Result<()>,
     ) -> mistlib_core::error::Result<()> {
         let send_tx = self
             .send_queues
@@ -1408,34 +1670,40 @@ impl WebRtcTransport {
             .ok_or_else(|| {
                 mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
             })?;
+        let permit_sender = send_tx.clone();
         let permit = send_tx.try_reserve_owned().map_err(|_| {
             mistlib_core::error::MistError::Internal(format!(
                 "Send queue full or closed for {}",
                 node
             ))
         })?;
-        let _admission = self.send_wait_admission.lock().unwrap();
-        let (data, method) = build(&|size| self.check_message_size(size))?;
-        permit.send(peer::QueuedSend {
-            data,
-            method,
-            completion: None,
-        });
-        Ok(())
+        build(
+            &|size| self.check_message_size(size),
+            Box::new(move |data, method| {
+                let lane = SendClass::from_wire(&data).lane;
+                let budget = if lane == SendLane::Bulk {
+                    self.bulk_budget(node, &permit_sender)
+                        .map(|b| b.try_reserve(data.len()))
+                        .transpose()?
+                } else {
+                    None
+                };
+                permit.send(peer::QueuedSend {
+                    _telemetry: self.queue_telemetry(node).charge(data.len(), lane),
+                    data,
+                    method,
+                    completion: None,
+                    _bulk_permit: budget,
+                });
+                Ok(())
+            }),
+        )
     }
 
-    /// Fully synchronous version of `Transport::send` -- no `.await`
-    /// anywhere, so it can be called inline from `MistEngine::handle_action_for`
-    /// (`engine/action.rs`) without spawning a task for it. This is what
-    /// makes the fix in `Peer::spawn_send_queue` actually hold end to end:
-    /// that queue only preserves the order messages are *enqueued* in, so
-    /// the enqueue call itself must happen synchronously, in the exact order
-    /// `OverlayAction::SendMessage` actions were produced (overlay seq
-    /// numbers are stamped synchronously too, in `OverlayRouter::wrap_data`)
-    /// -- if this were spawned instead, N concurrently spawned enqueue calls
-    /// could still run in a different order than they were spawned in
-    /// (tokio's scheduler makes no such guarantee), which would silently
-    /// reintroduce the exact reordering bug this queue exists to fix.
+    /// Synchronously admit a frame to the peer's ordered queue, returning any
+    /// admission error. Sequenced callers must invoke this inside the router's
+    /// sequence critical section. Synchronous calls alone do not preserve sequence
+    /// order across threads; the queue preserves only the order of admission.
     ///
     /// Resolves the queue sender from `self.send_queues` (a blocking
     /// `std::sync::RwLock` read) instead of `.await`ing or `try_read()`-ing
@@ -1455,15 +1723,24 @@ impl WebRtcTransport {
         let send_tx = send_queues.get(node).ok_or_else(|| {
             mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
         })?;
-        Self::enqueue_on_peer(node, send_tx, data, method)
+        self.enqueue_on_peer(node, send_tx, data, method)
     }
 
-    /// Synchronous broadcast built on `try_enqueue_send` -- see its doc
-    /// comment. Best-effort per target, exactly like the async `broadcast`.
-    pub(crate) fn try_enqueue_broadcast(&self, data: Bytes, method: DeliveryMethod) {
+    /// Attempt every connected target synchronously and report the first
+    /// admission failure, so overlay callers can observe queue pressure.
+    pub(crate) fn try_enqueue_broadcast(
+        &self,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        let mut result = Ok(());
         for target in self.get_connected_nodes() {
-            let _ = self.try_enqueue_send(&target, data.clone(), method);
+            let admitted = self.try_enqueue_send(&target, data.clone(), method);
+            if result.is_ok() {
+                result = admitted;
+            }
         }
+        result
     }
 }
 
@@ -1505,17 +1782,16 @@ impl Transport for WebRtcTransport {
         data: Bytes,
         method: DeliveryMethod,
     ) -> mistlib_core::error::Result<()> {
-        self.check_message_size(data.len())?;
+        self.enqueue_received_send(node, data, method).await
+    }
 
-        let peer = {
-            let peers = self.peers.read().await;
-            peers.get(node).cloned()
-        }
-        .ok_or_else(|| {
-            mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
-        })?;
-
-        Self::enqueue_on_peer(node, &peer.send_tx, data, method)
+    async fn send_wait(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        WebRtcTransport::send_wait(self, node, data, method).await
     }
 
     fn message_size_limit(&self, _node: &NodeId) -> Option<u32> {

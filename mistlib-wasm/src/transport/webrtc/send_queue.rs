@@ -2,48 +2,53 @@ use bytes::Bytes;
 use mistlib_core::types::{ConnectionState, DeliveryMethod};
 use std::collections::VecDeque;
 
-/// Cap on how many `ReliableOrdered` sends `WasmWebRtcTransport::send` will
-/// defer for a single node while its peer exists but isn't `Connected`
-/// yet/still (see `should_queue_reliable_send` below). Past this, the oldest
-/// queued message is dropped to make room -- a peer stuck mid ICE-restart
-/// grace for a long time (or one that never recovers and is eventually torn
-/// down) shouldn't be allowed to accumulate unbounded memory.
+/// Cap on `ReliableOrdered` sends deferred for a peer whose channel is not
+/// open while Connecting/Reconnecting. Evict oldest messages past the cap so
+/// a peer that never recovers cannot accumulate unbounded memory.
 pub const MAX_QUEUED_MESSAGES: usize = 64;
 /// Byte-size companion to `MAX_QUEUED_MESSAGES`: a handful of large messages
 /// can blow the memory budget well before the message count does.
 pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
 
-/// Whether `WasmWebRtcTransport::send` should defer `data` for later
-/// delivery (via `Peer::flush_send_queue`) instead of failing it outright
-/// with "Not connected" -- decided purely from the delivery method and a
-/// peer/state snapshot, so it's host-testable via the `#[path]` trick, same
-/// as the rest of this directory's pure modules.
-///
-/// Only `ReliableOrdered` qualifies: `UnreliableOrdered`/`Unreliable` are
-/// loss-tolerant by contract (that's the whole point of calling them
-/// "unreliable"), so they keep the existing fail-fast semantics instead of
-/// queuing behind a recovery that might never come.
-///
-/// Only queues while the peer still exists (there's an actual `Peer`/
-/// `RTCPeerConnection` to eventually flush onto) and its connection state is
-/// `Connecting` (a fresh connection whose DataChannel hasn't opened yet, or
-/// -- since `recovery::state_after_ice_recovery` -- a peer mid ICE-restart
-/// grace whose DataChannel isn't open) or `Reconnecting` (ICE `Disconnected`
-/// grace, see `mark_suspect_disconnected`/the ICE `Disconnected` arm in
-/// `Peer::setup_handlers`). A peer that doesn't exist, or one whose state is
-/// `Disconnected`/`Failed`, has nothing left to recover into -- keep failing
-/// those fast, exactly as before.
-pub fn should_queue_reliable_send(
+/// Channel readiness is authoritative, even during logical reconnect grace.
+/// Unreliable methods never defer or flush the reliable queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendAction {
+    Write,
+    FlushThenWrite,
+    Defer,
+    Fail,
+}
+
+/// Pure snapshot decision; the caller holds the reliable gate while taking
+/// this snapshot and executing it, including any deferred FIFO flush.
+pub fn send_action(
     method: DeliveryMethod,
     peer_exists: bool,
     state: ConnectionState,
-) -> bool {
-    peer_exists
-        && method == DeliveryMethod::ReliableOrdered
+    channel_open: bool,
+    has_queued: bool,
+) -> SendAction {
+    if !peer_exists {
+        return SendAction::Fail;
+    }
+    if channel_open {
+        return if method == DeliveryMethod::ReliableOrdered && has_queued {
+            SendAction::FlushThenWrite
+        } else {
+            SendAction::Write
+        };
+    }
+    if method == DeliveryMethod::ReliableOrdered
         && matches!(
             state,
             ConnectionState::Connecting | ConnectionState::Reconnecting
         )
+    {
+        SendAction::Defer
+    } else {
+        SendAction::Fail
+    }
 }
 
 /// A bounded per-peer FIFO of deferred `ReliableOrdered` sends. Lives on
@@ -79,13 +84,20 @@ impl SendQueue {
         dropped_oldest
     }
 
-    /// Removes and returns every queued message, in FIFO (oldest-first)
-    /// order, for `Peer::flush_send_queue` to replay onto the now-open
-    /// channel. Leaves the queue empty either way (including when nothing
-    /// was queued).
-    pub fn drain(&mut self) -> Vec<Bytes> {
-        self.total_bytes = 0;
-        self.messages.drain(..).collect()
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Leave the head in place until its channel write succeeds. A failed
+    /// flush must preserve the older frames and prevent new sends overtaking.
+    pub fn front(&self) -> Option<&Bytes> {
+        self.messages.front()
+    }
+
+    pub fn pop_front(&mut self) -> Option<Bytes> {
+        let data = self.messages.pop_front()?;
+        self.total_bytes -= data.len();
+        Some(data)
     }
 
     /// Drops everything queued without replaying it, returning how many

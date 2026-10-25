@@ -3,64 +3,67 @@ mod send_queue;
 
 use bytes::Bytes;
 use mistlib_core::types::{ConnectionState, DeliveryMethod};
-use send_queue::{should_queue_reliable_send, SendQueue, MAX_QUEUED_BYTES, MAX_QUEUED_MESSAGES};
+use send_queue::{send_action, SendAction, SendQueue, MAX_QUEUED_BYTES, MAX_QUEUED_MESSAGES};
 
 #[test]
-fn reliable_ordered_queues_while_connecting_with_existing_peer() {
-    // Fresh connection, or a peer mid ICE-restart grace whose DataChannel
-    // isn't open yet (recovery::state_after_ice_recovery keeps it
-    // Connecting in that case).
-    assert!(should_queue_reliable_send(
-        DeliveryMethod::ReliableOrdered,
-        true,
-        ConnectionState::Connecting
-    ));
+fn reliable_send_decision_table() {
+    use ConnectionState::*;
+    use SendAction::*;
+    // peer, logical state, actual channel open, queued frames, expected action
+    let cases = [
+        (true, Reconnecting, true, false, Write),
+        (true, Reconnecting, true, true, FlushThenWrite),
+        (true, Connecting, true, false, Write),
+        (true, Connected, true, true, FlushThenWrite),
+        (true, Disconnected, true, false, Write),
+        (true, Failed, true, true, FlushThenWrite),
+        (true, Reconnecting, false, false, Defer),
+        (true, Connecting, false, true, Defer),
+        (true, Disconnected, false, true, Fail),
+        (true, Failed, false, false, Fail),
+        (true, Connected, false, false, Fail),
+        (false, Connecting, false, false, Fail),
+        (false, Reconnecting, false, true, Fail),
+        (false, Disconnected, false, false, Fail),
+    ];
+    for (peer, state, open, queued, expected) in cases {
+        assert_eq!(
+            send_action(DeliveryMethod::ReliableOrdered, peer, state, open, queued),
+            expected,
+            "peer={peer}, state={state:?}, open={open}, queued={queued}"
+        );
+    }
 }
 
 #[test]
-fn reliable_ordered_queues_while_reconnecting() {
-    assert!(should_queue_reliable_send(
-        DeliveryMethod::ReliableOrdered,
-        true,
-        ConnectionState::Reconnecting
-    ));
-}
-
-#[test]
-fn reliable_ordered_does_not_queue_without_a_peer() {
-    assert!(!should_queue_reliable_send(
-        DeliveryMethod::ReliableOrdered,
-        false,
-        ConnectionState::Connecting
-    ));
-}
-
-#[test]
-fn reliable_ordered_does_not_queue_when_disconnected_or_failed() {
-    assert!(!should_queue_reliable_send(
-        DeliveryMethod::ReliableOrdered,
-        true,
-        ConnectionState::Disconnected
-    ));
-    assert!(!should_queue_reliable_send(
-        DeliveryMethod::ReliableOrdered,
-        true,
-        ConnectionState::Failed
-    ));
-}
-
-#[test]
-fn unreliable_methods_never_queue_even_mid_recovery() {
-    assert!(!should_queue_reliable_send(
+fn unreliable_methods_never_defer_or_flush_the_reliable_queue() {
+    for method in [
         DeliveryMethod::UnreliableOrdered,
-        true,
-        ConnectionState::Connecting
-    ));
-    assert!(!should_queue_reliable_send(
         DeliveryMethod::Unreliable,
-        true,
-        ConnectionState::Reconnecting
-    ));
+    ] {
+        for state in [
+            ConnectionState::Connected,
+            ConnectionState::Connecting,
+            ConnectionState::Reconnecting,
+            ConnectionState::Disconnected,
+            ConnectionState::Failed,
+        ] {
+            for queued in [false, true] {
+                assert_eq!(
+                    send_action(method, true, state, true, queued),
+                    SendAction::Write
+                );
+                assert_eq!(
+                    send_action(method, true, state, false, queued),
+                    SendAction::Fail
+                );
+                assert_eq!(
+                    send_action(method, false, state, false, queued),
+                    SendAction::Fail
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -91,24 +94,26 @@ fn push_drops_oldest_message_past_the_byte_cap() {
 }
 
 #[test]
-fn drain_returns_fifo_order_and_empties_the_queue() {
+fn queued_frames_stay_in_fifo_until_successfully_written() {
     let mut queue = SendQueue::default();
+    assert!(queue.is_empty());
     queue.push(Bytes::from_static(b"a"));
     queue.push(Bytes::from_static(b"b"));
     queue.push(Bytes::from_static(b"c"));
 
-    assert_eq!(
-        queue.drain(),
-        vec![
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"b"),
-            Bytes::from_static(b"c"),
-        ]
-    );
-    assert_eq!(queue.len(), 0);
-
-    // Draining an already-empty queue is a no-op, not an error.
-    assert!(queue.drain().is_empty());
+    // Inspecting a head for a write attempt leaves it queued. A failure
+    // before pop_front cannot discard it or allow the next frame past it.
+    assert_eq!(queue.front(), Some(&Bytes::from_static(b"a")));
+    assert_eq!(queue.len(), 3);
+    assert_eq!(queue.front(), Some(&Bytes::from_static(b"a")));
+    for expected in [b"a", b"b", b"c"] {
+        assert_eq!(queue.pop_front(), Some(Bytes::copy_from_slice(expected)));
+    }
+    assert!(queue.is_empty());
+    assert!(queue.pop_front().is_none());
+    assert!(queue.front().is_none());
+    // Successful pops release the byte budget as well as the message slots.
+    assert!(!queue.push(Bytes::from(vec![0u8; MAX_QUEUED_BYTES])));
 }
 
 #[test]

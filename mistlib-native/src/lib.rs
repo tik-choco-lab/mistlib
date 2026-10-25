@@ -25,7 +25,7 @@ pub use app::{
     send_message_direct_wait, send_message_direct_wait_in_room, send_message_in_room, set_config,
     set_local_track_audience, shutdown, try_send_message, try_send_message_in_room,
     unpublish_local_track, update_position, update_position_in_room, DELIVERY_RELIABLE,
-    DELIVERY_UNRELIABLE, DELIVERY_UNRELIABLE_ORDERED,
+    DELIVERY_RELIABLE_UNORDERED, DELIVERY_UNRELIABLE, DELIVERY_UNRELIABLE_ORDERED,
 };
 pub use error::{MistError, Result};
 pub use events::{

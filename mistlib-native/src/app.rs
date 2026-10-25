@@ -13,7 +13,8 @@ use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 pub use mistlib_core::types::{
-    DELIVERY_RELIABLE, DELIVERY_UNRELIABLE, DELIVERY_UNRELIABLE_ORDERED,
+    DELIVERY_RELIABLE, DELIVERY_RELIABLE_UNORDERED, DELIVERY_UNRELIABLE,
+    DELIVERY_UNRELIABLE_ORDERED,
 };
 
 #[derive(Clone)]
@@ -389,21 +390,29 @@ pub async fn send_message_direct(
             .unwrap()
             .get_next_hop(&target_node)
             .unwrap_or_else(|| target_node.clone());
-        return Ok(transport.try_enqueue_send_with(&next_hop, |validate| {
-            let OverlayAction::SendMessage { data, method, .. } = overlay.wrap_data_checked(
-                &target_node,
-                Bytes::from(data),
-                delivery_method(method),
-                validate,
-            )?
-            else {
-                unreachable!("wrap_data_checked always produces a send action");
-            };
-            Ok((data, method))
-        })?);
+        // Reserve capacity first, then stamp and enqueue under the router lock.
+        return Ok(
+            transport.try_enqueue_send_with(&next_hop, |validate, commit| {
+                overlay.dispatch_data(
+                    &target_node,
+                    Bytes::from(data),
+                    delivery_method(method),
+                    validate,
+                    |action| {
+                        let OverlayAction::SendMessage { data, method, .. } = action else {
+                            unreachable!("dispatch_data always produces a send action");
+                        };
+                        commit(data, method)
+                    },
+                )
+            })?,
+        );
     }
     let action = overlay.wrap_data(&target_node, Bytes::from(data), delivery_method(method));
-    let OverlayAction::SendMessage { to, data, method } = action else {
+    let OverlayAction::SendMessage {
+        to, data, method, ..
+    } = action
+    else {
         return Err(crate::error::MistError::Internal(
             "overlay did not produce a send action".to_string(),
         ));
@@ -461,7 +470,8 @@ async fn send_message_direct_wait_for(
         crate::error::MistError::Internal("WebRTC transport is not available".to_string())
     })?;
     // Snapshot the next hop before waiting. The reserved queue stays bound to this
-    // connection even if routing changes while capacity is unavailable.
+    // connection even if routing changes while capacity is unavailable. The
+    // commit sends through that permit inside the router's sequence lock.
     let next_hop = overlay
         .routing_table
         .lock()
@@ -469,17 +479,19 @@ async fn send_message_direct_wait_for(
         .get_next_hop(&target)
         .unwrap_or_else(|| target.clone());
     transport
-        .send_wait_with(&next_hop, |validate| {
-            let OverlayAction::SendMessage { data, method, .. } = overlay.wrap_data_checked(
+        .send_wait_with(&next_hop, |validate, commit| {
+            overlay.dispatch_data(
                 &target,
                 Bytes::from(data),
                 delivery_method(method),
                 validate,
-            )?
-            else {
-                unreachable!("wrap_data_checked always produces a send action");
-            };
-            Ok((data, method))
+                |action| {
+                    let OverlayAction::SendMessage { data, method, .. } = action else {
+                        unreachable!("dispatch_data always produces a send action");
+                    };
+                    commit(data, method)
+                },
+            )
         })
         .await?;
     Ok(())
@@ -717,7 +729,13 @@ async fn update_stats_cache() {
 }
 
 pub fn get_stats() -> String {
-    STATS_CACHE.lock().unwrap().clone()
+    let cached = STATS_CACHE.lock().unwrap().clone();
+    let mut stats: serde_json::Value =
+        serde_json::from_str(&cached).unwrap_or_else(|_| serde_json::json!({}));
+    stats["storage"] =
+        serde_json::to_value(mistlib_core::storage::telemetry::STORAGE_COUNTERS.snapshot())
+            .unwrap();
+    stats.to_string()
 }
 
 pub fn get_config() -> String {

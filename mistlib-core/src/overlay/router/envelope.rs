@@ -1,5 +1,5 @@
 use super::OverlayRouter;
-use crate::action::OverlayAction;
+use crate::action::{OverlayAction, SendLane};
 use crate::overlay::OverlayEnvelope;
 use crate::signaling::MessageContent;
 use crate::types::{DeliveryMethod, NodeId};
@@ -25,15 +25,22 @@ impl ForwardTargets {
 
 impl OverlayRouter {
     pub fn handle_envelope(&self, envelope: OverlayEnvelope, from: NodeId) -> HandleEnvelopeResult {
+        // `from` is the transport neighbor, whereas `envelope.from` may be
+        // a relayed source. Even duplicates and local echoes prove this link
+        // is alive, so record activity before dedupe or destination filtering.
+        let mut actions = Vec::new();
+        if crate::stats::STATS.note_inbound_activity(&from) {
+            actions.push(OverlayAction::ClearSuspect { to: from.clone() });
+        }
         if !self.mark_seen(&envelope) {
             return HandleEnvelopeResult {
-                actions: Vec::new(),
+                actions,
                 should_deliver: false,
             };
         }
 
         let is_broadcast = envelope.to.is_broadcast();
-        let mut actions = self.deliver_to_strategies(&envelope, is_broadcast);
+        actions.extend(self.deliver_to_strategies(&envelope, is_broadcast));
 
         if Self::can_forward(&envelope) {
             let targets = self.forward_targets(&envelope, &from, is_broadcast);
@@ -155,6 +162,15 @@ impl OverlayRouter {
             return Vec::new();
         }
 
+        let lane = SendLane::classify(&envelope.content, envelope.to.is_broadcast());
+        // Delivery method is absent from the wire. Only validated seq-0 chunks
+        // can be reclassified; other relays use reliable ordered, preserving seq.
+        let method = crate::transport::send::storage_delivery(
+            DeliveryMethod::ReliableOrdered,
+            lane,
+            envelope.seq,
+            self.transfer.bulk_channel,
+        );
         envelope.hop_count -= 1;
         let Ok(serialized) = crate::overlay::wire::serialize(&envelope) else {
             return Vec::new();
@@ -167,13 +183,15 @@ impl OverlayRouter {
                 .map(|to| OverlayAction::SendMessage {
                     to,
                     data: data.clone(),
-                    method: DeliveryMethod::ReliableOrdered,
+                    method,
+                    lane,
                 })
                 .collect(),
             ForwardTargets::Unicast(next_hop) => vec![OverlayAction::SendMessage {
                 to: next_hop,
                 data,
-                method: DeliveryMethod::ReliableOrdered,
+                method,
+                lane,
             }],
             ForwardTargets::None => Vec::new(),
         }

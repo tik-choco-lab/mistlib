@@ -11,6 +11,29 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) mod ping;
 
+/// One receive counter baseline per transport generation. Report IDs distinguish
+/// a selected-pair change from traffic; a counter decrease starts a new baseline.
+/// Keep this on the Peer, never in a NodeId-keyed process-wide map.
+#[derive(Debug, Default)]
+pub struct TransportReceiveCounter {
+    baseline: Option<(String, u64)>,
+}
+
+impl TransportReceiveCounter {
+    /// Only growth in the same report proves new inbound transport bytes.
+    pub fn observe(&mut self, report_id: &str, bytes_received: u64) -> bool {
+        let grew = self
+            .baseline
+            .as_ref()
+            .is_some_and(|(id, previous)| id == report_id && bytes_received > *previous);
+        match &mut self.baseline {
+            Some((id, previous)) if id == report_id => *previous = bytes_received,
+            baseline => *baseline = Some((report_id.to_owned(), bytes_received)),
+        }
+        grew
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStats {
@@ -54,14 +77,15 @@ pub struct SctpStats {
 }
 
 /// Per-peer PING/PONG liveness bookkeeping. `awaiting` tracks whether the most
-/// recently sent PING for this peer has not yet been answered by the time the
-/// next PING is about to go out; `consecutive_misses` counts how many rounds in
-/// a row that has happened. A single miss is expected/normal since PING travels
-/// Unreliable — this is only meaningful once it crosses a configured threshold.
+/// recently sent PING for this peer has not yet been followed by inbound traffic
+/// by the time the next PING is about to go out; `consecutive_misses` counts
+/// how many rounds in a row that has happened. An occasional miss is expected
+/// since PING travels Unreliable; only the configured threshold is suspect.
 #[derive(Default)]
 struct PingHealth {
     awaiting: bool,
     consecutive_misses: u32,
+    suspect: bool,
 }
 
 pub struct MistStats {
@@ -231,9 +255,9 @@ impl MistStats {
     }
 
     /// Records that a PING is about to be (re)sent to `node_id`. If the previous
-    /// round's PING was never answered, bumps the consecutive-miss counter;
+    /// round had no inbound traffic, bumps the consecutive-miss counter;
     /// otherwise resets it. Returns the updated miss count.
-    pub(crate) fn note_ping_sent(&self, node_id: &NodeId) -> u32 {
+    pub(crate) fn note_ping_sent(&self, node_id: &NodeId, timeout_count: u32) -> u32 {
         let mut health = self.ping_health.lock().unwrap_or_else(|e| e.into_inner());
         let entry = health.entry(node_id.clone()).or_default();
         if entry.awaiting {
@@ -242,23 +266,30 @@ impl MistStats {
             entry.consecutive_misses = 0;
         }
         entry.awaiting = true;
+        if timeout_count > 0 && entry.consecutive_misses == timeout_count {
+            entry.suspect = true;
+        }
         entry.consecutive_misses
     }
 
-    /// Records a PONG from `node_id`, clearing its miss streak. `timeout_count`
-    /// is the same liveness-suspect threshold `note_ping_sent` is checked
-    /// against; returns whether the miss streak had already crossed it (i.e.
-    /// whether a `SuspectDisconnected` was latched for this peer), so the
-    /// caller knows whether to emit a matching `ClearSuspect`.
-    pub(crate) fn note_pong_received(&self, node_id: &NodeId, timeout_count: u32) -> bool {
+    /// Records a PONG without changing RTT (the caller measures that separately).
+    /// Returns whether a matching `ClearSuspect` is needed.
+    pub(crate) fn note_pong_received(&self, node_id: &NodeId) -> bool {
+        self.note_inbound_activity(node_id)
+    }
+
+    /// Any inbound frame or transport-byte growth proves the link peer is alive. Reset the
+    /// miss streak and consume the suspect latch without touching RTT. Unknown
+    /// peers need no entry: only the ping tick starts tracking them. This hot
+    /// path performs one lookup and does not clone the node ID or allocate.
+    pub fn note_inbound_activity(&self, node_id: &NodeId) -> bool {
         let mut health = self.ping_health.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = health.get_mut(node_id) else {
             return false;
         };
-        let was_suspect = timeout_count > 0 && entry.consecutive_misses >= timeout_count;
         entry.awaiting = false;
         entry.consecutive_misses = 0;
-        was_suspect
+        std::mem::take(&mut entry.suspect)
     }
 
     #[cfg(test)]
@@ -359,6 +390,13 @@ mod tests {
     use super::*;
     use crate::overlay::{OverlayMessage, OVERLAY_MSG_PING};
     use crate::signaling::{SignalingData, SignalingType};
+
+    #[test]
+    fn inbound_activity_for_untracked_peer_does_not_allocate_health_entry() {
+        let stats = MistStats::new();
+        assert!(!stats.note_inbound_activity(&NodeId("untracked".into())));
+        assert!(stats.ping_health.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn test_stats_counts() {

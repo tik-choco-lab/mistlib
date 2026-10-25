@@ -1,7 +1,10 @@
+use super::disconnect_grace::InboundActivity;
 use super::{DisconnectGrace, GraceOrigin};
 use bytes::Bytes;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingData, SignalingType};
 use mistlib_core::stats::STATS;
+use mistlib_core::transport::send::{LaneQueue, ScheduledSend, SendClass};
 use mistlib_core::transport::NetworkEvent;
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
@@ -37,6 +40,52 @@ const ISOLATION_RECOVERY_DELAY_MS: u64 = 3000;
 /// that case is reaped by the sweeper (`sweeper::decide_grace_expiry`), which
 /// tears down the whole `Peer` (and this queue with it) via `close_all`.
 pub(crate) const PEER_SEND_QUEUE_CAPACITY: usize = 256;
+
+/// Pinned webrtc-rs returns these before SCTP accepts any user data:
+/// ensure_open / missing channel, or Stream::prepare_write on a closed stream.
+/// Other failures (including cancellation) have an ambiguous write outcome.
+fn bulk_write_failure(err: webrtc::Error) -> mistlib_core::transport::send::WriteFailure {
+    use mistlib_core::transport::send::WriteFailure;
+    let uncommitted = matches!(
+        &err,
+        webrtc::Error::ErrClosedPipe
+            | webrtc::Error::Data(webrtc::data::Error::Sctp(sctp::Error::ErrStreamClosed))
+    );
+    let err = mistlib_core::error::MistError::Network(format!("DataChannel send failed: {err}"));
+    if uncommitted {
+        WriteFailure::Uncommitted(err)
+    } else {
+        WriteFailure::Failed(err)
+    }
+}
+
+async fn write_selected_channel(
+    dc: &Arc<RTCDataChannel>,
+    data: &Bytes,
+    cancel: &CancellationToken,
+    pacing: Option<&super::pacing::NativePacing>,
+) -> Result<(), mistlib_core::transport::send::WriteFailure> {
+    let bulk = SendClass::from_wire(data).lane == mistlib_core::action::SendLane::Bulk;
+    if let Some(pacing) = pacing {
+        if bulk {
+            pacing
+                .wait(dc, data.len(), cancel)
+                .await
+                .map_err(mistlib_core::transport::send::WriteFailure::Uncommitted)?;
+        }
+        pacing.begin_submission();
+    }
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(mistlib_core::transport::send::WriteFailure::Failed(
+            mistlib_core::transport::send::closed_send())),
+        result = dc.send(data) => result.map(|_| ()).map_err(bulk_write_failure),
+    };
+    if let Some(pacing) = pacing {
+        pacing.finish_submission(dc, data.len(), bulk, result.is_ok());
+    }
+    result
+}
 
 /// Poll interval [`Peer::spawn_send_queue`]'s drainer uses while waiting for
 /// a queued message's target DataChannel to become `Open`. There is no
@@ -167,6 +216,11 @@ pub struct MediaTrackEvent {
 }
 
 pub struct Peer {
+    pub(super) pacing: Option<Arc<super::pacing::NativePacing>>,
+    pub(crate) unordered_capability:
+        mistlib_core::transport::reliable_unordered::ReliableUnorderedCapability,
+    pub(crate) unordered_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
+    pub(crate) inbound_activity: InboundActivity,
     pub pc: Arc<RTCPeerConnection>,
     pub channels: Arc<RwLock<HashMap<DeliveryMethod, Arc<RTCDataChannel>>>>,
     pub cancel_token: CancellationToken,
@@ -234,6 +288,17 @@ pub(crate) struct QueuedSend {
     pub data: Bytes,
     pub method: DeliveryMethod,
     pub completion: Option<oneshot::Sender<mistlib_core::error::Result<()>>>,
+    pub _telemetry: Option<mistlib_core::transport::send::QueueCharge>,
+    pub _bulk_permit: Option<mistlib_core::transport::send::BytePermit>,
+}
+
+impl ScheduledSend for QueuedSend {
+    fn reliable_unordered(&self) -> bool {
+        self.method == DeliveryMethod::ReliableUnordered
+    }
+    fn send_class(&self) -> SendClass {
+        SendClass::from_wire(&self.data)
+    }
 }
 
 impl QueuedSend {
@@ -347,7 +412,7 @@ impl PeerSharedHandles {
                             sender_id: self.local_node_id.clone(),
                             receiver_id: node.clone(),
                             room_id: self.room_id.clone(),
-                            data: desc.sdp,
+                            data: super::signaling::negotiation_data(desc.sdp),
                             signaling_type: SignalingType::Offer,
                         }),
                     )
@@ -901,7 +966,7 @@ impl PeerSharedHandles {
                 sender_id: self.local_node_id.clone(),
                 receiver_id: node.clone(),
                 room_id: self.room_id.clone(),
-                data: offer_desc.sdp,
+                data: super::signaling::negotiation_data(offer_desc.sdp),
                 signaling_type: SignalingType::Offer,
             })
         };
@@ -1209,21 +1274,12 @@ impl Peer {
     /// Spawns this peer's ordered send-queue drainer and returns the sender
     /// half, which becomes `Peer::send_tx`.
     ///
-    /// Before this existed, `WebRtcTransport::send` called `dc.send()`
-    /// directly, and `MistEngine::handle_action_for` (`engine/action.rs`)
-    /// invoked it from an independent fire-and-forget `tokio::spawn` per
-    /// outbound message. Overlay sequence numbers are stamped synchronously
-    /// and in call order (`OverlayRouter::wrap_data`/`next_seq`) before any
-    /// of those tasks are spawned, but the spawned tasks then raced each
-    /// other for the actual `dc.send()` call -- so the DataChannel write
-    /// order (and therefore the order bytes actually left the wire in)
-    /// could differ from the seq order, feeding the receiver's
-    /// `ReorderBuffer` with self-inflicted reordering purely from this
-    /// send-side race, not from the network. Routing every send for a peer
-    /// through this single-consumer queue instead makes the DataChannel
-    /// write order match the call order that produced the seq numbers,
-    /// while sends to *different* peers remain fully concurrent (each
-    /// `Peer` has its own queue and drainer task).
+    /// The drainer preserves enqueue order through each DataChannel write.
+    /// Sequenced senders must hand off frames inside the router's sequence
+    /// critical section, using either synchronous enqueue or a pre-reserved
+    /// permit. Synchronous enqueue after releasing that lock still allows
+    /// concurrent threads to invert sequence order. Different peers have
+    /// independent drainers and can write concurrently.
     ///
     /// As a side effect this also stops real message loss during a brief
     /// `Open` -> not-`Open` blip (e.g. an ICE restart): a message enqueued
@@ -1233,22 +1289,47 @@ impl Peer {
     /// grace period (`DISCONNECTED_GRACE_MS`), since a peer that never
     /// recovers is reaped by the sweeper, which cancels `cancel_token` and
     /// so tears this drainer down along with the rest of the peer.
-    pub(crate) fn spawn_send_queue(
+    pub(super) fn spawn_send_queue(
         node: NodeId,
         channels: Arc<RwLock<HashMap<DeliveryMethod, Arc<RTCDataChannel>>>>,
         cancel_token: CancellationToken,
+        priority: bool,
+        unordered_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
+        pacing: Option<Arc<super::pacing::NativePacing>>,
     ) -> mpsc::Sender<QueuedSend> {
         let (tx, mut rx) = mpsc::channel::<QueuedSend>(PEER_SEND_QUEUE_CAPACITY);
         tokio::spawn(async move {
+            let mut pending = LaneQueue::new(priority);
+            let mut writes: FuturesUnordered<
+                mistlib_core::transport::send::SendFuture<'static, bool>,
+            > = FuturesUnordered::new();
+            let (mut ordered_busy, mut bulk_busy) = (false, false);
+            let mut receiving = true;
             loop {
-                let queued = tokio::select! {
-                    _ = cancel_token.cancelled() => break,
-                    queued = rx.recv() => match queued {
-                        Some(queued) => queued,
-                        None => break,
-                    },
-                };
-
+                if !receiving && writes.is_empty() && pending.is_empty() {
+                    break;
+                }
+                if priority || bulk_busy {
+                    // Bound the look-ahead buffer as well as the ingress queue.
+                    while pending.len() < PEER_SEND_QUEUE_CAPACITY {
+                        match rx.try_recv() {
+                            Ok(frame) => pending.push_back(frame),
+                            Err(_) => break,
+                        }
+                    }
+                }
+                while let Some((queued, bulk)) = pending.pop(!ordered_busy, !bulk_busy) {
+                    if bulk {
+                        bulk_busy = true;
+                    } else {
+                        ordered_busy = true;
+                    }
+                    let node = node.clone();
+                    let channels = channels.clone();
+                    let unordered_channel = unordered_channel.clone();
+                    let cancel_token = cancel_token.clone();
+                    let pacing = pacing.clone();
+                    writes.push(Box::pin(async move {
                 // Wait for this message's channel to be `Open`, buffering it
                 // (and everything queued behind it) rather than dropping it
                 // -- see the doc comment above. Bounded by `cancel_token`:
@@ -1258,11 +1339,14 @@ impl Peer {
                 let dc = loop {
                     let candidate = {
                         let channels = channels.read().await;
-                        channels.get(&queued.method).cloned()
+                        let bulk = unordered_channel.read().await.clone().filter(|dc| dc.ready_state() == RTCDataChannelState::Open);
+                        if queued.method == DeliveryMethod::ReliableUnordered {
+                            bulk.map(|dc| (dc, true)).or_else(|| channels.get(&DeliveryMethod::ReliableOrdered).cloned().map(|dc| (dc, false)))
+                        } else { channels.get(&queued.method).cloned().map(|dc| (dc, false)) }
                     };
                     match candidate {
-                        Some(dc) if dc.ready_state() == RTCDataChannelState::Open => {
-                            break Some(dc)
+                        Some((dc, optional)) if dc.ready_state() == RTCDataChannelState::Open => {
+                            break Some((dc, optional))
                         }
                         Some(_) => {
                             tokio::select! {
@@ -1274,7 +1358,7 @@ impl Peer {
                     }
                 };
 
-                let Some(dc) = dc else {
+                let Some((dc, optional)) = dc else {
                     tracing::warn!(
                         "[SendQueue] dropping queued {:?} message to {} (channel never became \
                          available before the peer was torn down)",
@@ -1285,21 +1369,51 @@ impl Peer {
                         "Send channel unavailable for {}",
                         node
                     ))));
-                    continue;
+                    return bulk;
                 };
 
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel_token.cancelled() => Err(mistlib_core::error::MistError::Internal(
-                        format!("Peer {} torn down during send", node),
-                    )),
-                    result = dc.send(&queued.data) => result.map(|_| ()).map_err(|err| {
-                        mistlib_core::error::MistError::Internal(format!("DataChannel send to {} failed: {}", node, err))
-                    }),
-                };
+                let result = mistlib_core::transport::send::with_reliable_fallback(
+                    async {
+                        let result = write_selected_channel(&dc, &queued.data, &cancel_token, pacing.as_deref()).await;
+                        if result.is_ok() {
+                            if let Some(charge) = &queued._telemetry { charge.submitted_on(!dc.ordered()); }
+                        }
+                        match result {
+                            Err(mistlib_core::transport::send::WriteFailure::Uncommitted(err)) if !optional =>
+                                Err(mistlib_core::transport::send::WriteFailure::Failed(err)),
+                            result => result,
+                        }
+                    },
+                    || async {
+                        // Resolve from the same PC's map; never replay onto a replacement PC.
+                        let reliable = loop {
+                            let reliable = channels.read().await.get(&DeliveryMethod::ReliableOrdered).cloned()
+                                .ok_or_else(mistlib_core::transport::send::closed_send)?;
+                            if reliable.ready_state() == RTCDataChannelState::Open { break reliable; }
+                            if reliable.ready_state() == RTCDataChannelState::Closed {
+                                return Err(mistlib_core::transport::send::closed_send());
+                            }
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => return Err(mistlib_core::transport::send::closed_send()),
+                                _ = tokio::time::sleep(Duration::from_millis(SEND_QUEUE_POLL_INTERVAL_MS)) => {}
+                            }
+                        };
+                        let result = write_selected_channel(&reliable, &queued.data, &cancel_token, pacing.as_deref()).await;
+                        if result.is_ok() {
+                            if let Some(charge) = &queued._telemetry { charge.submitted_on(false); }
+                        }
+                        result.map_err(|failure| match failure {
+                            mistlib_core::transport::send::WriteFailure::Uncommitted(err)
+                            | mistlib_core::transport::send::WriteFailure::Failed(err) => err,
+                        })
+                    },
+                ).await;
                 if result.is_ok() {
                     STATS.add_send_frame(&queued.data);
                 } else if let Err(err) = &result {
+                    if queued.completion.is_none() && queued._telemetry.is_some() {
+                        mistlib_core::storage::telemetry::STORAGE_COUNTERS.responder_write_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                     tracing::warn!(
                         "[SendQueue] failed to send queued {:?} message to {}: {}",
                         queued.method,
@@ -1308,22 +1422,23 @@ impl Peer {
                     );
                 }
                 queued.complete(result);
-            }
-
-            // The peer was torn down (cancelled) or `send_tx` was dropped
-            // with messages still buffered -- drop them explicitly and warn
-            // once with the count, instead of silently discarding when `rx`
-            // itself is dropped at the end of this task.
-            let mut dropped = 0usize;
-            while rx.try_recv().is_ok() {
-                dropped += 1;
-            }
-            if dropped > 0 {
-                tracing::warn!(
-                    "[SendQueue] dropped {} queued message(s) to {} on peer teardown",
-                    dropped,
-                    node
-                );
+                        bulk
+                    }));
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => break,
+                    completed = writes.next(), if !writes.is_empty() => {
+                        if completed == Some(true) { bulk_busy = false; } else { ordered_busy = false; }
+                    },
+                    frame = rx.recv(), if receiving && if priority || bulk_busy { pending.len() < PEER_SEND_QUEUE_CAPACITY } else { pending.is_empty() && writes.is_empty() } => {
+                        match frame {
+                            Some(frame) => pending.push_back(frame),
+                            None if writes.is_empty() && pending.is_empty() => break,
+                            None => { receiving = false; },
+                        }
+                    },
+                }
             }
         });
         tx
@@ -1331,6 +1446,15 @@ impl Peer {
 
     pub async fn close_all(&self) {
         self.cancel_token.cancel();
+        if let Some(pacing) = &self.pacing {
+            pacing.budget.close();
+        }
+        self.unordered_capability.disable();
+        let unordered_channel = self.unordered_channel.write().await.take();
+        if let Some(dc) = unordered_channel {
+            Self::detach_data_channel_handlers(&dc);
+            let _ = dc.close().await;
+        }
         self.detach_peer_handlers();
         let channels = {
             let mut dc_lock = self.channels.write().await;
@@ -1398,6 +1522,7 @@ impl Peer {
         dc.on_open(Box::new(|| Box::pin(async {})));
         dc.on_close(Box::new(|| Box::pin(async {})));
         dc.on_message(Box::new(|_| Box::pin(async {})));
+        dc.on_error(Box::new(|_| Box::pin(async {})));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1508,11 +1633,20 @@ impl Peer {
                     if peer.cancel_token.is_cancelled() {
                         return;
                     }
-                    let method = match label.as_str() {
-                        "reliable" => DeliveryMethod::ReliableOrdered,
-                        "unreliable-ordered" => DeliveryMethod::UnreliableOrdered,
-                        "unreliable" => DeliveryMethod::Unreliable,
-                        _ => DeliveryMethod::ReliableOrdered,
+                    use mistlib_core::transport::reliable_unordered::{channel_label, ChannelLabel};
+                    let method = match channel_label(&label) {
+                        Some(ChannelLabel::Reliable) => DeliveryMethod::ReliableOrdered,
+                        Some(ChannelLabel::UnreliableOrdered) => DeliveryMethod::UnreliableOrdered,
+                        Some(ChannelLabel::Unreliable) => DeliveryMethod::Unreliable,
+                        Some(ChannelLabel::ReliableUnordered) if peer.unordered_capability.accepts_channel() => {
+                            let mut bulk = peer.unordered_channel.write().await;
+                            if bulk.is_some() { drop(bulk); let _ = dc.close().await; return; }
+                            *bulk = Some(dc.clone());
+                            drop(bulk);
+                            Self::setup_dc_handlers(dc, tx_opt, remote_id, peer.cancel_token.clone(), handles, peer_weak).await;
+                            return;
+                        },
+                        _ => { tracing::debug!(%label, "Rejecting unknown or unnegotiated DataChannel"); let _ = dc.close().await; return; }
                     };
                     {
                         let mut dc_lock = peer.channels.write().await;
@@ -1782,11 +1916,16 @@ impl Peer {
         handles: PeerSharedHandles,
         peer_weak: Weak<Peer>,
     ) {
+        if dc.label() == mistlib_core::transport::reliable_unordered::RELIABLE_UNORDERED_LABEL {
+            Self::setup_bulk_dc_handlers(&dc, peer_weak.clone());
+            Self::setup_dc_message_handler(&dc, remote_id, event_tx, cancel_token, peer_weak);
+            return;
+        }
         let method = match dc.label() {
             "reliable" => DeliveryMethod::ReliableOrdered,
             "unreliable-ordered" => DeliveryMethod::UnreliableOrdered,
             "unreliable" => DeliveryMethod::Unreliable,
-            _ => DeliveryMethod::ReliableOrdered,
+            _ => return,
         };
         let room_id = handles.room_id.clone();
         Self::setup_dc_open_handler(
@@ -1808,9 +1947,32 @@ impl Peer {
             remote_id.clone(),
             handles,
             cancel_token.clone(),
-            peer_weak,
+            peer_weak.clone(),
         );
-        Self::setup_dc_message_handler(&dc, remote_id, event_tx, cancel_token);
+        Self::setup_dc_message_handler(&dc, remote_id, event_tx, cancel_token, peer_weak);
+    }
+
+    fn setup_bulk_dc_handlers(dc: &Arc<RTCDataChannel>, peer: Weak<Peer>) {
+        let weak = peer.clone();
+        dc.on_close(Box::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                if let Some(peer) = weak.upgrade() {
+                    peer.unordered_capability.disable();
+                    peer.unordered_channel.write().await.take();
+                }
+            })
+        }));
+        dc.on_error(Box::new(move |error| {
+            let weak = peer.clone();
+            Box::pin(async move {
+                tracing::debug!(%error, "Storage bulk channel disabled");
+                if let Some(peer) = weak.upgrade() {
+                    peer.unordered_capability.disable();
+                    peer.unordered_channel.write().await.take();
+                }
+            })
+        }));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2066,9 +2228,13 @@ impl Peer {
         remote_id: NodeId,
         event_tx: Option<mpsc::Sender<NetworkEvent>>,
         cancel_token: CancellationToken,
+        peer: Weak<Peer>,
     ) {
         dc.on_message(Box::new(
             move |msg: webrtc::data_channel::data_channel_message::DataChannelMessage| {
+                if let Some(peer) = peer.upgrade() {
+                    peer.inbound_activity.record();
+                }
                 let tx = event_tx.clone();
                 let remote_id = remote_id.clone();
                 let cancel = cancel_token.clone();
@@ -2086,6 +2252,39 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn optional_bulk_retries_only_known_uncommitted_native_writes() {
+        use mistlib_core::transport::send::{with_reliable_fallback, WriteFailure};
+        for error in [
+            webrtc::Error::ErrClosedPipe,
+            webrtc::Error::Data(webrtc::data::Error::Sctp(sctp::Error::ErrStreamClosed)),
+        ] {
+            let writes = std::sync::Mutex::new(Vec::new());
+            let frame = bytes::Bytes::from_static(b"same-frame");
+            with_reliable_fallback(async { Err(super::bulk_write_failure(error)) }, || async {
+                writes.lock().unwrap().push(frame.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(*writes.lock().unwrap(), vec![frame]);
+        }
+        let ambiguous = super::bulk_write_failure(webrtc::Error::new("ambiguous".into()));
+        assert!(matches!(ambiguous, WriteFailure::Failed(_)));
+        assert!(with_reliable_fallback(async { Err(ambiguous) }, || async {
+            panic!("ambiguous writes must not retry")
+        })
+        .await
+        .is_err());
+        let expected = "fallback failed";
+        let result = with_reliable_fallback(
+            async { Err(super::bulk_write_failure(webrtc::Error::ErrClosedPipe)) },
+            || async { Err(mistlib_core::error::MistError::Network(expected.into())) },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains(expected));
+    }
+
     use super::*;
 
     /// Regression test for the "Node not found" overlay-send race: a peer

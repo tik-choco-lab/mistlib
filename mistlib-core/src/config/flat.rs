@@ -30,6 +30,7 @@ pub(super) struct FlatConfig {
     storage_spatial_decay_enabled: Option<bool>,
     storage_spatial_decay_interval_secs: Option<u64>,
     storage_spatial_decay_max_probability: Option<f32>,
+    storage_transfer: Option<super::StorageTransferConfig>,
     heartbeat_interval_seconds: Option<f32>,
     node_list_interval_seconds: Option<f32>,
     ping_interval_seconds: Option<f32>,
@@ -66,6 +67,7 @@ impl FlatConfig {
             storage_spatial_decay_enabled: Some(c.storage.spatial_decay_enabled),
             storage_spatial_decay_interval_secs: Some(c.storage.spatial_decay_interval_secs),
             storage_spatial_decay_max_probability: Some(c.storage.spatial_decay_max_probability),
+            storage_transfer: Some(c.storage.transfer.clone()),
             heartbeat_interval_seconds: Some(c.intervals.heartbeat),
             node_list_interval_seconds: Some(c.intervals.node_list),
             ping_interval_seconds: Some(c.intervals.ping),
@@ -139,6 +141,9 @@ impl FlatConfig {
         }
         if let Some(v) = self.storage_spatial_decay_max_probability {
             c.storage.spatial_decay_max_probability = v;
+        }
+        if let Some(v) = &self.storage_transfer {
+            c.storage.transfer = v.clone();
         }
         if let Some(v) = self.heartbeat_interval_seconds {
             c.intervals.heartbeat = v;

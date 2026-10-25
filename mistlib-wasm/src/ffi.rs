@@ -1,6 +1,13 @@
 use wasm_bindgen::prelude::*;
 use web_sys::MediaStreamTrack;
 
+/// Configure console logging before the first init. Levels: error, warn,
+/// info, debug, trace. Returns false for invalid levels or after initialization.
+#[wasm_bindgen]
+pub fn set_log_level(level: &str) -> bool {
+    crate::app::set_log_level(level)
+}
+
 pub const EVENT_RAW: u32 = crate::app::EVENT_RAW;
 pub const EVENT_OVERLAY: u32 = crate::app::EVENT_OVERLAY;
 pub const EVENT_NEIGHBORS: u32 = crate::app::EVENT_NEIGHBORS;
@@ -18,6 +25,7 @@ pub const MEDIA_EVENT_TRACK_REMOVED: u32 = crate::app::MEDIA_EVENT_TRACK_REMOVED
 pub const DELIVERY_RELIABLE: u32 = crate::app::DELIVERY_RELIABLE;
 pub const DELIVERY_UNRELIABLE_ORDERED: u32 = crate::app::DELIVERY_UNRELIABLE_ORDERED;
 pub const DELIVERY_UNRELIABLE: u32 = crate::app::DELIVERY_UNRELIABLE;
+pub const DELIVERY_RELIABLE_UNORDERED: u32 = crate::app::DELIVERY_RELIABLE_UNORDERED;
 
 // wasm-bindgen cannot export a free `pub const`, so the constants above are
 // invisible to JS -- importing `EVENT_PEER_CONNECTED` from the generated module
@@ -65,6 +73,8 @@ pub enum Delivery {
     UnreliableOrdered = 1,
     /// May be dropped or reordered. Lowest latency.
     Unreliable = 2,
+    /// Fully reliable, with no ordering guarantee. Uses reliable ordered on older peers.
+    ReliableUnordered = 3,
 }
 
 // A mismatch here means JS and Rust disagree about a wire-visible number, which
@@ -86,6 +96,7 @@ const _: () = {
     assert!(Delivery::Reliable as u32 == DELIVERY_RELIABLE);
     assert!(Delivery::UnreliableOrdered as u32 == DELIVERY_UNRELIABLE_ORDERED);
     assert!(Delivery::Unreliable as u32 == DELIVERY_UNRELIABLE);
+    assert!(Delivery::ReliableUnordered as u32 == DELIVERY_RELIABLE_UNORDERED);
 };
 
 /// Returns the MistLib package version embedded in this WASM binary.

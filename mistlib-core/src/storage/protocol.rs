@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::types::NodeId;
+use web_time::Instant;
 
 pub const MSG_WANT: u8 = 0x01;
 pub const MSG_HAVE: u8 = 0x02;
@@ -22,7 +23,26 @@ const MAX_WANT_PEERS: usize = 1024;
 type PeerCache = Arc<Mutex<HashMap<String, Vec<NodeId>>>>;
 type PeerNotifiers = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>;
 
+/// Counts are retained by the attempt even after its registration completes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChunkProgress {
+    pub received: u64,
+    pub accepted: u64,
+    pub last_accepted: Option<Instant>,
+}
+
+pub struct WantAttempt {
+    pub id: u64,
+    pub data: oneshot::Receiver<Vec<u8>>,
+    pub resets: watch::Receiver<u64>,
+    pub progress: watch::Receiver<ChunkProgress>,
+}
+
 struct PendingWant {
+    id: u64,
+    paths: HashSet<String>,
+    resets: watch::Sender<u64>,
+    progress: watch::Sender<ChunkProgress>,
     peers: Vec<NodeId>,
     tx: oneshot::Sender<Vec<u8>>,
 }
@@ -34,40 +54,109 @@ struct ChunkAssembly {
     chunks: Vec<Option<Vec<u8>>>,
 }
 
-#[derive(Default)]
 struct WantState {
     pending: HashMap<String, Vec<PendingWant>>,
-    assemblies: HashMap<(String, NodeId), ChunkAssembly>,
+    assemblies: HashMap<(String, NodeId, String), ChunkAssembly>,
+    next_attempt: u64,
+    progress: HashMap<NodeId, watch::Sender<u64>>,
+    sender_activity: HashMap<NodeId, Instant>,
+    any_progress: watch::Sender<u64>,
+    query_paths: HashMap<(String, NodeId), watch::Sender<u64>>,
+}
+
+impl Default for WantState {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            assemblies: HashMap::new(),
+            progress: HashMap::new(),
+            next_attempt: 0,
+            sender_activity: HashMap::new(),
+            any_progress: watch::channel(0).0,
+            query_paths: HashMap::new(),
+        }
+    }
 }
 
 impl WantState {
-    fn accepts(&self, cid: &str, sender: &NodeId) -> bool {
+    fn accepts(&self, cid: &str, sender: &NodeId, room: &str) -> bool {
         self.pending.get(cid).is_some_and(|wants| {
-            wants
-                .iter()
-                .any(|want| !want.tx.is_closed() && want.peers.contains(sender))
+            wants.iter().any(|want| {
+                !want.tx.is_closed() && want.peers.contains(sender) && want.paths.contains(room)
+            })
         })
     }
 
     fn prune(&mut self) {
+        self.query_paths
+            .retain(|_, resets| resets.receiver_count() > 0);
         self.pending.retain(|_, wants| {
             wants.retain(|want| !want.tx.is_closed());
             !wants.is_empty()
         });
         let pending = &self.pending;
-        self.assemblies.retain(|(cid, sender), _| {
-            pending
-                .get(cid)
-                .is_some_and(|wants| wants.iter().any(|want| want.peers.contains(sender)))
+        self.assemblies.retain(|(cid, sender, room), _| {
+            pending.get(cid).is_some_and(|wants| {
+                wants
+                    .iter()
+                    .any(|want| want.peers.contains(sender) && want.paths.contains(room))
+            })
         });
+        if !self.progress.is_empty() {
+            let senders: HashSet<_> = pending
+                .values()
+                .flatten()
+                .flat_map(|want| &want.peers)
+                .collect();
+            self.progress.retain(|sender, _| senders.contains(sender));
+            self.sender_activity
+                .retain(|sender, _| senders.contains(sender));
+        }
     }
 
-    fn fulfill(&mut self, cid: &str, sender: &NodeId, data: Vec<u8>) {
+    fn observe(
+        &self,
+        cid: &str,
+        sender: &NodeId,
+        room: &str,
+        accepted: bool,
+    ) -> Option<(u64, ChunkProgress)> {
+        let mut snapshot = None;
+        if let Some(wants) = self.pending.get(cid) {
+            for want in wants
+                .iter()
+                .filter(|want| want.peers.contains(sender) && want.paths.contains(room))
+            {
+                want.progress.send_modify(|progress| {
+                    if accepted {
+                        progress.accepted += 1;
+                        progress.last_accepted = Some(Instant::now());
+                    } else {
+                        progress.received += 1;
+                    }
+                });
+                snapshot.get_or_insert((want.id, *want.progress.borrow()));
+            }
+        }
+        snapshot
+    }
+
+    fn advance_progress(&mut self, sender: &NodeId) {
+        self.sender_activity.insert(sender.clone(), Instant::now());
+        self.any_progress
+            .send_modify(|counter| *counter = counter.wrapping_add(1));
+        self.progress
+            .entry(sender.clone())
+            .or_insert_with(|| watch::channel(0).0)
+            .send_modify(|counter| *counter = counter.wrapping_add(1));
+    }
+
+    fn fulfill(&mut self, cid: &str, sender: &NodeId, room: &str, data: Vec<u8>) {
         if let Some(wants) = self.pending.remove(cid) {
             // Unverified bytes may only complete waiters that requested this sender.
             let (authorized, remaining): (Vec<_>, Vec<_>) = wants
                 .into_iter()
-                .partition(|want| want.peers.contains(sender));
+                .partition(|want| want.peers.contains(sender) && want.paths.contains(room));
             if !remaining.is_empty() {
                 self.pending.insert(cid.to_string(), remaining);
             }
@@ -87,6 +176,7 @@ impl WantState {
 #[derive(Clone)]
 pub struct WantRegistry {
     state: Arc<Mutex<WantState>>,
+    counters: Arc<super::telemetry::StorageCounters>,
     peer_cache: PeerCache,
     peer_notifiers: PeerNotifiers,
 }
@@ -101,6 +191,7 @@ impl WantRegistry {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(WantState::default())),
+            counters: super::telemetry::STORAGE_COUNTERS.clone(),
             peer_cache: Arc::new(Mutex::new(HashMap::new())),
             peer_notifiers: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -117,21 +208,42 @@ impl WantRegistry {
 
     /// Register before sending WANT; for broadcast, pass the snapshotted recipients.
     /// An immediately closed receiver indicates admission limits were exceeded.
-    pub fn register_for_peers(
+    pub fn register_for_peers(&self, cid: &str, peers: Vec<NodeId>) -> oneshot::Receiver<Vec<u8>> {
+        self.register_attempt_for_peers(cid, peers, true).data
+    }
+
+    /// Register one resolver attempt before routing WANTs. Paths are attached
+    /// immediately before each send, so even teardown during enqueue is retained.
+    pub fn register_attempt(&self, cid: &str, sender: NodeId) -> WantAttempt {
+        self.register_attempt_for_peers(cid, vec![sender], false)
+    }
+
+    fn register_attempt_for_peers(
         &self,
         cid: &str,
         mut peers: Vec<NodeId>,
-    ) -> oneshot::Receiver<Vec<u8>> {
+        local: bool,
+    ) -> WantAttempt {
         let (tx, rx) = oneshot::channel();
+        let (resets, reset_rx) = watch::channel(0);
+        let (progress, progress_rx) = watch::channel(ChunkProgress::default());
         let mut state = self.state.lock().unwrap();
         state.prune();
+        state.next_attempt = state.next_attempt.wrapping_add(1);
+        let id = state.next_attempt;
+        let attempt = WantAttempt {
+            id,
+            data: rx,
+            resets: reset_rx,
+            progress: progress_rx,
+        };
         if cid.len() > u8::MAX as usize
             || peers.is_empty()
             || peers.len() > MAX_WANT_PEERS
             || peers.iter().any(|peer| peer.0.len() > 256)
             || state.pending.values().map(Vec::len).sum::<usize>() >= MAX_PENDING_WANTS
         {
-            return rx;
+            return attempt;
         }
         peers.sort_by(|a, b| a.0.cmp(&b.0));
         peers.dedup();
@@ -139,8 +251,66 @@ impl WantRegistry {
             .pending
             .entry(cid.to_string())
             .or_default()
-            .push(PendingWant { peers, tx });
-        rx
+            .push(PendingWant {
+                id,
+                paths: if local {
+                    HashSet::from([String::new()])
+                } else {
+                    HashSet::new()
+                },
+                resets,
+                progress,
+                peers,
+                tx,
+            });
+        attempt
+    }
+
+    pub fn track_path(&self, attempt: u64, room: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state
+            .pending
+            .values_mut()
+            .flatten()
+            .find(|want| want.id == attempt)
+            .is_some_and(|want| want.paths.insert(room.to_string()))
+    }
+
+    /// Undo a newly attached path when enqueue fails. Paths from earlier
+    /// successful sends stay attached until the attempt ends.
+    pub fn untrack_path(&self, attempt: u64, room: &str) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(want) = state
+            .pending
+            .values_mut()
+            .flatten()
+            .find(|want| want.id == attempt)
+        {
+            want.paths.remove(room);
+        }
+        state.prune();
+    }
+
+    pub fn attempt_paths(&self, attempt: u64) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut paths: Vec<_> = state
+            .pending
+            .values()
+            .flatten()
+            .find(|want| want.id == attempt)
+            .map(|want| want.paths.iter().cloned().collect())
+            .unwrap_or_default();
+        paths.sort();
+        paths
+    }
+
+    pub fn sender_last_accepted(&self, sender: &NodeId) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap()
+            .sender_activity
+            .get(sender)
+            .copied()
     }
 
     pub fn fulfill(&self, cid: &str, data: Vec<u8>) {
@@ -148,10 +318,25 @@ impl WantRegistry {
     }
 
     pub fn fulfill_from(&self, cid: &str, sender: &NodeId, data: Vec<u8>) {
+        self.fulfill_in("", cid, sender, data);
+    }
+
+    pub fn fulfill_in(&self, room: &str, cid: &str, sender: &NodeId, data: Vec<u8>) {
         let mut state = self.state.lock().unwrap();
         state.prune();
-        if data.len() <= MAX_WANT_BLOCK_BYTES && state.accepts(cid, sender) {
-            state.fulfill(cid, sender, data);
+        let counters = state.observe(cid, sender, room, false);
+        let accepted = data.len() <= MAX_WANT_BLOCK_BYTES && state.accepts(cid, sender, room);
+        tracing::debug!(%cid, peer = %sender.0, %room, len = data.len(), accepted, ?counters,
+            reason = if accepted { "complete" } else { "oversized or no WANT on path" }, "Storage: HAVE received");
+        if accepted {
+            self.counters.accepted(data.len());
+            self.counters.completed();
+            let counters = state.observe(cid, sender, room, true);
+            tracing::debug!(%cid, peer = %sender.0, %room, ?counters, "Storage: HAVE accepted; response complete");
+            state.advance_progress(sender);
+            state.fulfill(cid, sender, room, data);
+        } else {
+            self.counters.rejected();
         }
     }
 
@@ -167,29 +352,58 @@ impl WantRegistry {
         chunk_total: u16,
         data: Vec<u8>,
     ) {
+        self.fulfill_chunk_in("", cid, sender, chunk_index, chunk_total, data);
+    }
+
+    pub fn fulfill_chunk_in(
+        &self,
+        room: &str,
+        cid: &str,
+        sender: &NodeId,
+        chunk_index: u16,
+        chunk_total: u16,
+        data: Vec<u8>,
+    ) {
+        // One lock makes observation, admission, completion and reset atomic.
+        let mut state = self.state.lock().unwrap();
+        state.prune();
+        let counters = state.observe(cid, sender, room, false);
+        tracing::debug!(%cid, peer = %sender.0, %room, chunk_index, chunk_total, len = data.len(), ?counters, "Storage: chunk received");
         if chunk_total == 0
             || chunk_total > MAX_WANT_CHUNKS
             || chunk_index >= chunk_total
             || data.len() > MAX_WANT_BLOCK_BYTES
         {
+            tracing::debug!(%cid, %room, chunk_index, reason = "invalid header or oversized chunk", "Storage: chunk rejected");
+            self.counters.rejected();
             return;
         }
-        // One lock makes admission, allocation, completion and cancellation atomic.
-        let mut state = self.state.lock().unwrap();
-        state.prune();
-        if !state.accepts(cid, sender) {
+        if !state.accepts(cid, sender, room) {
+            tracing::debug!(%cid, peer = %sender.0, %room, chunk_index, reason = "no WANT on path", "Storage: chunk rejected");
+            self.counters.rejected();
             return;
         }
-        let key = (cid.to_string(), sender.clone());
+        let key = (cid.to_string(), sender.clone(), room.to_string());
         if let Some(entry) = state.assemblies.get(&key) {
             // Never reset an assembly in response to contradictory metadata.
-            if entry.total_chunks != chunk_total || entry.chunks[chunk_index as usize].is_some() {
+            if entry.total_chunks != chunk_total {
+                tracing::debug!(%cid, peer = %sender.0, %room, chunk_index, expected_total = entry.total_chunks, chunk_total, reason = "contradictory total", "Storage: chunk rejected");
+                self.counters.rejected();
+                return;
+            }
+            if entry.chunks[chunk_index as usize].is_some() {
+                tracing::debug!(%cid, peer = %sender.0, %room, chunk_index, reason = "duplicate index", "Storage: chunk duplicate");
+                self.counters.duplicate(data.len());
                 return;
             }
             if entry.bytes + data.len() > MAX_WANT_BLOCK_BYTES {
+                tracing::debug!(%cid, %room, chunk_index, reason = "block byte limit", "Storage: chunk rejected");
+                self.counters.rejected();
                 return;
             }
         } else if state.assemblies.len() >= MAX_WANT_ASSEMBLIES {
+            tracing::debug!(%cid, %room, chunk_index, reason = "assembly count limit", "Storage: chunk rejected");
+            self.counters.rejected();
             return;
         }
         if state
@@ -200,6 +414,8 @@ impl WantRegistry {
             + data.len()
             > MAX_WANT_ASSEMBLY_BYTES
         {
+            tracing::debug!(%cid, %room, chunk_index, reason = "registry byte limit", "Storage: chunk rejected");
+            self.counters.rejected();
             return;
         }
         let entry = state
@@ -211,16 +427,25 @@ impl WantRegistry {
                 bytes: 0,
                 chunks: (0..chunk_total).map(|_| None).collect(),
             });
+        self.counters.accepted(data.len());
         entry.bytes += data.len();
         entry.chunks[chunk_index as usize] = Some(data);
         entry.received_chunks += 1;
-        if entry.received_chunks == entry.total_chunks {
+        let complete = entry.received_chunks == entry.total_chunks;
+        let assembly_received = entry.received_chunks;
+        let bytes = entry.bytes;
+        let counters = state.observe(cid, sender, room, true);
+        tracing::debug!(%cid, peer = %sender.0, %room, chunk_index, assembly_received, total = chunk_total, bytes, complete, ?counters, "Storage: chunk accepted");
+        state.advance_progress(sender);
+        if complete {
+            self.counters.completed();
+            let entry = state.assemblies.get_mut(&key).unwrap();
             let mut full = Vec::with_capacity(entry.bytes);
             for part in &mut entry.chunks {
                 full.extend_from_slice(&part.take().unwrap());
             }
             state.assemblies.remove(&key);
-            state.fulfill(cid, sender, full);
+            state.fulfill(cid, sender, room, full);
         }
     }
 
@@ -233,11 +458,105 @@ impl WantRegistry {
         });
     }
 
+    /// Senders with open WANT registrations, excluding abandoned or completed requests.
+    /// Prune with the same rules as cancellation before taking the snapshot.
+    pub fn outstanding_senders(&self) -> Vec<NodeId> {
+        let mut state = self.state.lock().unwrap();
+        state.prune();
+        state
+            .pending
+            .values()
+            .flatten()
+            .flat_map(|want| want.peers.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Subscribe after registering a WANT and before sending it. Accepted data for
+    /// any CID from this sender advances the counter, including between polls.
+    /// Unreferenced senders get a closed receiver without allocating a map entry;
+    /// live entries are bounded by the admitted wants and their candidate peers.
+    pub fn progress(&self, sender: &NodeId) -> watch::Receiver<u64> {
+        let mut state = self.state.lock().unwrap();
+        state.prune();
+        if !state
+            .pending
+            .values()
+            .flatten()
+            .any(|want| want.peers.contains(sender))
+        {
+            return watch::channel(0).1;
+        }
+        state
+            .progress
+            .entry(sender.clone())
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe()
+    }
+
+    /// Confirmed path teardown, never temporary ICE suspicion. Keep registrations
+    /// for replay, and clear only that room's assemblies (layouts may change).
+    pub fn sender_reset(&self, sender: &NodeId, room: &str) {
+        self.reset_path(Some(sender), room);
+    }
+
+    /// A whole session is gone, including routed paths whose next-hop mapping
+    /// may already have been removed with the session. Notify each attempt once.
+    pub fn room_reset(&self, room: &str) {
+        self.reset_path(None, room);
+    }
+
+    /// Observe a QUERY recipient before enqueue, without registering a WANT or
+    /// accepting bulk responses. Only live discovery observers retain entries.
+    pub(crate) fn query_path_resets(&self, room: &str, peer: &NodeId) -> watch::Receiver<u64> {
+        let mut state = self.state.lock().unwrap();
+        state.prune();
+        state
+            .query_paths
+            .entry((room.to_string(), peer.clone()))
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe()
+    }
+
+    fn reset_path(&self, sender: Option<&NodeId>, room: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.prune();
+        for ((path, peer), resets) in &state.query_paths {
+            if path == room && sender.is_none_or(|sender| sender == peer) {
+                resets.send_modify(|counter| *counter = counter.wrapping_add(1));
+            }
+        }
+        let before = state.assemblies.len();
+        state.assemblies.retain(|(_, source, path), _| {
+            path != room || sender.is_some_and(|sender| source != sender)
+        });
+        let mut affected = 0;
+        for want in state.pending.values().flatten() {
+            if sender.is_none_or(|sender| want.peers.contains(sender)) && want.paths.contains(room)
+            {
+                want.resets
+                    .send_modify(|counter| *counter = counter.wrapping_add(1));
+                affected += 1;
+                tracing::debug!(attempt = want.id, ?sender, %room, generation = *want.resets.borrow(), "Storage: attempt path reset");
+            }
+        }
+        tracing::debug!(?sender, %room, affected, assemblies = before - state.assemblies.len(), "Storage: path reset");
+    }
+
+    /// Subscribe before discovery broadcasts. Every accepted, stored HAVE or
+    /// HAVE_CHUNK advances this counter, regardless of CID or sender. A single
+    /// watch value retains progress between polls without per-discovery state.
+    pub fn any_progress(&self) -> watch::Receiver<u64> {
+        self.state.lock().unwrap().any_progress.subscribe()
+    }
+
     /// Explicitly cancel all requests for a CID. A single resolver timeout must not use this.
     pub fn cancel(&self, cid: &str) {
         let mut state = self.state.lock().unwrap();
         state.pending.remove(cid);
-        state.assemblies.retain(|(key, _), _| key != cid);
+        state.assemblies.retain(|(key, _, _), _| key != cid);
+        state.prune();
         self.peer_notifiers.lock().unwrap().remove(cid);
     }
 
@@ -254,6 +573,9 @@ impl WantRegistry {
     }
 
     pub fn register_peer(&self, cid: &str, peer_id: NodeId) {
+        self.counters
+            .have_status_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut cache = self.peer_cache.lock().unwrap();
             let peers = cache.entry(cid.to_string()).or_default();
@@ -278,16 +600,87 @@ impl WantRegistry {
     }
 }
 
+/// A validated storage frame borrowing its CID and payload from the wire bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageFrame<'a> {
+    Want {
+        cid: &'a str,
+    },
+    Have {
+        cid: &'a str,
+        data: &'a [u8],
+    },
+    Query {
+        cid: &'a str,
+    },
+    HaveStatus {
+        cid: &'a str,
+    },
+    HaveChunk {
+        cid: &'a str,
+        chunk_index: u16,
+        chunk_total: u16,
+        data: &'a [u8],
+    },
+}
+
+/// Classifies only well-formed storage frames with a valid CID. Other raw
+/// bytes belong to the application, even if their first byte is a storage tag.
+/// This checks framing, not whether HAVE bytes hash to the advertised CID.
+pub fn classify_storage_frame(raw: &[u8]) -> Option<StorageFrame<'_>> {
+    fn parse_cid(bytes: &[u8]) -> Option<&str> {
+        if bytes.len() > u8::MAX as usize {
+            return None;
+        }
+        let cid = std::str::from_utf8(bytes).ok()?;
+        crate::storage::cid::is_valid_cid(cid).then_some(cid)
+    }
+
+    let (&tag, rest) = raw.split_first()?;
+    match tag {
+        MSG_WANT => Some(StorageFrame::Want {
+            cid: parse_cid(rest)?,
+        }),
+        MSG_QUERY => Some(StorageFrame::Query {
+            cid: parse_cid(rest)?,
+        }),
+        MSG_HAVE_STATUS => Some(StorageFrame::HaveStatus {
+            cid: parse_cid(rest)?,
+        }),
+        MSG_HAVE => {
+            let (&cid_len, body) = rest.split_first()?;
+            let cid_len = cid_len as usize;
+            let cid = parse_cid(body.get(..cid_len)?)?;
+            Some(StorageFrame::Have {
+                cid,
+                data: &body[cid_len..],
+            })
+        }
+        MSG_HAVE_CHUNK => {
+            let header = raw.get(..6)?;
+            let cid_len = header[1] as usize;
+            let chunk_index = u16::from_be_bytes([header[2], header[3]]);
+            let chunk_total = u16::from_be_bytes([header[4], header[5]]);
+            if chunk_total == 0 || chunk_total > MAX_WANT_CHUNKS || chunk_index >= chunk_total {
+                return None;
+            }
+            let cid = parse_cid(raw.get(6..6 + cid_len)?)?;
+            Some(StorageFrame::HaveChunk {
+                cid,
+                chunk_index,
+                chunk_total,
+                data: &raw[6 + cid_len..],
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn parse_have_message(raw: &[u8]) -> Option<(String, Vec<u8>)> {
-    if raw.len() < 2 || raw[0] != MSG_HAVE {
-        return None;
+    match classify_storage_frame(raw)? {
+        StorageFrame::Have { cid, data } => Some((cid.to_string(), data.to_vec())),
+        _ => None,
     }
-    let cid_len = raw[1] as usize;
-    if raw.len() < 2 + cid_len {
-        return None;
-    }
-    let cid = std::str::from_utf8(&raw[2..2 + cid_len]).ok()?.to_string();
-    Some((cid, raw[2 + cid_len..].to_vec()))
 }
 
 pub fn build_have_message(cid: &str, data: &[u8]) -> Vec<u8> {
@@ -318,32 +711,28 @@ pub fn build_have_chunk_message(
 }
 
 pub fn parse_have_chunk_message(raw: &[u8]) -> Option<(String, u16, u16, Vec<u8>)> {
-    if raw.len() < 6 || raw[0] != MSG_HAVE_CHUNK {
-        return None;
+    match classify_storage_frame(raw)? {
+        StorageFrame::HaveChunk {
+            cid,
+            chunk_index,
+            chunk_total,
+            data,
+        } => Some((cid.to_string(), chunk_index, chunk_total, data.to_vec())),
+        _ => None,
     }
-
-    let cid_len = raw[1] as usize;
-    let header_end = 6 + cid_len;
-    if raw.len() < header_end {
-        return None;
-    }
-
-    let chunk_index = u16::from_be_bytes([raw[2], raw[3]]);
-    let chunk_total = u16::from_be_bytes([raw[4], raw[5]]);
-    if chunk_total == 0 || chunk_index >= chunk_total {
-        return None;
-    }
-
-    let cid = std::str::from_utf8(&raw[6..header_end]).ok()?.to_string();
-    let payload = raw[header_end..].to_vec();
-    Some((cid, chunk_index, chunk_total, payload))
 }
 
 pub fn parse_want_message(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() || raw[0] != MSG_WANT {
-        return None;
+    match classify_storage_frame(raw)? {
+        StorageFrame::Want { cid } => Some(cid.to_string()),
+        _ => None,
     }
-    std::str::from_utf8(&raw[1..]).ok().map(|s| s.to_string())
+}
+
+pub fn build_want_message(cid: &str) -> Vec<u8> {
+    let mut msg = vec![MSG_WANT];
+    msg.extend_from_slice(cid.as_bytes());
+    msg
 }
 
 pub fn build_query_message(cid: &str) -> Vec<u8> {
@@ -353,10 +742,10 @@ pub fn build_query_message(cid: &str) -> Vec<u8> {
 }
 
 pub fn parse_query_message(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() || raw[0] != MSG_QUERY {
-        return None;
+    match classify_storage_frame(raw)? {
+        StorageFrame::Query { cid } => Some(cid.to_string()),
+        _ => None,
     }
-    std::str::from_utf8(&raw[1..]).ok().map(|s| s.to_string())
 }
 
 pub fn build_have_status_message(cid: &str) -> Vec<u8> {
@@ -366,16 +755,18 @@ pub fn build_have_status_message(cid: &str) -> Vec<u8> {
 }
 
 pub fn parse_have_status_message(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() || raw[0] != MSG_HAVE_STATUS {
-        return None;
+    match classify_storage_frame(raw)? {
+        StorageFrame::HaveStatus { cid } => Some(cid.to_string()),
+        _ => None,
     }
-    std::str::from_utf8(&raw[1..]).ok().map(|s| s.to_string())
 }
 
 /// Picks the wire chunk size for one `cid`'s `HAVE_CHUNK` sends from the
 /// sending transport's best-known per-peer message ceiling. The fixed wire
 /// header, CID, and overlay envelope share that ceiling with the payload, so
-/// their overhead is subtracted here. An unknown or implausibly small limit
+/// their overhead is subtracted here. Payloads never exceed `HAVE_CHUNK_SIZE`:
+/// a negotiated ceiling is a legality bound, not an efficient SCTP message size.
+/// An unknown or implausibly small limit
 /// retains the conservative 16 KiB behavior instead of producing degenerate
 /// near-zero chunks.
 pub fn chunk_size_for_limit(cid: &str, limit: Option<u32>) -> usize {
@@ -392,7 +783,7 @@ pub fn chunk_size_for_limit(cid: &str, limit: Option<u32>) -> usize {
     };
     let overhead = HAVE_CHUNK_HEADER_LEN + cid.len() + OVERLAY_ENVELOPE_SAFETY_MARGIN;
     match (limit as usize).checked_sub(overhead) {
-        Some(usable) if usable >= MIN_CHUNK_SIZE => usable,
+        Some(usable) if usable >= MIN_CHUNK_SIZE => usable.min(HAVE_CHUNK_SIZE),
         _ => HAVE_CHUNK_SIZE,
     }
 }
@@ -433,6 +824,184 @@ pub fn build_have_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::cid::{compute_cid, MULTICODEC_RAW};
+
+    #[test]
+    fn telemetry_counts_unique_duplicate_and_rejected_admission() {
+        let counters = Arc::new(super::super::telemetry::StorageCounters::default());
+        let registry = WantRegistry {
+            counters: counters.clone(),
+            ..WantRegistry::new()
+        };
+        let sender = NodeId("peer".into());
+        let _want = registry.register_from("cid", sender.clone());
+        registry.fulfill_chunk_from("cid", &sender, 0, 2, vec![1, 2]);
+        registry.fulfill_chunk_from("cid", &sender, 0, 2, vec![1, 2]);
+        registry.fulfill_chunk_from("cid", &sender, 1, 3, vec![3]);
+        registry.fulfill_chunk_from("cid", &sender, 2, 2, vec![3]);
+        registry.fulfill_chunk_from("unknown", &sender, 0, 1, vec![3]);
+        registry.fulfill_chunk_from("cid", &sender, 1, 2, vec![3]);
+        let s = counters.snapshot();
+        assert_eq!((s.accepted_chunks, s.accepted_bytes), (2, 3));
+        assert_eq!((s.duplicate_chunks, s.duplicate_bytes), (1, 2));
+        assert_eq!(s.rejected_chunks, 3);
+        assert_eq!(s.blocks_completed, 1);
+        let _want = registry.register_from("whole", sender.clone());
+        registry.fulfill_from("whole", &sender, vec![4, 5]);
+        registry.fulfill_from("unsolicited", &sender, vec![4]);
+        let s = counters.snapshot();
+        assert_eq!((s.accepted_chunks, s.accepted_bytes), (3, 5));
+        assert_eq!(s.rejected_chunks, 4);
+        assert_eq!(s.blocks_completed, 2);
+    }
+
+    #[test]
+    fn classifier_accepts_all_storage_builders_and_borrows_payloads() {
+        let data = b"storage payload";
+        let cid = compute_cid(data, MULTICODEC_RAW);
+        let frames = [
+            (build_want_message(&cid), StorageFrame::Want { cid: &cid }),
+            (build_query_message(&cid), StorageFrame::Query { cid: &cid }),
+            (
+                build_have_status_message(&cid),
+                StorageFrame::HaveStatus { cid: &cid },
+            ),
+            (
+                build_have_message(&cid, data),
+                StorageFrame::Have { cid: &cid, data },
+            ),
+            (
+                build_have_chunk_message(&cid, 1, 2, data),
+                StorageFrame::HaveChunk {
+                    cid: &cid,
+                    chunk_index: 1,
+                    chunk_total: 2,
+                    data,
+                },
+            ),
+        ];
+        for (raw, expected) in frames {
+            assert_eq!(classify_storage_frame(&raw), Some(expected));
+            match classify_storage_frame(&raw).unwrap() {
+                StorageFrame::Have {
+                    cid: parsed_cid,
+                    data: parsed_data,
+                } => {
+                    assert_eq!(parsed_cid.as_ptr(), raw[2..].as_ptr());
+                    assert_eq!(parsed_data.as_ptr(), raw[2 + cid.len()..].as_ptr());
+                }
+                StorageFrame::HaveChunk {
+                    cid: parsed_cid,
+                    data: parsed_data,
+                    ..
+                } => {
+                    assert_eq!(parsed_cid.as_ptr(), raw[6..].as_ptr());
+                    assert_eq!(parsed_data.as_ptr(), raw[6 + cid.len()..].as_ptr());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            parse_want_message(&build_want_message(&cid)),
+            Some(cid.clone())
+        );
+        assert_eq!(
+            parse_query_message(&build_query_message(&cid)),
+            Some(cid.clone())
+        );
+        assert_eq!(
+            parse_have_status_message(&build_have_status_message(&cid)),
+            Some(cid.clone())
+        );
+        assert_eq!(
+            parse_have_message(&build_have_message(&cid, data)),
+            Some((cid.clone(), data.to_vec()))
+        );
+        assert_eq!(
+            parse_have_chunk_message(&build_have_chunk_message(&cid, 1, 2, data)),
+            Some((cid, 1, 2, data.to_vec()))
+        );
+    }
+
+    fn assert_application_frame(raw: &[u8]) {
+        assert_eq!(classify_storage_frame(raw), None, "raw: {raw:?}");
+        assert!(parse_want_message(raw).is_none());
+        assert!(parse_query_message(raw).is_none());
+        assert!(parse_have_status_message(raw).is_none());
+        assert!(parse_have_message(raw).is_none());
+        assert!(parse_have_chunk_message(raw).is_none());
+    }
+
+    #[test]
+    fn classifier_rejects_application_bytes_and_invalid_cids() {
+        for raw in [
+            b"".as_slice(),
+            b"\x01hello",
+            b"\x03",
+            b"\xff\x00\x93\x17",
+            b"application data",
+        ] {
+            assert_application_frame(raw);
+        }
+        for cid in [
+            "".to_string(),
+            "hello".into(),
+            "../../etc/passwd".into(),
+            "bABC".into(),
+            "bhello0".into(),
+            format!("b{}", "a".repeat(128)),
+            format!("b{}", "a".repeat(255)),
+        ] {
+            for raw in [
+                build_want_message(&cid),
+                build_query_message(&cid),
+                build_have_status_message(&cid),
+                build_have_message(&cid, b"data"),
+                build_have_chunk_message(&cid, 0, 1, b"data"),
+            ] {
+                assert_application_frame(&raw);
+            }
+        }
+        for tag in [MSG_WANT, MSG_QUERY, MSG_HAVE_STATUS] {
+            assert_application_frame(&[tag, 0xff]);
+            let cid = compute_cid(b"cid", MULTICODEC_RAW);
+            let mut raw = [vec![tag], cid.into_bytes()].concat();
+            raw.push(0); // Trailing bytes cannot be ignored on CID-only frames.
+            assert_application_frame(&raw);
+        }
+        assert_application_frame(&[MSG_HAVE, 1, 0xff]);
+        assert_application_frame(&[MSG_HAVE_CHUNK, 1, 0, 0, 0, 1, 0xff]);
+    }
+
+    #[test]
+    fn classifier_rejects_truncated_frames_and_invalid_chunk_headers() {
+        let cid = compute_cid(b"chunk", MULTICODEC_RAW);
+        for raw in [
+            build_have_message(&cid, b""),
+            build_have_chunk_message(&cid, 0, 1, b""),
+        ] {
+            for end in 0..raw.len() {
+                assert_application_frame(&raw[..end]);
+            }
+            assert!(classify_storage_frame(&raw).is_some());
+        }
+        for (index, total) in [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (0, MAX_WANT_CHUNKS + 1),
+            (0, u16::MAX),
+        ] {
+            assert_application_frame(&build_have_chunk_message(&cid, index, total, b"data"));
+        }
+        assert!(classify_storage_frame(&build_have_chunk_message(
+            &cid,
+            MAX_WANT_CHUNKS - 1,
+            MAX_WANT_CHUNKS,
+            b"data"
+        ))
+        .is_some());
+    }
 
     #[test]
     fn concurrent_wants_do_not_replace_each_other() {
@@ -453,6 +1022,302 @@ mod tests {
 
     fn peer(name: &str) -> NodeId {
         NodeId(name.to_string())
+    }
+
+    #[test]
+    fn room_reset_preserves_same_cid_sender_assembly_and_waiter_in_other_room() {
+        let registry = WantRegistry::new();
+        let sender = peer("shared-provider");
+        let mut main = registry.register_attempt("cid", sender.clone());
+        let mut secondary = registry.register_attempt("cid", sender.clone());
+        registry.track_path(main.id, "main");
+        registry.track_path(secondary.id, "secondary");
+        registry.fulfill_chunk_in("main", "cid", &sender, 0, 2, b"main-".to_vec());
+        registry.fulfill_chunk_in("secondary", "cid", &sender, 0, 3, b"old".to_vec());
+        let progress = registry.progress(&sender);
+        let before = *progress.borrow();
+        registry.sender_reset(&sender, "secondary");
+        assert!(!main.resets.has_changed().unwrap());
+        assert_eq!(*secondary.resets.borrow_and_update(), 1);
+        assert_eq!(*progress.borrow(), before, "reset is not storage progress");
+        assert_eq!(registry.state.lock().unwrap().assemblies.len(), 1);
+        registry.fulfill_chunk_in("main", "cid", &sender, 1, 2, b"block".to_vec());
+        assert_eq!(main.data.try_recv().unwrap(), b"main-block");
+        assert_eq!(
+            secondary.data.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        // Same-room replay may change layout; it still completes independently.
+        registry.fulfill_chunk_in("secondary", "cid", &sender, 0, 1, b"replacement".to_vec());
+        assert_eq!(secondary.data.try_recv().unwrap(), b"replacement");
+        assert!(registry.state.lock().unwrap().assemblies.is_empty());
+        assert!(registry.state.lock().unwrap().sender_activity.is_empty());
+    }
+
+    #[test]
+    fn whole_room_reset_covers_all_providers_once_and_preserves_other_room() {
+        let registry = WantRegistry::new();
+        let main = registry.register_attempt("main-cid", peer("a"));
+        registry.track_path(main.id, "main");
+        let first =
+            registry.register_attempt_for_peers("first", vec![peer("a"), peer("relay")], false);
+        let second = registry.register_attempt("second", peer("routed-provider"));
+        registry.track_path(first.id, "secondary");
+        registry.track_path(second.id, "secondary");
+        registry.fulfill_chunk_in("main", "main-cid", &peer("a"), 0, 2, vec![1]);
+        registry.fulfill_chunk_in("secondary", "first", &peer("a"), 0, 2, vec![1]);
+        registry.fulfill_chunk_in(
+            "secondary",
+            "second",
+            &peer("routed-provider"),
+            0,
+            2,
+            vec![1],
+        );
+        registry.room_reset("secondary");
+        assert!(!main.resets.has_changed().unwrap());
+        assert_eq!(*first.resets.borrow(), 1);
+        assert_eq!(*second.resets.borrow(), 1);
+        assert_eq!(registry.state.lock().unwrap().assemblies.len(), 1);
+        drop((main, first, second));
+        registry.cancel_closed();
+        assert!(registry.state.lock().unwrap().assemblies.is_empty());
+    }
+
+    #[test]
+    fn attempt_records_only_its_paths_and_counts_received_separately_from_accepted() {
+        let registry = WantRegistry::new();
+        let sender = peer("shared");
+        let mut want = registry.register_attempt("cid", sender.clone());
+        registry.track_path(want.id, "main");
+        registry.fulfill_chunk_in("secondary", "cid", &sender, 0, 2, vec![9]);
+        registry.sender_reset(&sender, "secondary");
+        assert!(!want.resets.has_changed().unwrap());
+        assert_eq!(want.progress.borrow().received, 0);
+        registry.fulfill_chunk_in("main", "cid", &sender, 0, 2, vec![1]);
+        registry.fulfill_chunk_in("main", "cid", &sender, 0, 2, vec![9]);
+        registry.fulfill_chunk_in("main", "cid", &sender, 1, 3, vec![9]);
+        assert_eq!(want.progress.borrow().received, 3);
+        assert_eq!(want.progress.borrow().accepted, 1);
+        assert!(want.progress.borrow().last_accepted.is_some());
+        // A fanout WANT uses both paths, so either path can reset that attempt.
+        registry.track_path(want.id, "secondary");
+        registry.sender_reset(&sender, "secondary");
+        assert_eq!(*want.resets.borrow_and_update(), 1);
+        registry.fulfill_chunk_in("main", "cid", &sender, 1, 2, vec![2]);
+        assert_eq!(want.data.try_recv().unwrap(), vec![1, 2]);
+        assert_eq!(want.progress.borrow().received, 4);
+        assert_eq!(want.progress.borrow().accepted, 2);
+        for i in 0..100 {
+            registry.sender_reset(&peer(&i.to_string()), "unused");
+        }
+        assert!(registry.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn query_resets_retain_room_scoped_evidence_without_wants_or_progress() {
+        let registry = WantRegistry::new();
+        let mut main = registry.query_path_resets("main", &peer("a"));
+        let same = registry.query_path_resets("main", &peer("a"));
+        let secondary = registry.query_path_resets("secondary", &peer("a"));
+        let other = registry.query_path_resets("main", &peer("b"));
+        let progress = registry.any_progress();
+        registry.sender_reset(&peer("a"), "main");
+        registry.sender_reset(&peer("a"), "main");
+        assert_eq!(*main.borrow_and_update(), 2);
+        assert!(same.has_changed().unwrap());
+        assert!(!secondary.has_changed().unwrap());
+        assert!(!other.has_changed().unwrap());
+        assert_eq!(*progress.borrow(), 0);
+        assert!(registry.outstanding_senders().is_empty());
+        // A new query after recovery observes only future resets.
+        let fresh = registry.query_path_resets("main", &peer("a"));
+        assert!(!fresh.has_changed().unwrap());
+        registry.room_reset("main");
+        assert!(main.has_changed().unwrap());
+        assert!(fresh.has_changed().unwrap());
+        assert!(other.has_changed().unwrap());
+        assert!(!secondary.has_changed().unwrap());
+        drop((main, same, secondary, other, fresh));
+        registry.cancel_closed();
+        assert!(registry.state.lock().unwrap().query_paths.is_empty());
+        registry.sender_reset(&peer("unused"), "main");
+        assert!(registry.state.lock().unwrap().query_paths.is_empty());
+    }
+
+    #[test]
+    fn resets_are_sender_scoped_retained_without_progress_and_pruned_with_wants() {
+        let registry = WantRegistry::new();
+        let first = registry.register_attempt("first", peer("a"));
+        let second = registry.register_attempt("second", peer("b"));
+        registry.track_path(first.id, "");
+        registry.track_path(second.id, "");
+        let mut resets = first.resets;
+        let other = second.resets;
+        let first = first.data;
+        let second = second.data;
+        let progress = registry.progress(&peer("a"));
+        let any_progress = registry.any_progress();
+        registry.fulfill_chunk_from("first", &peer("a"), 0, 2, vec![1]);
+        registry.fulfill_chunk_from("second", &peer("b"), 0, 2, vec![2]);
+        let before = *progress.borrow();
+        let any_before = *any_progress.borrow();
+        registry.sender_reset(&peer("a"), "");
+        registry.sender_reset(&peer("a"), "");
+        assert_eq!(*resets.borrow_and_update(), 2);
+        assert!(!other.has_changed().unwrap());
+        assert_eq!(*progress.borrow(), before);
+        assert_eq!(*any_progress.borrow(), any_before);
+        let state = registry.state.lock().unwrap();
+        assert!(!state
+            .assemblies
+            .contains_key(&("first".into(), peer("a"), String::new())));
+        assert!(state
+            .assemblies
+            .contains_key(&("second".into(), peer("b"), String::new())));
+        drop(state);
+        drop((first, second));
+        registry.cancel_closed();
+        assert!(resets.has_changed().is_err());
+        assert!(other.has_changed().is_err());
+        for i in 0..100 {
+            registry.sender_reset(&peer(&format!("unreferenced-{i}")), "");
+        }
+        assert!(registry.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn outstanding_senders_track_open_registrations_and_prune_closed_assemblies() {
+        let registry = WantRegistry::new();
+        let first = registry.register_from("first", peer("shared"));
+        let second = registry.register_from("second", peer("shared"));
+        let completed = registry.register_from("completed", peer("done"));
+        registry.fulfill_from("completed", &peer("done"), vec![1]);
+        registry.fulfill_chunk_from("first", &peer("shared"), 0, 2, vec![1]);
+        assert_eq!(registry.outstanding_senders(), [peer("shared")]);
+        drop(first);
+        assert_eq!(registry.outstanding_senders(), [peer("shared")]);
+        assert!(registry.state.lock().unwrap().assemblies.is_empty());
+        drop(second);
+        assert!(registry.outstanding_senders().is_empty());
+        assert!(registry.state.lock().unwrap().pending.is_empty());
+        assert!(registry.state.lock().unwrap().progress.is_empty());
+        drop(completed);
+    }
+
+    #[tokio::test]
+    async fn sender_progress_is_lossless_and_shared_across_cids() {
+        let registry = WantRegistry::new();
+        let sender = peer("sender");
+        let first = registry.register_from("first", sender.clone());
+        let second = registry.register_from("second", sender.clone());
+        let mut progress = registry.progress(&sender);
+        assert_eq!(*progress.borrow(), 0);
+        registry.fulfill_chunk_from("first", &sender, 0, 2, vec![1]);
+        registry.fulfill_from("second", &sender, vec![2]);
+        // Both updates happened before changed() was polled; neither is lost.
+        progress.changed().await.unwrap();
+        assert_eq!(*progress.borrow_and_update(), 2);
+        assert_eq!(second.await.unwrap(), vec![2]);
+        registry.fulfill_chunk_from("first", &sender, 1, 2, vec![3]);
+        progress.changed().await.unwrap();
+        assert_eq!(*progress.borrow(), 3);
+        assert_eq!(first.await.unwrap(), vec![1, 3]);
+        assert!(registry.state.lock().unwrap().progress.is_empty());
+    }
+
+    #[tokio::test]
+    async fn registry_progress_is_lossless_across_senders_and_survives_pruning() {
+        let registry = WantRegistry::new();
+        let mut progress = registry.any_progress();
+        let first = registry.register_from("first", peer("one"));
+        let second = registry.register_from("second", peer("two"));
+        registry.fulfill_chunk_from("first", &peer("one"), 0, 2, vec![1]);
+        registry.fulfill_from("second", &peer("two"), vec![2]);
+        progress.changed().await.unwrap();
+        assert_eq!(*progress.borrow_and_update(), 2);
+        assert_eq!(second.await.unwrap(), vec![2]);
+        registry.fulfill_chunk_from("first", &peer("one"), 1, 2, vec![3]);
+        assert_eq!(first.await.unwrap(), vec![1, 3]);
+        registry.cancel_closed();
+        progress.changed().await.unwrap();
+        assert_eq!(*progress.borrow_and_update(), 3);
+        assert!(registry.state.lock().unwrap().progress.is_empty());
+        assert!(!progress.has_changed().unwrap());
+        let third = registry.register_from("third", peer("three"));
+        registry.fulfill_from("third", &peer("three"), vec![4]);
+        assert_eq!(third.await.unwrap(), vec![4]);
+        progress.changed().await.unwrap();
+        assert_eq!(*progress.borrow(), 4);
+    }
+
+    #[test]
+    fn rejected_and_duplicate_data_do_not_advance_progress() {
+        let registry = WantRegistry::new();
+        let sender = peer("sender");
+        let _want = registry.register_from("cid", sender.clone());
+        let progress = registry.progress(&sender);
+        let any_progress = registry.any_progress();
+        registry.fulfill_chunk_from("cid", &sender, 0, 2, vec![0; MAX_WANT_BLOCK_BYTES]);
+        assert_eq!(*progress.borrow(), 1);
+        registry.fulfill_chunk_from("cid", &sender, 0, 2, vec![1]); // Duplicate.
+        registry.fulfill_chunk_from("cid", &sender, 1, 3, vec![1]); // Contradictory total.
+        registry.fulfill_chunk_from("cid", &sender, 1, 2, vec![1]); // Block byte bound.
+        registry.fulfill_chunk_from("cid", &sender, 0, 0, vec![1]);
+        registry.fulfill_chunk_from("cid", &sender, 0, MAX_WANT_CHUNKS + 1, vec![1]);
+        registry.fulfill_chunk_from("cid", &sender, 2, 2, vec![1]);
+        registry.fulfill_from("cid", &sender, vec![0; MAX_WANT_BLOCK_BYTES + 1]);
+        registry.fulfill_from("unrequested", &sender, vec![1]);
+        registry.fulfill_from("cid", &peer("other"), vec![1]);
+        assert_eq!(*progress.borrow(), 1);
+        assert_eq!(*any_progress.borrow(), 1);
+        assert!(!registry
+            .state
+            .lock()
+            .unwrap()
+            .progress
+            .contains_key(&peer("other")));
+    }
+
+    #[test]
+    fn progress_entries_are_bounded_by_live_wants_and_reclaimed() {
+        let registry = WantRegistry::new();
+        let mut wants = Vec::new();
+        for i in 0..MAX_PENDING_WANTS {
+            let sender = peer(&format!("sender-{i}"));
+            wants.push(registry.register_from("cid", sender.clone()));
+            let _progress = registry.progress(&sender);
+        }
+        for i in 0..2 * MAX_WANT_PEERS {
+            let sender = peer(&format!("unreferenced-{i}"));
+            assert!(registry.progress(&sender).has_changed().is_err());
+            registry.fulfill_chunk_from("cid", &sender, 0, 2, vec![1]);
+        }
+        assert_eq!(
+            registry.state.lock().unwrap().progress.len(),
+            MAX_PENDING_WANTS
+        );
+        let rejected = registry.register_from("overflow", peer("overflow"));
+        assert!(registry.progress(&peer("overflow")).has_changed().is_err());
+        drop(rejected);
+        wants.truncate(MAX_PENDING_WANTS / 2);
+        registry.cancel_closed();
+        assert_eq!(
+            registry.state.lock().unwrap().progress.len(),
+            MAX_PENDING_WANTS / 2
+        );
+        drop(wants);
+        registry.cancel_closed();
+        assert!(registry.state.lock().unwrap().progress.is_empty());
+
+        let _first = registry.register_from("first", peer("shared"));
+        let _second = registry.register_from("second", peer("shared"));
+        let progress = registry.progress(&peer("shared"));
+        registry.cancel("first");
+        assert!(progress.has_changed().is_ok());
+        registry.cancel("second");
+        assert!(progress.has_changed().is_err());
+        assert!(registry.state.lock().unwrap().progress.is_empty());
     }
 
     #[test]
@@ -504,12 +1369,11 @@ mod tests {
             let cid = format!("cid-{i}");
             wants.push(registry.register(&cid));
             registry.fulfill_chunk(&cid, 0, MAX_WANT_CHUNKS + 1, vec![1]);
-            assert!(!registry
-                .state
-                .lock()
-                .unwrap()
-                .assemblies
-                .contains_key(&(cid.clone(), peer(""))));
+            assert!(!registry.state.lock().unwrap().assemblies.contains_key(&(
+                cid.clone(),
+                peer(""),
+                String::new()
+            )));
             registry.fulfill_chunk(&cid, 0, 2, vec![0; MAX_WANT_BLOCK_BYTES]);
             registry.fulfill_chunk(&cid, 1, 2, vec![1]);
         }
@@ -574,24 +1438,20 @@ mod tests {
     }
 
     #[test]
-    fn chunk_size_uses_realistic_negotiated_limit_without_exceeding_it() {
-        const LIMIT: u32 = 262_144;
+    fn chunk_size_caps_large_negotiated_limits_but_honors_smaller_usable_limits() {
         const HEADER_LEN: usize = 6;
         const ENVELOPE_MARGIN: usize = 512;
         let cid = "bafy-short-cid";
-        let chunk_size = chunk_size_for_limit(cid, Some(LIMIT));
-
+        for limit in [65_536, 262_144, u32::MAX] {
+            let size = chunk_size_for_limit(cid, Some(limit));
+            assert_eq!(size, HAVE_CHUNK_SIZE);
+            assert!(size + HEADER_LEN + cid.len() + ENVELOPE_MARGIN <= limit as usize);
+        }
+        let small = 4096;
         assert_eq!(
-            chunk_size + HEADER_LEN + cid.len() + ENVELOPE_MARGIN,
-            LIMIT as usize
+            chunk_size_for_limit(cid, Some(small)),
+            small as usize - HEADER_LEN - cid.len() - ENVELOPE_MARGIN
         );
-    }
-
-    #[test]
-    fn measured_limit_still_increases_chunk_size_with_envelope_margin() {
-        let chunk_size = chunk_size_for_limit("bafy-short-cid", Some(262_144));
-
-        assert!(chunk_size > HAVE_CHUNK_SIZE);
     }
 
     #[test]
@@ -609,15 +1469,37 @@ mod tests {
     }
 
     #[test]
+    fn one_mib_in_64_chunks_reassembles_with_the_existing_wire_layout() {
+        let data = vec![42; 1024 * 1024];
+        let cid = compute_cid(&data, MULTICODEC_RAW);
+        let sender = peer("provider");
+        let registry = WantRegistry::new();
+        let mut block = registry.register_from(&cid, sender.clone());
+        let chunk_size = chunk_size_for_limit(&cid, Some(65_536));
+        let total = have_chunk_count(data.len(), chunk_size).unwrap();
+        assert_eq!(total, 64);
+        assert!(total <= MAX_WANT_CHUNKS);
+        // Out-of-order delivery and one duplicate exercise unchanged admission.
+        for index in (0..total).rev().chain(std::iter::once(1)) {
+            let raw = build_have_payload(&cid, &data, index, total, chunk_size);
+            let (parsed_cid, parsed_index, parsed_total, payload) =
+                parse_have_chunk_message(&raw).unwrap();
+            assert!(payload.len() <= HAVE_CHUNK_SIZE);
+            registry.fulfill_chunk_from(&parsed_cid, &sender, parsed_index, parsed_total, payload);
+        }
+        assert_eq!(block.try_recv().unwrap(), data);
+    }
+
+    #[test]
     fn variable_chunk_size_round_trips_across_wire_messages() {
-        let cid = "bafy-variable-chunks";
+        let cid = compute_cid(b"variable-chunks", MULTICODEC_RAW);
         let chunk_size = 7;
         let data: Vec<u8> = (0..31).collect();
         let total_chunks = have_chunk_count(data.len(), chunk_size).expect("block should fit");
         let mut reassembled = Vec::with_capacity(data.len());
 
         for chunk_index in 0..total_chunks {
-            let message = build_have_payload(cid, &data, chunk_index, total_chunks, chunk_size);
+            let message = build_have_payload(&cid, &data, chunk_index, total_chunks, chunk_size);
             let (parsed_cid, parsed_index, parsed_total, payload) =
                 parse_have_chunk_message(&message).expect("chunk message should parse");
             assert_eq!(parsed_cid, cid);

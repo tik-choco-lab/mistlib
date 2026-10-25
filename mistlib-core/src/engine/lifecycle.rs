@@ -61,6 +61,7 @@ impl MistEngine {
     }
 
     fn prepare_leave(&self) -> Option<LeaveCleanup> {
+        self.close_send_queues();
         self.run_generation.fetch_add(1, AtomicOrdering::Relaxed);
 
         let cleanup = {

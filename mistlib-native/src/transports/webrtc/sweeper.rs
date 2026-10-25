@@ -58,53 +58,36 @@ pub(crate) fn reservation_reap_allowed(reserved_at: Option<Instant>, gate_ms: u6
 
 use super::{DisconnectGrace, GraceOrigin, Peer, WebRtcTransport, DATA_CHANNEL_OPEN_TIMEOUT_MS};
 
-/// Outcome of evaluating a peer's disconnect grace against its actual health.
-/// Pure (no lock/`RTCPeerConnection` access) so the `LivenessSuspect`
-/// false-positive suppression below is exhaustively unit-testable without
-/// mocking a real `RTCPeerConnection` -- see `GraceOrigin`'s doc for why the
-/// distinction exists: a liveness-suspect grace can start against a peer
-/// whose SCTP association (and every data channel except the best-effort
-/// ping one) never actually had a problem.
+/// Pure disconnect-grace decision. Terminal states override traffic; otherwise
+/// grace expires only after a full window of inbound silence. A healthy peer
+/// can still clear a missed-PONG false positive through the existing recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GraceExpiryDecision {
-    /// No grace is running, or it hasn't reached the grace duration yet.
     Wait,
-    /// Grace expired, but the peer looks genuinely healthy (only possible for
-    /// a `LivenessSuspect`-origin grace): restore `Connected` instead of
-    /// tearing the session down.
+    ExtendedByTraffic,
     RecoverFalsePositive,
-    /// Grace expired and the peer is still unhealthy, or this is an
-    /// `Ice`-origin grace (never second-guessed against the live pc state) --
-    /// reap as before.
     Reap,
 }
 
-/// Decides what the sweeper should do about `node`'s disconnect grace, if
-/// any. `grace` is a snapshot of `disconnected_since[node]`; `pc_state` and
-/// `has_required_data_channel` are the sweeper's own live reads of the actual
-/// `RTCPeerConnection`/data-channel state for the same node.
-///
-/// Only a `LivenessSuspect`-origin grace is ever second-guessed: an
-/// `Ice`-origin grace means the peer connection itself already reported
-/// `Disconnected`, so there is nothing to re-validate. A `LivenessSuspect`
-/// grace, by contrast, is started purely on a missed-PONG heuristic
-/// (`OverlayAction::SuspectDisconnected`, mistlib-core's `stats::ping`) that
-/// runs over the best-effort `Unreliable` channel (`max_retransmits: Some(0)`)
-/// and never itself inspects the real peer connection -- packet loss on that
-/// one channel alone is not evidence that the `ReliableOrdered` channel
-/// actually carrying application data (e.g. a tunneled SSH session) is
-/// unhealthy. Reaping on that signal alone tears down a perfectly good
-/// connection; this lets the sweeper re-check reality before doing so.
 pub(crate) fn decide_grace_expiry(
     grace: Option<DisconnectGrace>,
     pc_state: RTCPeerConnectionState,
     has_required_data_channel: bool,
+    last_rx: Option<Instant>,
+    now: Instant,
     grace_ms: u64,
 ) -> GraceExpiryDecision {
+    if matches!(
+        pc_state,
+        RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+    ) {
+        return GraceExpiryDecision::Reap;
+    }
     let Some(grace) = grace else {
         return GraceExpiryDecision::Wait;
     };
-    if grace.started_at.elapsed() < Duration::from_millis(grace_ms) {
+    let window = Duration::from_millis(grace_ms);
+    if now.saturating_duration_since(grace.started_at) < window {
         return GraceExpiryDecision::Wait;
     }
     if grace.origin == GraceOrigin::LivenessSuspect
@@ -112,6 +95,9 @@ pub(crate) fn decide_grace_expiry(
         && has_required_data_channel
     {
         return GraceExpiryDecision::RecoverFalsePositive;
+    }
+    if last_rx.is_some_and(|rx| now.saturating_duration_since(rx.max(grace.started_at)) < window) {
+        return GraceExpiryDecision::ExtendedByTraffic;
     }
     GraceExpiryDecision::Reap
 }
@@ -307,7 +293,7 @@ impl WebRtcTransport {
                     sender_id: handles.local_node_id.clone(),
                     receiver_id: node.clone(),
                     room_id: handles.room_id.clone(),
-                    data: local_desc.sdp,
+                    data: super::signaling::negotiation_data(local_desc.sdp),
                     signaling_type: SignalingType::Offer,
                 });
                 if let Err(err) = handles.signaler.send_signaling(&node, msg).await {
@@ -381,6 +367,42 @@ impl WebRtcTransport {
                     continue;
                 }
                 last_sweep = Instant::now();
+
+                // One bounded stats pass at the existing sweep cadence. Sampling
+                // concurrently prevents a slow send from multiplying the budget
+                // by the number of peers. Cancellation drops every in-flight call.
+                let established: Vec<_> = {
+                    let peers = handles.peers.read().await;
+                    let established = handles.established_at.read().unwrap();
+                    peers
+                        .iter()
+                        .filter(|(node, _)| established.contains_key(*node))
+                        .map(|(node, peer)| (node.clone(), peer.clone()))
+                        .collect()
+                };
+                let samples = tokio::select! {
+                    biased;
+                    _ = cancel_for_task.cancelled() => break,
+                    samples = futures_util::future::join_all(established.into_iter().map(|(node, peer)| async move {
+                        let sample = super::stats::transport_received_bytes(&peer).await;
+                        (node, peer, sample)
+                    })) => samples,
+                };
+                for (node, peer, sample) in samples {
+                    // A replacement for the same NodeId must never inherit the
+                    // old association's bytes or its suspect-clear side effect.
+                    let current = handles.peers.read().await;
+                    if !current.get(&node).is_some_and(|p| Arc::ptr_eq(p, &peer)) {
+                        continue;
+                    }
+                    if let Some((id, bytes)) = sample {
+                        if peer.inbound_activity.record_transport_bytes(&id, bytes)
+                            && mistlib_core::stats::STATS.note_inbound_activity(&node)
+                        {
+                            handles.clear_suspect(&node);
+                        }
+                    }
+                }
 
                 {
                     let ttl = Duration::from_millis(last_disconnect_ttl_ms);
@@ -600,8 +622,20 @@ impl WebRtcTransport {
                         grace_snapshot,
                         pc_state,
                         has_required_data_channel,
+                        peer.inbound_activity.last_rx(),
+                        Instant::now(),
                         disconnected_grace_ms,
                     );
+                    if grace_decision == GraceExpiryDecision::ExtendedByTraffic
+                        && grace_snapshot.is_some_and(|grace| {
+                            peer.inbound_activity.log_extension_once(grace.started_at)
+                        })
+                    {
+                        tracing::debug!(
+                            "[Sweeper] disconnected grace extended by inbound traffic for {}",
+                            node
+                        );
+                    }
                     if grace_decision == GraceExpiryDecision::RecoverFalsePositive {
                         // The missed-PONG heuristic that started this grace
                         // (mistlib-core's `stats::ping`) only ever watches the
@@ -623,7 +657,8 @@ impl WebRtcTransport {
                         handles.recover_connected_from_grace(&node);
                         continue;
                     }
-                    let disconnected_grace_expired = grace_decision == GraceExpiryDecision::Reap;
+                    let disconnected_grace_expired =
+                        !failed_or_closed && grace_decision == GraceExpiryDecision::Reap;
                     let data_channel_open_timeout = Self::data_channel_open_timeout();
                     let missing_required_channel = !has_required_data_channel
                         && handles

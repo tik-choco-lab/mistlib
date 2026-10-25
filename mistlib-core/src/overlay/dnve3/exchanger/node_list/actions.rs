@@ -41,6 +41,7 @@ impl DNVE3Exchanger {
             to: to.clone(),
             data: bytes::Bytes::from(data),
             method: DeliveryMethod::ReliableOrdered,
+            lane: crate::action::SendLane::Control,
         })
     }
 
@@ -84,6 +85,7 @@ impl DNVE3Exchanger {
             to,
             data: bytes::Bytes::from(data),
             method: DeliveryMethod::ReliableOrdered,
+            lane: crate::action::SendLane::Control,
         })
     }
 }

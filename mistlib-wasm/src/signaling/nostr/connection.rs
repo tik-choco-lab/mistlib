@@ -119,14 +119,16 @@ impl WasmNostrSignaler {
         let open_tx_cb = open_tx.clone();
         let onopen_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
             if !subscribe_signaler.reconnect_epoch_matches(epoch) {
-                if let Some(tx) = open_tx_cb.borrow_mut().take() {
+                let tx = open_tx_cb.borrow_mut().take();
+                if let Some(tx) = tx {
                     let _ = tx.send(Err("stale reconnect epoch".to_string()));
                 }
                 return;
             }
             if let Some(room_id) = subscribe_signaler.room_id() {
                 if let Err(err) = subscribe_signaler.send_subscriptions(&subscribe_ws, &room_id) {
-                    if let Some(tx) = open_tx_cb.borrow_mut().take() {
+                    let tx = open_tx_cb.borrow_mut().take();
+                    if let Some(tx) = tx {
                         let _ = tx.send(Err(err.to_string()));
                     }
                     return;
@@ -140,7 +142,8 @@ impl WasmNostrSignaler {
                     );
                 }
             }
-            if let Some(tx) = open_tx_cb.borrow_mut().take() {
+            let tx = open_tx_cb.borrow_mut().take();
+            if let Some(tx) = tx {
                 let _ = tx.send(Ok(()));
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
@@ -151,7 +154,8 @@ impl WasmNostrSignaler {
         let error_signaler = self.clone();
         let error_ws = ws.clone();
         let onerror_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            if let Some(tx) = open_tx_cb.borrow_mut().take() {
+            let tx = open_tx_cb.borrow_mut().take();
+            if let Some(tx) = tx {
                 error_signaler.remove_socket(&error_ws);
                 let _ = error_ws.close();
                 let _ = tx.send(Err("websocket failed to open".to_string()));
@@ -166,7 +170,8 @@ impl WasmNostrSignaler {
         let reconnect_relay = relay.clone();
         let close_ws = ws.clone();
         let onclose_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            if let Some(tx) = open_tx_cb.borrow_mut().take() {
+            let tx = open_tx_cb.borrow_mut().take();
+            if let Some(tx) = tx {
                 signaler.remove_socket(&close_ws);
                 let _ = tx.send(Err("websocket closed before opening".to_string()));
                 return;

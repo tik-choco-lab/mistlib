@@ -4,7 +4,11 @@ use super::{
     EVENT_ROOM_JOIN_FAILED, EVENT_ROOM_LEFT,
 };
 use mistlib_core::engine::{EngineEvent, EngineEventHandler};
+use mistlib_core::storage::protocol::StorageFrame;
 use mistlib_core::types::NodeId;
+
+mod storage_frame;
+use storage_frame::classify_raw_message;
 use wasm_bindgen::prelude::*;
 
 /// One per session (see `layers::wasm_l0::build_session`), closing over that
@@ -23,8 +27,11 @@ impl WasmEngineEventHandler {
 
 impl EngineEventHandler for WasmEngineEventHandler {
     fn on_event(&self, event: EngineEvent) {
-        if let EngineEvent::RawMessage(from, data) = &event {
-            handle_storage_control_message(&self.room_id, from, data);
+        if let Some(frame) = classify_raw_message(&event) {
+            if let EngineEvent::RawMessage(from, _) = &event {
+                handle_storage_control_message(&self.room_id, from, frame);
+            }
+            return;
         }
 
         let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
@@ -65,53 +72,30 @@ fn dispatch_event(
     let _ = f.apply(&JsValue::NULL, &args);
 }
 
-fn handle_storage_control_message(room_id: &str, from: &NodeId, data: &[u8]) {
-    let Some((&first, rest)) = data.split_first() else {
-        return;
-    };
-
-    match first {
-        0x01 => {
-            if let Ok(cid) = std::str::from_utf8(rest) {
-                crate::storage::handle_want(room_id.to_string(), from.clone(), cid.to_string());
-            }
+fn handle_storage_control_message(room_id: &str, from: &NodeId, frame: StorageFrame<'_>) {
+    match frame {
+        StorageFrame::Want { cid } => {
+            crate::storage::handle_want(room_id.to_string(), from.clone(), cid.to_string());
         }
-        0x02 => handle_storage_have(from, rest),
-        0x03 => {
-            if let Ok(cid) = std::str::from_utf8(rest) {
-                crate::storage::handle_query(room_id.to_string(), from.clone(), cid.to_string());
-            }
+        StorageFrame::Have { cid, data } => {
+            crate::storage::WANT_REGISTRY.with(|r| r.fulfill_in(room_id, cid, from, data.to_vec()));
         }
-        0x04 => {
-            if let Ok(cid) = std::str::from_utf8(rest) {
-                crate::storage::handle_have_status(from.clone(), cid.to_string());
-            }
+        StorageFrame::Query { cid } => {
+            crate::storage::handle_query(room_id.to_string(), from.clone(), cid.to_string());
         }
-        0x05 => {
-            if let Some((cid, chunk_index, chunk_total, payload)) =
-                crate::storage::resolver::parse_have_chunk_message(data)
-            {
-                crate::storage::WANT_REGISTRY.with(|r| {
-                    r.fulfill_chunk_from(&cid, from, chunk_index, chunk_total, payload);
-                });
-            }
+        StorageFrame::HaveStatus { cid } => {
+            crate::storage::handle_have_status(from.clone(), cid.to_string());
         }
-        _ => {}
-    }
-}
-
-fn handle_storage_have(from: &NodeId, rest: &[u8]) {
-    let Some((&cid_len, body)) = rest.split_first() else {
-        return;
-    };
-    let cid_len = cid_len as usize;
-    if body.len() < cid_len {
-        return;
-    }
-
-    if let Ok(cid) = std::str::from_utf8(&body[..cid_len]) {
-        let payload = body[cid_len..].to_vec();
-        crate::storage::handle_have_from(from.clone(), cid.to_string(), payload);
+        StorageFrame::HaveChunk {
+            cid,
+            chunk_index,
+            chunk_total,
+            data,
+        } => {
+            crate::storage::WANT_REGISTRY.with(|r| {
+                r.fulfill_chunk_in(room_id, cid, from, chunk_index, chunk_total, data.to_vec());
+            });
+        }
     }
 }
 
@@ -125,6 +109,7 @@ pub fn emit_peer_connected(node_id: NodeId, room_id: String) {
 }
 
 pub fn emit_peer_disconnected(node_id: NodeId, room_id: String) {
+    reset_storage_senders(&room_id, &node_id);
     // Per-session (multi-room contract point 9): only the affected room's
     // transport/engine react, not every joined room's.
     if let Some(webrtc) = crate::app::session_webrtc(&room_id) {
@@ -143,6 +128,36 @@ pub fn emit_peer_disconnected(node_id: NodeId, room_id: String) {
             dispatch_event(&f, EVENT_PEER_DISCONNECTED, &node_id.0, &[], &room_id);
         });
     }
+}
+
+/// Called for teardown and replacement, including paths that detach browser
+/// callbacks. Remove stale routes before resolvers check reachability.
+pub(crate) fn reset_storage_senders(room_id: &str, node_id: &NodeId) {
+    crate::storage::WANT_REGISTRY.with(|registry| {
+        let mut affected = vec![node_id.clone()];
+        if let Some(ctx) = crate::app::session_running_ctx(room_id) {
+            if let Some(overlay) = ctx.overlay.as_ref() {
+                let senders = registry.outstanding_senders();
+                let mut rt = overlay.routing_table.lock().unwrap();
+                affected.extend(senders.into_iter().filter(|sender| {
+                    sender != node_id && rt.get_next_hop(sender).as_ref() == Some(node_id)
+                }));
+                rt.on_disconnected(node_id);
+            }
+        }
+        for sender in affected {
+            registry.sender_reset(&sender, room_id);
+        }
+    });
+}
+
+pub(crate) fn reset_storage_room(room_id: &str) {
+    if let Some(ctx) = crate::app::session_running_ctx(room_id) {
+        if let Some(overlay) = ctx.overlay.as_ref() {
+            *overlay.routing_table.lock().unwrap() = Default::default();
+        }
+    }
+    crate::storage::WANT_REGISTRY.with(|registry| registry.room_reset(room_id));
 }
 
 /// Fires once a `join_room`/`join_room_async` call for `room_id` has left
@@ -204,4 +219,79 @@ pub fn register_event_callback(callback: &js_sys::Function) {
     EVENT_CALLBACK.with(|cb| {
         *cb.borrow_mut() = Some(callback.clone());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn secondary_disconnect_preserves_main_room_storage_assembly() {
+        let provider = NodeId("w15-shared-provider".into());
+        crate::storage::WANT_REGISTRY.with(|registry| {
+            let mut main = registry.register_attempt("w15-cross-room", provider.clone());
+            let mut secondary = registry.register_attempt("w15-cross-room", provider.clone());
+            registry.track_path(main.id, "w15-main");
+            registry.track_path(secondary.id, "w15-secondary");
+            registry.fulfill_chunk_in(
+                "w15-main",
+                "w15-cross-room",
+                &provider,
+                0,
+                2,
+                b"main-".to_vec(),
+            );
+            registry.fulfill_chunk_in(
+                "w15-secondary",
+                "w15-cross-room",
+                &provider,
+                0,
+                3,
+                b"old".to_vec(),
+            );
+            emit_peer_disconnected(provider.clone(), "w15-secondary".into());
+            assert!(!main.resets.has_changed().unwrap());
+            assert_eq!(*secondary.resets.borrow(), 1);
+            registry.fulfill_chunk_in(
+                "w15-main",
+                "w15-cross-room",
+                &provider,
+                1,
+                2,
+                b"block".to_vec(),
+            );
+            assert_eq!(main.data.try_recv().unwrap(), b"main-block");
+            registry.fulfill_chunk_in(
+                "w15-secondary",
+                "w15-cross-room",
+                &provider,
+                0,
+                1,
+                b"replay".to_vec(),
+            );
+            assert_eq!(secondary.data.try_recv().unwrap(), b"replay");
+            registry.cancel_closed();
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn disconnect_notifies_storage_without_a_host_callback() {
+        let node = NodeId("w13-disconnected-provider".into());
+        crate::storage::WANT_REGISTRY.with(|registry| {
+            let registration = registry.register_attempt("w13-disconnect-event", node.clone());
+            registry.track_path(registration.id, "w13-missing-room");
+            let mut want = registration.data;
+            let resets = registration.resets;
+            emit_peer_disconnected(node, "w13-missing-room".into());
+            assert!(resets.has_changed().unwrap());
+            assert_eq!(*resets.borrow(), 1);
+            assert!(matches!(
+                want.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            drop(want);
+            registry.cancel_closed();
+        });
+    }
 }

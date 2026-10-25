@@ -183,6 +183,7 @@ impl DNVE3Exchanger {
             to: target.clone(),
             data: bytes::Bytes::from(data),
             method: DeliveryMethod::Unreliable,
+            lane: crate::action::SendLane::Control,
         })
     }
 

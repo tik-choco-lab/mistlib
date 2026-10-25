@@ -92,6 +92,8 @@ async fn teardown(ctx: &SessionCtx) {
     if let Some(wt) = ctx.webrtc_transport.as_ref() {
         wt.close_all_peer_connections().await;
         wt.stop_session_sweeper();
+    } else {
+        crate::storage::WANT_REGISTRY.room_reset(&ctx.room_id);
     }
     if let Some(signaler) = ctx.bootstrap_signaler.as_ref() {
         if let Err(err) = signaler.close().await {

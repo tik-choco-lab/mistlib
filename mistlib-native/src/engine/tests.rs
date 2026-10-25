@@ -257,17 +257,10 @@ pub(crate) mod session_registry {
     }
 }
 
-/// Regression coverage for the self-inflicted reordering bug described in
-/// the reorder-reliability notes: `handle_action_for` used to spawn an
-/// independent `tokio::task` per `OverlayAction::SendMessage`, so N
-/// sequential (non-concurrent) calls from the *same* caller -- exactly how
-/// `SessionActionHandler::handle_action` (`layers/native_l0/init.rs`) is
-/// actually invoked, one action at a time, in the order `OverlayRouter`
-/// produced them -- could still have their underlying `dc.send()` calls
-/// execute out of order, since `tokio::spawn` makes no ordering guarantee
-/// between independently spawned tasks. This exercises that exact call
-/// pattern: `ENGINE.handle_action_for` called back-to-back, synchronously, no
-/// spawning at the call site.
+/// Sequential action calls must preserve enqueue order without per-send task
+/// spawning. Concurrent sequence stamping is covered separately by
+/// `transports::webrtc::tests::send_queues`, where app and OverlayTransport
+/// senders share the router's sequence critical section.
 mod action_ordering {
     use super::session_registry::{session_with_webrtc_transport, REGISTRY_TEST_LOCK};
     use super::*;
@@ -334,9 +327,9 @@ mod action_ordering {
         let ctx = session_with_webrtc_transport(&room_id, ta.clone());
         assert!(ENGINE.insert_session(room_id.clone(), ctx.clone()).await);
 
-        // The real call pattern this reproduces: `SessionActionHandler::handle_action`
-        // is called synchronously, once per action, in the order `OverlayRouter`
-        // produced them -- never concurrently from independently spawned
+        // Exercise sequential action calls. Concurrent production senders use
+        // `SessionActionHandler::try_dispatch_send` under the router lock;
+        // this regression deliberately does not launch independently spawned
         // callers. No `tokio::spawn` here at all, deliberately.
         const COUNT: u32 = 200;
         for i in 0..COUNT {
@@ -346,6 +339,7 @@ mod action_ordering {
                     to: id_b.clone(),
                     data: Bytes::copy_from_slice(&i.to_be_bytes()),
                     method: DeliveryMethod::ReliableOrdered,
+                    lane: mistlib_core::action::SendLane::General,
                 },
             );
         }

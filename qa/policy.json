@@ -2,7 +2,14 @@
   "schema": 1,
   "nativeTargets": ["linux-x86_64", "windows-x86_64", "macos-aarch64"],
   "browsers": ["chromium", "firefox"],
-  "phases": ["delivery", "aoi", "multi-room", "leave-rejoin", "relay-outage", "peer-restart", "storage", "soak"],
+  "phases": ["delivery", "aoi", "multi-room", "leave-rejoin", "relay-outage", "peer-restart", "storage", "storage-wan", "soak"],
+  "wanStorage": {
+    "bytes": 4194305,
+    "delayMs": 150,
+    "rateKbit": 1000,
+    "queueMs": 200,
+    "deadlineMs": 240000
+  },
   "messagesPerDirection": 32,
   "connectionDeadlineMs": 30000,
   "deliveryDeadlineMs": 10000,

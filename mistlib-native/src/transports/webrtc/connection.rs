@@ -27,10 +27,38 @@ impl WebRtcTransport {
         let channels: Arc<
             tokio::sync::RwLock<HashMap<DeliveryMethod, Arc<webrtc::data_channel::RTCDataChannel>>>,
         > = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let send_tx =
-            Peer::spawn_send_queue(remote_id.clone(), channels.clone(), cancel_token.clone());
+        let unordered_channel = Arc::new(tokio::sync::RwLock::new(None));
+        let pacing = super::pacing::NativePacing::new(&self.storage_transfer.read().unwrap());
+        if let Some(pacing) = &pacing {
+            pacing.spawn_observer(
+                remote_id.clone(),
+                channels.clone(),
+                unordered_channel.clone(),
+                cancel_token.clone(),
+            );
+        }
+        let send_tx = Peer::spawn_send_queue(
+            remote_id.clone(),
+            channels.clone(),
+            cancel_token.clone(),
+            self.storage_transfer.read().unwrap().control_priority,
+            unordered_channel.clone(),
+            pacing.clone(),
+        );
+        if let Some(pacing) = &pacing {
+            self.bulk_budgets
+                .lock()
+                .unwrap()
+                .entry(remote_id.clone())
+                .or_default()
+                .push((send_tx.downgrade(), pacing.budget.clone()));
+        }
         let peer = Arc::new(Peer {
+            pacing,
+            unordered_capability: Default::default(),
+            unordered_channel,
             pc: pc.clone(),
+            inbound_activity: super::disconnect_grace::InboundActivity::new(),
             channels,
             cancel_token: cancel_token.clone(),
             local_offer_unsent: std::sync::atomic::AtomicBool::new(false),
@@ -39,6 +67,7 @@ impl WebRtcTransport {
             send_tx,
         });
 
+        peer.unordered_capability.set_local(true);
         let event_tx = self.spawn_event_forwarder(cancel_token.clone());
 
         let media_tx = self.media_tx.lock().unwrap().clone();
@@ -175,11 +204,47 @@ impl WebRtcTransport {
         })
     }
 
+    pub(crate) async fn open_reliable_unordered(&self, node: &NodeId, peer: &Arc<Peer>) {
+        if !peer.unordered_capability.begin_open() {
+            return;
+        }
+        let init = RTCDataChannelInit {
+            ordered: Some(false),
+            ..Default::default()
+        };
+        match peer
+            .pc
+            .create_data_channel(
+                mistlib_core::transport::reliable_unordered::RELIABLE_UNORDERED_LABEL,
+                Some(init),
+            )
+            .await
+        {
+            Ok(dc) => {
+                *peer.unordered_channel.write().await = Some(dc.clone());
+                Peer::setup_dc_handlers(
+                    dc,
+                    self.spawn_event_forwarder(peer.cancel_token.clone()),
+                    node.clone(),
+                    peer.cancel_token.clone(),
+                    self.peer_handles(),
+                    Arc::downgrade(peer),
+                )
+                .await;
+            }
+            Err(error) => {
+                peer.unordered_capability.disable();
+                tracing::debug!(%error, "Storage bulk channel setup failed; using reliable");
+            }
+        }
+    }
+
     async fn setup_outgoing_data_channels(
         &self,
         peer: &Arc<Peer>,
         node: &NodeId,
     ) -> mistlib_core::error::Result<()> {
+        peer.unordered_capability.set_initial_offerer();
         let methods = vec![
             (DeliveryMethod::ReliableOrdered, "reliable", None),
             (
@@ -241,6 +306,8 @@ impl WebRtcTransport {
             .unwrap()
             .insert(node.clone(), send_tx);
         if let Some(old_peer) = old_peer {
+            let room = self.room_id.read().unwrap().clone();
+            crate::events::reset_storage_after_teardown(&room, node).await;
             tracing::warn!("[WebRTC Close] reason=replace_peer node={}", node);
             old_peer.close_all().await;
             crate::mem::record_peer_cleaned();
@@ -296,7 +363,7 @@ impl WebRtcTransport {
         }
 
         if let Some(offer_desc) = peer.pc.local_description().await {
-            let data = offer_desc.sdp;
+            let data = super::signaling::negotiation_data(offer_desc.sdp);
             if let Err(e) = self
                 .signaler
                 .send_signaling(

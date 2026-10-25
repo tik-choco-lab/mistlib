@@ -1,5 +1,6 @@
 use super::backend::{BlockStore, MetaStore, PeerResolver, SelfPositionSource};
 use super::engine::{SpatialPolicy, StorageEngine};
+use crate::config::StorageTransferConfig;
 use crate::error::Result;
 use crate::layers::l2::L2Storage;
 use crate::types::Vector3;
@@ -18,13 +19,32 @@ impl<B: BlockStore, P: PeerResolver> P2PStorage<B, P> {
         position_source: Option<Arc<dyn SelfPositionSource>>,
         spatial: SpatialPolicy,
     ) -> Self {
+        Self::new_with_transfer(
+            store,
+            resolver,
+            max_capacity_bytes,
+            position_source,
+            spatial,
+            StorageTransferConfig::default(),
+        )
+    }
+
+    pub fn new_with_transfer(
+        store: B,
+        resolver: P,
+        max_capacity_bytes: u64,
+        position_source: Option<Arc<dyn SelfPositionSource>>,
+        spatial: SpatialPolicy,
+        transfer: StorageTransferConfig,
+    ) -> Self {
         Self {
-            engine: StorageEngine::new(
+            engine: StorageEngine::new_with_transfer(
                 store,
                 resolver,
                 max_capacity_bytes,
                 position_source,
                 spatial,
+                transfer,
             ),
         }
     }

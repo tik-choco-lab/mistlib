@@ -3,11 +3,13 @@ pub mod meta;
 pub mod resolver;
 
 use crate::engine::SessionCtx;
+use crate::runtime::TokioRuntime;
 use crate::storage::fs::NativeBlockStore;
-use crate::storage::resolver::{NativePeerResolver, TransportSource, WantRegistry};
+use crate::storage::resolver::WantRegistry;
 use async_trait::async_trait;
 use mistlib_core::config::StorageConfig;
-use mistlib_core::storage::protocol::{build_have_payload, chunk_size_for_limit, have_chunk_count};
+use mistlib_core::storage::protocol::{chunk_size_for_limit, have_chunk_count};
+use mistlib_core::storage::resolver::{NetworkPeerResolver, ResolverTimings, TransportSource};
 use mistlib_core::storage::{P2PStorage, SelfPositionSource, SpatialPolicy};
 use mistlib_core::transport::Transport;
 use mistlib_core::types::Vector3;
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::OnceCell;
 
-pub type NativeStorageInstance = P2PStorage<NativeBlockStore, NativePeerResolver>;
+pub type NativeStorageInstance = P2PStorage<NativeBlockStore, NetworkPeerResolver>;
 
 pub static STORAGE: OnceCell<Arc<NativeStorageInstance>> = OnceCell::const_new();
 
@@ -31,9 +33,9 @@ pub static STORAGE: OnceCell<Arc<NativeStorageInstance>> = OnceCell::const_new()
 pub static WANT_REGISTRY: LazyLock<WantRegistry> = LazyLock::new(WantRegistry::new);
 
 /// Feeds the resolver the live set of per-room transports (SPEC-15 rule 8):
-/// a WANT/QUERY broadcast fans out across every active session's transport,
-/// snapshotted at request time, since a block's peers may only be reachable
-/// through one particular room.
+/// QUERY broadcasts and targeted WANTs fan out across every active session's
+/// transport, snapshotted at request time, since a block's peers may only be
+/// reachable through one particular room.
 struct EngineSessionTransports;
 
 #[async_trait]
@@ -44,6 +46,14 @@ impl TransportSource for EngineSessionTransports {
             .await
             .into_iter()
             .map(|(_, ctx)| ctx.transport.clone())
+            .collect()
+    }
+    async fn session_transports(&self) -> Vec<(String, Arc<dyn Transport>)> {
+        crate::engine::ENGINE
+            .sessions_snapshot()
+            .await
+            .into_iter()
+            .map(|(room, ctx)| (room, ctx.transport.clone()))
             .collect()
     }
 }
@@ -106,18 +116,21 @@ pub async fn init_storage(storage_config: &StorageConfig, cache_dir: Option<std:
         .await
         .expect("Failed to init block store");
 
-    let resolver = NativePeerResolver::new(
-        Arc::new(EngineSessionTransports),
+    let resolver = NetworkPeerResolver::new_with_transfer(
+        Arc::new(EngineSessionTransports) as Arc<dyn TransportSource>,
+        Arc::new(TokioRuntime::new(tokio::runtime::Handle::current())),
         WANT_REGISTRY.clone(),
-        5000,
+        ResolverTimings::default(),
+        storage_config.transfer.clone(),
     );
     let max_capacity_bytes = storage_config.max_capacity_mb * 1024 * 1024;
-    let storage = P2PStorage::new(
+    let storage = P2PStorage::new_with_transfer(
         store,
         resolver,
         max_capacity_bytes,
         Some(Arc::new(EngineSessionPositions) as Arc<dyn SelfPositionSource>),
         SpatialPolicy::from(storage_config),
+        storage_config.transfer.clone(),
     )
     .with_meta_store(Arc::new(meta));
 
@@ -168,7 +181,53 @@ fn maybe_start_decay_sweeper(storage_config: &StorageConfig) {
 
 /// Replies go back out via `ctx.transport` -- the session the WANT arrived on
 /// (SPEC-15 rule 8) -- rather than any other active room's transport.
+struct WantJob {
+    ctx: Arc<SessionCtx>,
+    from: mistlib_core::types::NodeId,
+    cid: String,
+}
+type WantKey = (usize, mistlib_core::types::NodeId);
+static SERVING: std::sync::LazyLock<
+    std::sync::Mutex<mistlib_core::storage::responder::WantQueue<WantKey, WantJob>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn enqueue_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId, cid: String) {
+    use mistlib_core::storage::responder::WantAdmission;
+    let limited = ctx
+        .overlay
+        .as_ref()
+        .is_some_and(|router| mistlib_core::transport::send::pipeline_enabled(&router.transfer));
+    let key = (Arc::as_ptr(&ctx) as usize, from.clone());
+    let job = WantJob { ctx, from, cid };
+    let first = if limited {
+        SERVING.lock().unwrap().enqueue(key.clone(), job)
+    } else {
+        WantAdmission::Start(job)
+    };
+    let WantAdmission::Start(mut job) = first else {
+        if matches!(first, WantAdmission::Dropped) {
+            tracing::debug!(peer = %key.1, "Storage: dropping WANT: 64 pending descriptors");
+        }
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            handle_want(job.ctx, job.from, job.cid).await;
+            let next = if limited {
+                SERVING.lock().unwrap().next(&key)
+            } else {
+                None
+            };
+            match next {
+                Some(next) => job = next,
+                None => break,
+            }
+        }
+    });
+}
+
 pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId, cid: String) {
+    tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, "Storage: WANT received");
     if !mistlib_core::storage::is_valid_cid(&cid) {
         tracing::warn!(
             "Storage: dropping WANT with malformed CID (possible path-traversal attempt): {:?}",
@@ -178,9 +237,9 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
     }
 
     if let Some(storage) = STORAGE.get() {
-        use mistlib_core::types::DeliveryMethod;
-
-        let block = storage.get_block(&cid).await.ok().flatten();
+        let loaded = storage.get_block(&cid).await;
+        tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, found = loaded.as_ref().is_ok_and(|block| block.is_some()), error = ?loaded.as_ref().err(), "Storage: WANT load result");
+        let block = loaded.ok().flatten();
 
         if let Some(data) = block {
             let limit = ctx
@@ -198,49 +257,46 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
                 return;
             };
 
-            if total_chunks <= 1 {
-                let msg = build_have_payload(&cid, &data, 0, total_chunks, chunk_size);
-                let _ = ctx
-                    .transport
-                    .send(
-                        &from,
-                        bytes::Bytes::from(msg),
-                        DeliveryMethod::ReliableOrdered,
-                    )
-                    .await;
-            } else {
-                for chunk_index in 0..total_chunks {
-                    let msg =
-                        build_have_payload(&cid, &data, chunk_index, total_chunks, chunk_size);
-
-                    let _ = ctx
-                        .transport
-                        .send(
-                            &from,
-                            bytes::Bytes::from(msg),
-                            DeliveryMethod::ReliableOrdered,
-                        )
-                        .await;
-
-                    if chunk_index % 8 == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                }
+            tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, bytes = data.len(), chunk_size, total_chunks, "Storage: WANT response layout");
+            if let Err(error) = mistlib_core::storage::responder::send_block(
+                ctx.transport.as_ref(),
+                &from,
+                &cid,
+                &data,
+                chunk_size,
+                total_chunks,
+                |index| {
+                    Box::pin(async move {
+                        if total_chunks > 1 && index % 8 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                },
+            )
+            .await
+            {
+                tracing::debug!(%cid, peer = %from, %error, "Storage: WANT response stopped after send failure");
+                return;
             }
 
             tracing::debug!(
-                "Storage: served `have` for {} to {} ({} bytes, {} chunks)",
+                "Storage: WANT response ended for {} to {} ({} bytes, {} chunks queued)",
                 cid,
                 from.0,
                 data.len(),
                 total_chunks.max(1)
             );
+        } else {
+            tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, "Storage: WANT response ended: block unavailable");
         }
+    } else {
+        tracing::debug!(%cid, room = %ctx.room_id, "Storage: WANT response ended: storage unavailable");
     }
 }
 
 /// See `handle_want` for why replies go back via `ctx.transport`.
 pub async fn handle_query(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId, cid: String) {
+    tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, "Storage: QUERY received");
     if !mistlib_core::storage::is_valid_cid(&cid) {
         tracing::warn!(
             "Storage: dropping QUERY with malformed CID (possible path-traversal attempt): {:?}",
@@ -252,11 +308,13 @@ pub async fn handle_query(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeI
     if let Some(storage) = STORAGE.get() {
         use mistlib_core::types::DeliveryMethod;
 
-        let block_exists = storage.get_block(&cid).await.ok().flatten().is_some();
+        let loaded = storage.get_block(&cid).await;
+        tracing::debug!(%cid, room = %ctx.room_id, error = ?loaded.as_ref().err(), "Storage: QUERY load result");
+        let block_exists = loaded.ok().flatten().is_some();
 
         if block_exists {
             let msg = resolver::build_have_status_message(&cid);
-            let _ = ctx
+            let result = ctx
                 .transport
                 .send(
                     &from,
@@ -264,7 +322,21 @@ pub async fn handle_query(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeI
                     DeliveryMethod::ReliableOrdered,
                 )
                 .await;
+            tracing::debug!(
+                "Storage: QUERY response ended for {} from {}: {:?}",
+                cid,
+                from.0,
+                result
+            );
+        } else {
+            tracing::debug!(
+                "Storage: QUERY response ended for {} from {}: not held",
+                cid,
+                from.0
+            );
         }
+    } else {
+        tracing::debug!(%cid, room = %ctx.room_id, "Storage: QUERY response ended: storage unavailable");
     }
 }
 
@@ -327,23 +399,26 @@ pub fn handle_have_chunk_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mistlib_core::storage::protocol::build_have_payload;
 
     #[test]
     fn small_have_payload_uses_single_message() {
         let data = b"small";
+        let cid = mistlib_core::storage::compute_cid(data, 0x55);
         let total = have_chunk_count(data.len(), resolver::HAVE_CHUNK_SIZE)
             .expect("small block should fit");
-        let msg = build_have_payload("cid-small", data, 0, total, resolver::HAVE_CHUNK_SIZE);
+        let msg = build_have_payload(&cid, data, 0, total, resolver::HAVE_CHUNK_SIZE);
         let parsed = resolver::parse_have_message(&msg).expect("single HAVE should parse");
 
         assert_eq!(total, 1);
-        assert_eq!(parsed.0, "cid-small");
+        assert_eq!(parsed.0, cid);
         assert_eq!(parsed.1, data);
     }
 
     #[test]
     fn one_mib_have_payload_is_split_into_datachannel_safe_chunks() {
         let data = vec![7u8; 1024 * 1024];
+        let expected_cid = mistlib_core::storage::compute_cid(&data, 0x55);
         let total =
             have_chunk_count(data.len(), resolver::HAVE_CHUNK_SIZE).expect("1MiB block should fit");
 
@@ -356,7 +431,7 @@ mod tests {
         let mut reassembled = Vec::with_capacity(data.len());
         for chunk_index in 0..total {
             let msg = build_have_payload(
-                "cid-large",
+                &expected_cid,
                 &data,
                 chunk_index,
                 total,
@@ -366,7 +441,7 @@ mod tests {
 
             let (cid, parsed_index, parsed_total, payload) =
                 resolver::parse_have_chunk_message(&msg).expect("chunk HAVE should parse");
-            assert_eq!(cid, "cid-large");
+            assert_eq!(cid, expected_cid);
             assert_eq!(parsed_index, chunk_index);
             assert_eq!(parsed_total, total);
             assert!(payload.len() <= resolver::HAVE_CHUNK_SIZE);

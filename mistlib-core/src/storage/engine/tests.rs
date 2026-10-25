@@ -215,6 +215,76 @@ fn test_add_get_cycle() {
     });
 }
 
+struct PrefetchRecordingResolver {
+    blocks: HashMap<String, Vec<u8>>,
+    prefetched: StdMutex<Vec<Vec<String>>>,
+    resolved: StdMutex<Vec<String>>,
+}
+
+#[async_trait]
+impl PeerResolver for PrefetchRecordingResolver {
+    async fn prefetch_providers(&self, cids: &[String]) {
+        self.prefetched.lock().unwrap().push(cids.to_vec());
+    }
+
+    async fn resolve_block(&self, cid: &str) -> Option<Vec<u8>> {
+        // The manifest is local in this test, so every network fetch must be
+        // preceded by the batch prefetch for its chunk CID.
+        assert!(self.prefetched.lock().unwrap()[0].contains(&cid.to_string()));
+        self.resolved.lock().unwrap().push(cid.to_string());
+        self.blocks.get(cid).cloned()
+    }
+}
+
+#[tokio::test]
+async fn get_prefetches_only_locally_missing_chunks_before_fetching() {
+    let blocks = [
+        b"local".to_vec(),
+        b"remote-a".to_vec(),
+        b"remote-b".to_vec(),
+    ];
+    let cids: Vec<_> = blocks
+        .iter()
+        .map(|block| compute_cid(block, MULTICODEC_RAW))
+        .collect();
+    let data = blocks.concat();
+    let manifest = FileManifest {
+        name: "mixed.bin".into(),
+        size: data.len() as u64,
+        chunks: cids.clone(),
+    };
+    let manifest_bytes = serde_cbor::to_vec(&manifest).unwrap();
+    let root = compute_cid(&manifest_bytes, MULTICODEC_DAG_CBOR);
+    let store = MemBlockStore::new();
+    store.store_block(&root, &manifest_bytes).await.unwrap();
+    store.store_block(&cids[0], &blocks[0]).await.unwrap();
+    let resolver = PrefetchRecordingResolver {
+        blocks: cids.iter().cloned().zip(blocks).collect(),
+        prefetched: StdMutex::new(Vec::new()),
+        resolved: StdMutex::new(Vec::new()),
+    };
+    let engine = StorageEngine::new(
+        store,
+        resolver,
+        10 * 1024 * 1024,
+        None,
+        SpatialPolicy::default(),
+    );
+    assert_eq!(engine.get(&root).await.unwrap(), data);
+    assert_eq!(
+        *engine.resolver.prefetched.lock().unwrap(),
+        [cids[1..].to_vec()]
+    );
+    let resolved = engine.resolver.resolved.lock().unwrap().clone();
+    assert_eq!(resolved.len(), 2);
+    assert!(cids[1..].iter().all(|cid| resolved.contains(cid)));
+
+    // Once every chunk is cached, the next get has no provider work to prefetch.
+    assert_eq!(engine.get(&root).await.unwrap(), data);
+    assert!(engine.resolver.prefetched.lock().unwrap()[1].is_empty());
+    assert_eq!(*engine.resolver.resolved.lock().unwrap(), resolved);
+}
+
 #[test]
 fn test_multichunk_deduplication() {
     block_on(async {
@@ -1343,4 +1413,75 @@ fn test_run_decay_sweep_loads_pin_registry_on_fresh_engine() {
             .unwrap()
             .is_some());
     });
+}
+
+#[test]
+fn network_discovery_failure_context_reaches_storage_callers() {
+    struct FailedDiscovery;
+    #[async_trait]
+    impl PeerResolver for FailedDiscovery {
+        async fn resolve_block(&self, _: &str) -> Option<Vec<u8>> {
+            panic!("engine should use the contextual result method");
+        }
+        async fn resolve_block_result(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Err(MistError::Network(
+                "No provider answered within the discovery query budget".into(),
+            ))
+        }
+    }
+    let engine = StorageEngine::new(
+        MemBlockStore::new(),
+        FailedDiscovery,
+        16 * 1024 * 1024,
+        None,
+        SpatialPolicy::default(),
+    );
+    let cid = compute_cid(b"missing", MULTICODEC_RAW);
+    let error = block_on(engine.resolve_or_fetch(&cid, MULTICODEC_RAW)).unwrap_err();
+    assert!(
+        matches!(error, MistError::Network(message) if message.contains("discovery query budget"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn get_concurrency_uses_config_and_clamps_to_one_through_64() {
+    // Tiny valid blocks let us exercise the upper clamp without allocating 64 MiB.
+    let mut blocks = HashMap::new();
+    let mut chunks = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..70u8 {
+        let data = vec![index];
+        let cid = compute_cid(&data, MULTICODEC_RAW);
+        chunks.push(cid.clone());
+        expected.extend_from_slice(&data);
+        blocks.insert(cid, data);
+    }
+    let manifest = serde_cbor::to_vec(&FileManifest {
+        name: "configured.bin".into(),
+        size: 70,
+        chunks,
+    })
+    .unwrap();
+    let root = compute_cid(&manifest, MULTICODEC_DAG_CBOR);
+    blocks.insert(root.clone(), manifest);
+    for (configured, expected_peak) in [(0, 1), (1, 1), (2, 2), (4, 4), (7, 7), (64, 64), (100, 64)]
+    {
+        let engine = StorageEngine::new_with_transfer(
+            MemBlockStore::new(),
+            CountingResolver::new(blocks.clone()),
+            1024 * 1024,
+            None,
+            SpatialPolicy::default(),
+            StorageTransferConfig {
+                get_concurrency: configured,
+                ..Default::default()
+            },
+        );
+        assert_eq!(engine.get(&root).await.unwrap(), expected);
+        assert_eq!(
+            *engine.resolver.max_active.lock().unwrap(),
+            expected_peak,
+            "configured concurrency {configured}"
+        );
+    }
 }

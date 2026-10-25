@@ -167,9 +167,8 @@ pub(crate) fn drain_join_waiters(room_id: &str, result: Result<(), String>) {
 /// `set_config()` update (config is process-wide, but each engine keeps its
 /// own copy -- see the multi-room contract).
 pub(crate) fn for_each_session_engine(mut f: impl FnMut(&Arc<MistEngine>)) {
-    SESSIONS.with(|s| {
-        for (_, sess) in s.borrow().iter_in_join_order() {
-            f(&sess.engine);
-        }
-    });
+    // A callback may leave a room or otherwise re-enter the registry.
+    for engine in super::all_session_engines() {
+        f(&engine);
+    }
 }

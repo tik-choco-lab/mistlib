@@ -19,21 +19,76 @@ fn grace(origin: GraceOrigin, elapsed: Duration) -> DisconnectGrace {
     }
 }
 
+#[test]
+fn transport_byte_growth_extends_grace_without_application_frames() {
+    use crate::transports::webrtc::disconnect_grace::InboundActivity;
+    let activity = InboundActivity::new();
+    assert!(!activity.record_transport_bytes("ice_transport", 100));
+    assert!(!activity.record_transport_bytes("ice_transport", 100));
+    assert!(!activity.record_transport_bytes("ice_transport", 1));
+    assert_eq!(activity.last_rx(), None);
+    assert!(activity.record_transport_bytes("ice_transport", 2));
+    let rx = activity.last_rx().unwrap();
+    let grace = Some(DisconnectGrace {
+        started_at: rx - Duration::from_secs(1),
+        origin: GraceOrigin::Ice,
+    });
+    assert_eq!(
+        decide_grace_expiry(
+            grace,
+            RTCPeerConnectionState::Disconnected,
+            true,
+            Some(rx),
+            rx,
+            GRACE_MS
+        ),
+        GraceExpiryDecision::ExtendedByTraffic
+    );
+    assert_eq!(
+        decide_grace_expiry(
+            grace,
+            RTCPeerConnectionState::Disconnected,
+            true,
+            Some(rx),
+            rx + Duration::from_millis(GRACE_MS),
+            GRACE_MS
+        ),
+        GraceExpiryDecision::Reap
+    );
+    assert!(!activity.record_transport_bytes("other", 1000));
+    assert_eq!(activity.last_rx(), Some(rx));
+    assert!(!InboundActivity::new().record_transport_bytes("ice_transport", 1000));
+}
+
 // --- Pure `decide_grace_expiry` unit tests -------------------------------
 //
 // These exhaustively cover the decision table described at the sweeper's
 // call site: only a `LivenessSuspect`-origin grace that has both a `Connected`
 // pc *and* an open ReliableOrdered data channel is ever suppressed as a false
-// positive. Everything else reaps exactly as it did before this fix.
+// positive. These cases have no inbound traffic and are logically reconnecting.
 
 #[test]
 fn no_grace_is_always_wait() {
     assert_eq!(
-        decide_grace_expiry(None, RTCPeerConnectionState::Connected, true, GRACE_MS),
+        decide_grace_expiry(
+            None,
+            RTCPeerConnectionState::Connected,
+            true,
+            None,
+            Instant::now(),
+            GRACE_MS
+        ),
         GraceExpiryDecision::Wait
     );
     assert_eq!(
-        decide_grace_expiry(None, RTCPeerConnectionState::Disconnected, false, GRACE_MS),
+        decide_grace_expiry(
+            None,
+            RTCPeerConnectionState::Disconnected,
+            false,
+            None,
+            Instant::now(),
+            GRACE_MS
+        ),
         GraceExpiryDecision::Wait
     );
 }
@@ -46,6 +101,8 @@ fn grace_not_yet_elapsed_is_wait_regardless_of_origin_or_health() {
             Some(grace(GraceOrigin::LivenessSuspect, not_yet)),
             RTCPeerConnectionState::Connected,
             true,
+            None,
+            Instant::now(),
             GRACE_MS
         ),
         GraceExpiryDecision::Wait
@@ -55,6 +112,8 @@ fn grace_not_yet_elapsed_is_wait_regardless_of_origin_or_health() {
             Some(grace(GraceOrigin::Ice, not_yet)),
             RTCPeerConnectionState::Disconnected,
             false,
+            None,
+            Instant::now(),
             GRACE_MS
         ),
         GraceExpiryDecision::Wait
@@ -69,6 +128,8 @@ fn liveness_suspect_expired_with_healthy_pc_and_open_dc_is_recovered_as_false_po
             Some(grace(GraceOrigin::LivenessSuspect, expired)),
             RTCPeerConnectionState::Connected,
             true,
+            None,
+            Instant::now(),
             GRACE_MS
         ),
         GraceExpiryDecision::RecoverFalsePositive,
@@ -84,6 +145,8 @@ fn liveness_suspect_expired_without_open_dc_is_still_reaped() {
             Some(grace(GraceOrigin::LivenessSuspect, expired)),
             RTCPeerConnectionState::Connected,
             false,
+            None,
+            Instant::now(),
             GRACE_MS
         ),
         GraceExpiryDecision::Reap,
@@ -106,6 +169,8 @@ fn liveness_suspect_expired_with_unhealthy_pc_is_still_reaped() {
                 Some(grace(GraceOrigin::LivenessSuspect, expired)),
                 pc_state,
                 true,
+                None,
+                Instant::now(),
                 GRACE_MS
             ),
             GraceExpiryDecision::Reap,
@@ -116,15 +181,17 @@ fn liveness_suspect_expired_with_unhealthy_pc_is_still_reaped() {
 }
 
 #[test]
-fn ice_origin_expired_grace_always_reaps_even_if_pc_looks_connected() {
+fn ice_origin_expired_grace_reaps_while_logically_reconnecting() {
     let expired = Duration::from_millis(GRACE_MS + 1);
-    // An Ice-origin grace is never second-guessed against the live pc state --
-    // ICE itself is what reported trouble, so there is nothing to re-validate.
+    // A logically reconnecting peer still needs a full silence window, even
+    // if its PC state has already recovered ahead of the logical state.
     assert_eq!(
         decide_grace_expiry(
             Some(grace(GraceOrigin::Ice, expired)),
             RTCPeerConnectionState::Connected,
             true,
+            None,
+            Instant::now(),
             GRACE_MS
         ),
         GraceExpiryDecision::Reap,
@@ -135,10 +202,138 @@ fn ice_origin_expired_grace_always_reaps_even_if_pc_looks_connected() {
             Some(grace(GraceOrigin::Ice, expired)),
             RTCPeerConnectionState::Disconnected,
             false,
+            None,
+            Instant::now(),
             GRACE_MS
         ),
         GraceExpiryDecision::Reap
     );
+}
+
+#[test]
+fn inbound_silence_grace_decision_table() {
+    use GraceExpiryDecision::{ExtendedByTraffic, Reap, Wait};
+    use RTCPeerConnectionState::{Closed, Connected, Disconnected, Failed};
+    let now = Instant::now();
+    let start = now - Duration::from_millis(1_000);
+    let recent = now - Duration::from_millis(10);
+    let boundary = now - Duration::from_millis(GRACE_MS);
+    for (name, pc, _state, grace_start, rx, expected) in [
+        (
+            "silent grace boundary",
+            Disconnected,
+            ConnectionState::Reconnecting,
+            Some(boundary),
+            None,
+            Reap,
+        ),
+        (
+            "long disconnect with recent traffic",
+            Disconnected,
+            ConnectionState::Reconnecting,
+            Some(start),
+            Some(recent),
+            ExtendedByTraffic,
+        ),
+        (
+            "logical reconnect with recent traffic",
+            Connected,
+            ConnectionState::Reconnecting,
+            Some(start),
+            Some(recent),
+            ExtendedByTraffic,
+        ),
+        (
+            "traffic before grace does not shorten it",
+            Disconnected,
+            ConnectionState::Reconnecting,
+            Some(recent),
+            Some(start),
+            Wait,
+        ),
+        (
+            "last traffic exactly one window ago",
+            Disconnected,
+            ConnectionState::Reconnecting,
+            Some(start),
+            Some(boundary),
+            Reap,
+        ),
+        (
+            // An expired Ice-origin grace is reaped even when webrtc-rs still
+            // reports the aggregate pc state as Connected (a crashed peer).
+            "connected stale grace",
+            Connected,
+            ConnectionState::Connected,
+            Some(start),
+            None,
+            Reap,
+        ),
+        (
+            "connected recent traffic",
+            Connected,
+            ConnectionState::Connected,
+            Some(start),
+            Some(recent),
+            ExtendedByTraffic,
+        ),
+        (
+            "failed with traffic",
+            Failed,
+            ConnectionState::Reconnecting,
+            Some(recent),
+            Some(now),
+            Reap,
+        ),
+        (
+            "closed with traffic",
+            Closed,
+            ConnectionState::Reconnecting,
+            Some(recent),
+            Some(now),
+            Reap,
+        ),
+        (
+            "failed without grace",
+            Failed,
+            ConnectionState::Connected,
+            None,
+            Some(now),
+            Reap,
+        ),
+        (
+            "closed without grace",
+            Closed,
+            ConnectionState::Connected,
+            None,
+            Some(now),
+            Reap,
+        ),
+        (
+            "disconnected without grace",
+            Disconnected,
+            ConnectionState::Reconnecting,
+            None,
+            Some(now),
+            Wait,
+        ),
+    ] {
+        assert_eq!(
+            decide_grace_expiry(
+                grace_start.map(|started_at| DisconnectGrace {
+                    started_at,
+                    origin: GraceOrigin::Ice
+                }),
+                pc,
+                true,
+                rx,
+                now,
+                GRACE_MS,
+            ),
+            expected,
+            "{name}"
+        );
+    }
 }
 
 // --- Pure `reservation_reap_allowed` unit tests (sweeper livelock fix) ---

@@ -125,6 +125,7 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 
 **投递模式** —— `Delivery.Reliable`（`0`）必达且保持顺序；`Delivery.UnreliableOrdered`
 （`1`）可能丢失但绝不乱序；`Delivery.Unreliable`（`2`）可能丢失或乱序，延迟最低。
+`Delivery.ReliableUnordered`（`3`）保证可靠投递，不保证顺序；可选通道不可用时回退到可靠有序通道。
 事件 ID 同样可以从 `MistEvent` 取得。
 
 ## 配置

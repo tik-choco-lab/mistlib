@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -30,6 +31,8 @@ class GateTest(unittest.TestCase):
         self.dist.mkdir()
         self.reports.mkdir()
         self.policy = load(POLICY)
+        wan = self.policy["wanStorage"]
+        self.limit_packets = math.ceil((2 * wan["delayMs"] + wan["queueMs"]) / 1000 * wan["rateKbit"] * 1000 / 8 / 1200)
         self.manifests = {}
         for target in self.policy["nativeTargets"]:
             identity = f"native-{target}"
@@ -77,7 +80,16 @@ class GateTest(unittest.TestCase):
                         "multi-room": {"roomLeaks": 0, "observationMs": 1000},
                         "leave-rejoin": {"cycles": 3, "sent": 384, "received": 384},
                         "relay-outage": {"disconnectedSockets": 2}, "peer-restart": {"restarts": 1},
-                        "storage": {"transfers": 2, "corruptions": 0}, "soak": {"observedMs": 15000, "samples": 10}}[phase])
+                        "storage": {"transfers": 2, "corruptions": 0},
+                        "storage-wan": {"transfers": 2, "corruptions": 0, "bytes": self.policy["wanStorage"]["bytes"],
+                            "shaped": platform == "linux",
+                            "delayMs": self.policy["wanStorage"]["delayMs"] if platform == "linux" else None,
+                            "rateKbit": self.policy["wanStorage"]["rateKbit"] if platform == "linux" else None,
+                            "queueMs": wan["queueMs"] if platform == "linux" else None,
+                            "limitPackets": self.limit_packets if platform == "linux" else None,
+                            "queueProfile": "bounded" if platform == "linux" else None,
+                            "transferMs": [40000, 41000]},
+                        "soak": {"observedMs": 15000, "samples": 10}}[phase])
                     cases.append({"id": f"{pair}/{phase}", "passed": True, "durationMs": 1000, "metrics": metrics})
             native = self.manifests["native-linux-x86_64" if browser else identity]
             report = {"schema": 1, "id": identity, "passed": True, "commit": COMMIT, "version": VERSION,
@@ -133,6 +145,15 @@ class GateTest(unittest.TestCase):
             "too few rejoins": lambda r: mutate_case(r, "leave-rejoin", "cycles", 1),
             "no soak": lambda r: mutate_case(r, "soak", "observedMs", 0),
             "corrupt storage": lambda r: mutate_case(r, "storage", "corruptions", 1),
+            "WAN missing transfer": lambda r: mutate_case(r, "storage-wan", "transfers", 1),
+            "WAN corrupt storage": lambda r: mutate_case(r, "storage-wan", "corruptions", 1),
+            "WAN small payload": lambda r: mutate_case(r, "storage-wan", "bytes", 30),
+            "WAN wrong delay": lambda r: mutate_case(r, "storage-wan", "delayMs", 0),
+            "WAN wrong rate": lambda r: mutate_case(r, "storage-wan", "rateKbit", 10000),
+            "WAN timeout": lambda r: mutate_case(r, "storage-wan", "transferMs", [240001, 41000]),
+            "WAN missing timing": lambda r: mutate_case(r, "storage-wan", "transferMs", [40000]),
+            "WAN boolean timing": lambda r: mutate_case(r, "storage-wan", "transferMs", [True, 41000]),
+            "WAN faster than shaped link": lambda r: mutate_case(r, "storage-wan", "transferMs", [20, 41000]),
         }
         path = self.reports / f"{identity}.json"
         for name, mutate in mutations.items():
@@ -143,6 +164,68 @@ class GateTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.evaluate()
         self.write(path, original)
+
+    def test_linux_wan_shaping_is_required_for_every_pair(self):
+        for identity in ("native-linux-x86_64", "browser-chromium", "browser-firefox"):
+            original = self.report_data[identity]
+            path = self.reports / f"{identity}.json"
+            for index, case in enumerate(original["cases"]):
+                if not case["id"].endswith("/storage-wan"):
+                    continue
+                for shaped in (False, 1, None):
+                    with self.subTest(identity=identity, pair=case["id"], shaped=shaped):
+                        report = deepcopy(original)
+                        report["cases"][index]["metrics"]["shaped"] = shaped
+                        self.write(path, report)
+                        with self.assertRaisesRegex(ValueError, "shaping required on Linux"):
+                            self.evaluate()
+            self.write(path, original)
+
+    def test_policy_queue_and_unshaped_nulls_pass(self):
+        self.assertEqual(self.limit_packets, 53)
+        self.assertTrue(self.evaluate()["passed"])
+
+    def test_queue_mismatches_block_every_linux_pair(self):
+        changes = [
+            {"queueMs": 201}, {"queueMs": None}, {"queueMs": True},
+            {"limitPackets": self.limit_packets + 1}, {"limitPackets": None},
+            {"limitPackets": float(self.limit_packets)},
+            {"queueProfile": "deep"}, {"queueProfile": None},
+            {"queueProfile": "deep", "limitPackets": None, "queueMs": None},
+        ]
+        for identity in ("native-linux-x86_64", "browser-chromium", "browser-firefox"):
+            original = self.report_data[identity]
+            path = self.reports / f"{identity}.json"
+            for index, case in enumerate(original["cases"]):
+                if not case["id"].endswith("/storage-wan"):
+                    continue
+                for change in changes + [{field: "missing"} for field in ("queueMs", "limitPackets", "queueProfile")]:
+                    with self.subTest(identity=identity, pair=case["id"], change=change):
+                        report = deepcopy(original)
+                        metrics = report["cases"][index]["metrics"]
+                        for field, value in change.items():
+                            if value == "missing":
+                                metrics.pop(field)
+                            else:
+                                metrics[field] = value
+                        self.write(path, report)
+                        with self.assertRaisesRegex(ValueError, "WAN storage queue parameters"):
+                            self.evaluate()
+            self.write(path, original)
+
+    def test_unshaped_reports_require_null_queue_fields(self):
+        for identity in ("native-windows-x86_64", "native-macos-aarch64"):
+            original = self.report_data[identity]
+            path = self.reports / f"{identity}.json"
+            for field, value in (("queueMs", 200), ("limitPackets", 53), ("queueProfile", "deep")):
+                with self.subTest(identity=identity, field=field):
+                    report = deepcopy(original)
+                    metrics = next(case["metrics"] for case in report["cases"] if case["id"].endswith("/storage-wan"))
+                    metrics[field] = value
+                    self.write(path, report)
+                    with self.assertRaisesRegex(ValueError, "unshaped WAN storage queue parameters"):
+                        self.evaluate()
+            self.write(path, original)
 
     def test_missing_report_and_duplicate_json_are_rejected(self):
         path = self.reports / "browser-firefox.json"

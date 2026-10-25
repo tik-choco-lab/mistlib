@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use mistlib_core::signaling::MessageContent;
+use mistlib_core::storage::protocol::{classify_storage_frame, StorageFrame};
 use mistlib_core::transport::NetworkEvent;
 use mistlib_core::types::NodeId;
 use tokio::sync::mpsc;
@@ -33,6 +34,8 @@ impl super::MistEngine {
                         }
                         Err(e) => {
                             tracing::trace!("process_network_events: bincode deserialize failed ({e}), trying storage protocol");
+                            // Non-envelope frames are only ever storage protocol;
+                            // anything else here is undecodable and never reaches the app.
                             self.handle_storage_message(&event.data, from_origin, &ctx);
                         }
                     }
@@ -59,7 +62,23 @@ impl super::MistEngine {
 
         let result = ov.handle_envelope(envelope, from_origin.clone());
         for action in result.actions {
-            self.handle_action_for(ctx.clone(), action);
+            if let mistlib_core::action::OverlayAction::SendMessage {
+                to, data, method, ..
+            } = action
+            {
+                if let Some(wt) = &ctx.webrtc_transport {
+                    tokio::select! {
+                        _ = ctx.cancel.cancelled() => return,
+                        result = wt.enqueue_received_send(&to, data, method) => {
+                            if let Err(err) = result {
+                                tracing::warn!("Failed to forward overlay action: {err}");
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.handle_action_for(ctx.clone(), action);
+            }
         }
 
         if to_self && result.should_deliver {
@@ -103,8 +122,9 @@ impl super::MistEngine {
     ) {
         match content {
             MessageContent::Raw(payload) => {
-                let _ = self.handle_storage_message(&payload, from_origin.clone(), ctx);
-                super::dispatch_event(super::EVENT_RAW, &ctx.room_id, &from_origin, &payload);
+                if !self.handle_storage_message(&payload, from_origin.clone(), ctx) {
+                    super::dispatch_event(super::EVENT_RAW, &ctx.room_id, &from_origin, &payload);
+                }
             }
             MessageContent::Overlay(overlay_msg) => {
                 if overlay_msg.is_internal_control() {
@@ -141,42 +161,48 @@ impl super::MistEngine {
         from_origin: NodeId,
         ctx: &Arc<SessionCtx>,
     ) -> bool {
-        use crate::storage::resolver;
-
-        if let Some(cid) = resolver::parse_want_message(data) {
-            let from = from_origin.clone();
-            let ctx = ctx.clone();
-            self.runtime.handle().spawn(async move {
-                crate::storage::handle_want(ctx, from, cid).await;
-            });
-            true
-        } else if let Some(cid) = resolver::parse_query_message(data) {
-            let from = from_origin.clone();
-            let ctx = ctx.clone();
-            self.runtime.handle().spawn(async move {
-                crate::storage::handle_query(ctx, from, cid).await;
-            });
-            true
-        } else if let Some(cid) = resolver::parse_have_status_message(data) {
-            crate::storage::handle_have_status(from_origin, cid);
-            true
-        } else if let Some((cid, data)) = resolver::parse_have_message(data) {
-            crate::storage::handle_have_from(from_origin, cid, data);
-            true
-        } else if let Some((cid, chunk_index, chunk_total, data)) =
-            resolver::parse_have_chunk_message(data)
-        {
-            crate::storage::handle_have_chunk_from(
-                from_origin,
+        let Some(frame) = classify_storage_frame(data) else {
+            return false;
+        };
+        match frame {
+            StorageFrame::Want { cid } => {
+                crate::storage::enqueue_want(ctx.clone(), from_origin, cid.to_string());
+            }
+            StorageFrame::Query { cid } => {
+                let cid = cid.to_string();
+                let ctx = ctx.clone();
+                self.runtime.handle().spawn(async move {
+                    crate::storage::handle_query(ctx, from_origin, cid).await;
+                });
+            }
+            StorageFrame::HaveStatus { cid } => {
+                crate::storage::handle_have_status(from_origin, cid.to_string());
+            }
+            StorageFrame::Have { cid, data } => {
+                crate::storage::WANT_REGISTRY.fulfill_in(
+                    &ctx.room_id,
+                    cid,
+                    &from_origin,
+                    data.to_vec(),
+                );
+            }
+            StorageFrame::HaveChunk {
                 cid,
                 chunk_index,
                 chunk_total,
                 data,
-            );
-            true
-        } else {
-            false
+            } => {
+                crate::storage::WANT_REGISTRY.fulfill_chunk_in(
+                    &ctx.room_id,
+                    cid,
+                    &from_origin,
+                    chunk_index,
+                    chunk_total,
+                    data.to_vec(),
+                );
+            }
         }
+        true
     }
 }
 
@@ -327,6 +353,84 @@ mod tests {
             Arc::new(StdMutex::new(NodeStore::new())),
             NodeId("local".to_string()),
         ))
+    }
+
+    #[test]
+    fn storage_frames_are_handled_without_raw_events_on_both_receive_paths() {
+        use mistlib_core::storage::cid::{compute_cid, MULTICODEC_RAW};
+        use mistlib_core::storage::protocol::{build_have_chunk_message, build_have_message};
+
+        // dispatch_event uses the process-wide engine; serialize callback changes
+        // with the existing event dispatch tests.
+        let _guard = crate::events::tests::TEST_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        *super::super::ENGINE.rust_event_callback.lock().unwrap() =
+            Some(Arc::new(move |kind, from, data| {
+                if from == "storage-dispatch-test-peer" {
+                    tx.send((kind, data)).unwrap();
+                }
+            }));
+
+        let engine = super::super::MistEngine::new();
+        let (ctx, _) = fake_ctx_with_handler(router());
+        let from = NodeId("storage-dispatch-test-peer".into());
+        let data = b"storage payload";
+        let cid = compute_cid(data, MULTICODEC_RAW);
+        let application = b"\x01hello";
+
+        for fallback in [false, true] {
+            let registration = crate::storage::WANT_REGISTRY.register_attempt(&cid, from.clone());
+            crate::storage::WANT_REGISTRY.track_path(registration.id, &ctx.room_id);
+            let mut want = registration.data;
+            let frames = [
+                build_have_message(&cid, data),
+                build_have_chunk_message(&cid, 0, 1, data),
+                application.to_vec(),
+            ];
+            if fallback {
+                let (tx, network_rx) = mpsc::unbounded_channel();
+                // Undecodable non-storage frames on this path never reach the app.
+                for frame in frames {
+                    assert!(
+                        mistlib_core::overlay::wire::deserialize::<OverlayEnvelope>(&frame)
+                            .is_err()
+                    );
+                    tx.send(NetworkEvent {
+                        from: from.clone(),
+                        data: frame.into(),
+                    })
+                    .unwrap();
+                }
+                drop(tx);
+                engine
+                    .runtime
+                    .block_on(engine.process_network_events(network_rx, ctx.clone()));
+                // Barrier: an app frame through the envelope path is the only event.
+                engine.dispatch_local_message(
+                    MessageContent::Raw(application.to_vec().into()),
+                    from.clone(),
+                    &ctx,
+                );
+            } else {
+                for frame in frames {
+                    engine.dispatch_local_message(
+                        MessageContent::Raw(frame.into()),
+                        from.clone(),
+                        &ctx,
+                    );
+                }
+            }
+            assert_eq!(want.try_recv().unwrap(), data);
+            // The app event is a FIFO barrier: any leaked storage event would
+            // already be ahead of it in the dispatch queue.
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (super::super::EVENT_RAW, application.to_vec())
+            );
+            assert!(rx.try_recv().is_err());
+        }
+
+        *super::super::ENGINE.rust_event_callback.lock().unwrap() = None;
     }
 
     /// Builds a unicast `ReliableOrdered` envelope from `peer-a` to `local`

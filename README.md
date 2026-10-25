@@ -130,6 +130,8 @@ they copy nothing and return the required byte length, so a zero-length call can
 (`1`) may drop but never reorders; `Delivery.Unreliable` (`2`) may drop or reorder, for the
 lowest latency. Event ids come from the `MistEvent` enum the same way.
 
+`Delivery.ReliableUnordered` (`3`) is fully reliable without an ordering guarantee; it falls back to reliable ordered when the optional channel is unavailable.
+
 ## Configuration
 
 A JSON object passed to `init_with_config`, or to `set_config` later. Anything you omit keeps its

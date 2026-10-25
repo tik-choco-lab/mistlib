@@ -494,11 +494,26 @@ impl WebRtcTransport {
 }
 
 impl WebRtcTransport {
+    #[cfg(test)]
     pub(crate) async fn handle_offer(
         &self,
         remote_id: NodeId,
         sdp: String,
     ) -> crate::error::Result<()> {
+        self.handle_decoded_offer(remote_id, decode_negotiation(sdp))
+            .await
+    }
+
+    async fn handle_decoded_offer(
+        &self,
+        remote_id: NodeId,
+        payload: DecodedNegotiation,
+    ) -> crate::error::Result<()> {
+        let DecodedNegotiation {
+            sdp,
+            reliable_unordered,
+            ..
+        } = payload;
         // An inbound offer means the remote is alive and negotiating with us,
         // so any pending CONNECT_REQUEST retry loop for this node is obsolete
         // regardless of which path below handles the offer.
@@ -593,7 +608,7 @@ impl WebRtcTransport {
                                 sender_id: self.local_node_id.clone(),
                                 receiver_id: remote_id.clone(),
                                 room_id: self.get_room_id(),
-                                data: answer_desc.sdp,
+                                data: negotiation_data(answer_desc.sdp),
                                 signaling_type: SignalingType::Answer,
                             });
                             if let Err(err) = self.signaler.send_signaling(&remote_id, msg).await {
@@ -616,7 +631,9 @@ impl WebRtcTransport {
                     }
                     None => {}
                 }
-                return self.apply_offer(remote_id, sdp, peer).await;
+                return self
+                    .apply_offer(remote_id, sdp, reliable_unordered, peer)
+                    .await;
             }
         }
 
@@ -699,6 +716,8 @@ impl WebRtcTransport {
             .unwrap()
             .insert(remote_id.clone(), peer.send_tx.clone());
         if let Some(old_peer) = old_peer {
+            let room = self.room_id.read().unwrap().clone();
+            crate::events::reset_storage_after_teardown(&room, &remote_id).await;
             tracing::warn!(
                 "[WebRTC Close] reason=handle_offer_replace_peer node={}",
                 remote_id
@@ -725,7 +744,9 @@ impl WebRtcTransport {
         super::conn_timing::log_attempt_start(&remote_id);
         self.spawn_connection_watchdog(remote_id.clone(), attempt_id);
 
-        let result = self.apply_offer(remote_id.clone(), sdp, peer.clone()).await;
+        let result = self
+            .apply_offer(remote_id.clone(), sdp, reliable_unordered, peer.clone())
+            .await;
 
         if result.is_err() {
             // Guard on the peer this call just inserted: a concurrent
@@ -780,6 +801,7 @@ impl WebRtcTransport {
         &self,
         remote_id: NodeId,
         sdp: String,
+        reliable_unordered: Option<u8>,
         peer: Arc<Peer>,
     ) -> crate::error::Result<()> {
         // Held for the whole set_remote_description -> create_answer ->
@@ -801,11 +823,13 @@ impl WebRtcTransport {
             )));
         }
 
-        let offer = parse_offer_payload(&sdp)?;
+        let offer = parse_sdp_description(&sdp, true)?;
         if let Err(e) = peer.pc.set_remote_description(offer).await {
             rollback_to_stable_on_failure(&peer.pc, &remote_id).await;
             return Err(e.into());
         }
+
+        peer.unordered_capability.accept_remote(reliable_unordered);
 
         let answer = match peer.pc.create_answer(None).await {
             Ok(answer) => answer,
@@ -852,7 +876,7 @@ impl WebRtcTransport {
         }
 
         if let Some(answer_desc) = peer.pc.local_description().await {
-            let data = answer_desc.sdp;
+            let data = negotiation_data(answer_desc.sdp);
             if let Err(err) = self
                 .signaler
                 .send_signaling(
@@ -883,11 +907,26 @@ impl WebRtcTransport {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle_answer(
         &self,
         remote_id: NodeId,
         sdp: String,
     ) -> crate::error::Result<()> {
+        self.handle_decoded_answer(remote_id, decode_negotiation(sdp))
+            .await
+    }
+
+    async fn handle_decoded_answer(
+        &self,
+        remote_id: NodeId,
+        payload: DecodedNegotiation,
+    ) -> crate::error::Result<()> {
+        let DecodedNegotiation {
+            sdp,
+            reliable_unordered,
+            ..
+        } = payload;
         let peer = {
             let peers = self.peers.read().await;
             peers.get(&remote_id).cloned()
@@ -897,7 +936,7 @@ impl WebRtcTransport {
             // Serialize the state check and application with offers, ICE
             // restarts and answers arriving through the other signaling path.
             let _negotiating = peer.negotiating.lock().await;
-            let answer = parse_answer_payload(&sdp)?;
+            let answer = parse_sdp_description(&sdp, false)?;
             let signaling_state = peer.pc.signaling_state();
             if signaling_state == RTCSignalingState::Stable {
                 if let Some(applied) = peer.pc.remote_description().await {
@@ -945,6 +984,9 @@ impl WebRtcTransport {
                 rollback_to_stable_on_failure(&peer.pc, &remote_id).await;
                 return Err(e.into());
             }
+
+            peer.unordered_capability.accept_remote(reliable_unordered);
+            self.open_reliable_unordered(&remote_id, &peer).await;
 
             let cands = {
                 let mut pc_lock = self.pending_candidates.write().await;
@@ -1078,29 +1120,25 @@ impl SignalingHandler for WebRtcTransport {
 
         match data.signaling_type {
             SignalingType::Offer => {
-                let envelope = serde_json::from_str::<NegotiationEnvelope>(&data.data).ok();
-                let payload = envelope
-                    .as_ref()
-                    .map_or_else(|| data.data.clone(), |item| item.sdp.clone());
-                self.handle_offer(data.sender_id.clone(), payload)
+                let payload = decode_negotiation(data.data);
+                let id = payload.id;
+                self.handle_decoded_offer(data.sender_id.clone(), payload)
                     .await
                     .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
-                if let Some(envelope) = envelope {
-                    self.send_negotiation_ack(&data.sender_id, &current_room_id, envelope.id)
+                if let Some(id) = id {
+                    self.send_negotiation_ack(&data.sender_id, &current_room_id, id)
                         .await;
                 }
                 Ok(())
             }
             SignalingType::Answer => {
-                let envelope = serde_json::from_str::<NegotiationEnvelope>(&data.data).ok();
-                let payload = envelope
-                    .as_ref()
-                    .map_or_else(|| data.data.clone(), |item| item.sdp.clone());
-                self.handle_answer(data.sender_id.clone(), payload)
+                let payload = decode_negotiation(data.data);
+                let id = payload.id;
+                self.handle_decoded_answer(data.sender_id.clone(), payload)
                     .await
                     .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
-                if let Some(envelope) = envelope {
-                    self.send_negotiation_ack(&data.sender_id, &current_room_id, envelope.id)
+                if let Some(id) = id {
+                    self.send_negotiation_ack(&data.sender_id, &current_room_id, id)
                         .await;
                 }
                 Ok(())
@@ -1387,18 +1425,58 @@ pub(crate) fn offer_takeover_decision(
     }
 }
 
-pub(crate) fn parse_offer_payload(payload: &str) -> crate::error::Result<RTCSessionDescription> {
-    if let Ok(description) = serde_json::from_str::<RTCSessionDescription>(payload) {
-        return Ok(description);
-    }
-    RTCSessionDescription::offer(payload.to_string()).map_err(Into::into)
+pub(crate) fn negotiation_data(sdp: String) -> String {
+    serde_json::to_string(&NegotiationEnvelope {
+        id: rand::random(),
+        sdp,
+        reliable_unordered: Some(1),
+    })
+    .expect("negotiation JSON consists only of integers and strings")
 }
 
-pub(crate) fn parse_answer_payload(payload: &str) -> crate::error::Result<RTCSessionDescription> {
+struct DecodedNegotiation {
+    sdp: String,
+    reliable_unordered: Option<u8>,
+    id: Option<u64>,
+}
+
+fn decode_negotiation(payload: String) -> DecodedNegotiation {
+    match serde_json::from_str::<NegotiationEnvelope>(&payload) {
+        Ok(envelope) => DecodedNegotiation {
+            sdp: envelope.sdp,
+            reliable_unordered: envelope.reliable_unordered,
+            id: Some(envelope.id),
+        },
+        Err(_) => DecodedNegotiation {
+            sdp: payload,
+            reliable_unordered: None,
+            id: None,
+        },
+    }
+}
+
+fn parse_sdp_description(
+    payload: &str,
+    offer: bool,
+) -> crate::error::Result<RTCSessionDescription> {
     if let Ok(description) = serde_json::from_str::<RTCSessionDescription>(payload) {
         return Ok(description);
     }
-    RTCSessionDescription::answer(payload.to_string()).map_err(Into::into)
+    if offer {
+        RTCSessionDescription::offer(payload.to_string()).map_err(Into::into)
+    } else {
+        RTCSessionDescription::answer(payload.to_string()).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parse_offer_payload(payload: &str) -> crate::error::Result<RTCSessionDescription> {
+    parse_sdp_description(&decode_negotiation(payload.to_owned()).sdp, true)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_answer_payload(payload: &str) -> crate::error::Result<RTCSessionDescription> {
+    parse_sdp_description(&decode_negotiation(payload.to_owned()).sdp, false)
 }
 
 #[cfg(test)]
@@ -1406,6 +1484,47 @@ mod payload_tests {
     use super::*;
 
     const MINIMAL_SDP: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+
+    #[test]
+    fn wrapped_negotiation_preserves_raw_sdp_for_takeover_duplicates_and_application() {
+        let raw = format!("{MINIMAL_SDP}a=fingerprint:sha-256 NEW-PC\r\n");
+        for capability in [None, Some(1)] {
+            let decoded = decode_negotiation(
+                serde_json::to_string(&NegotiationEnvelope {
+                    id: 42,
+                    sdp: raw.clone(),
+                    reliable_unordered: capability,
+                })
+                .unwrap(),
+            );
+            assert_eq!(decoded.id, Some(42));
+            assert_eq!(decoded.reliable_unordered, capability);
+            assert_eq!(decoded.sdp, raw);
+            let fingerprint = sdp_fingerprint(&decoded.sdp).unwrap();
+            assert!(offer_takeover_decision(
+                Some("old-pc"),
+                Some(&fingerprint),
+                false,
+                None,
+                None,
+                None
+            ));
+            assert!(matches!(
+                duplicate_offer_decision(raw == decoded.sdp, RTCSignalingState::Stable, true),
+                Some(DuplicateOfferAction::ResendAnswer)
+            ));
+            assert_eq!(parse_sdp_description(&decoded.sdp, true).unwrap().sdp, raw);
+            assert_eq!(parse_sdp_description(&decoded.sdp, false).unwrap().sdp, raw);
+        }
+        let legacy = decode_negotiation(raw.clone());
+        assert_eq!(legacy.sdp, raw);
+        assert_eq!(legacy.id, None);
+        assert_eq!(legacy.reliable_unordered, None);
+        assert_eq!(
+            decode_negotiation(negotiation_data(raw.clone())).reliable_unordered,
+            Some(1)
+        );
+    }
 
     #[test]
     fn parse_offer_payload_accepts_raw_sdp() {

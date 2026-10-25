@@ -2,23 +2,11 @@
 //! per-peer ordered send queue introduced to fix the self-inflicted
 //! reordering bug described in the reorder-reliability notes.
 //!
-//! IMPORTANT SCOPE NOTE: the actual bug (and its regression test) lives one
-//! layer up, at `MistEngine::handle_action_for`/`handle_action_in_room`
-//! (`engine/action.rs`; regression test in `engine::tests::action_ordering`).
-//! This queue only preserves the order messages are *enqueued* in -- it
-//! cannot and does not make N genuinely-concurrently-`tokio::spawn`ed callers
-//! of `WebRtcTransport::send`/`try_enqueue_send` arrive in their spawn order,
-//! because tokio's scheduler makes no such guarantee between independently
-//! spawned tasks (confirmed empirically: an earlier version of this test
-//! spawned one task per send, exactly like `handle_action_for` used to, and
-//! still observed reordering even with this queue in place). The real fix is
-//! that `handle_action_for` no longer spawns a task per `SendMessage` at all
-//! -- it calls `try_enqueue_send`/`try_enqueue_broadcast` inline, so the
-//! enqueue order matches the caller's true call order. What this queue does
-//! guarantee, and what's covered here, is: (1) sequential/awaited sends are
-//! written to the DataChannel in that same order, and (2) it's bounded, with
-//! overflow dropped (not deadlocked or unbounded) once
-//! `PEER_SEND_QUEUE_CAPACITY` is exceeded.
+//! This queue preserves enqueue order through DataChannel writes. Reliable
+//! overlay senders must also stamp and enqueue inside the router's sequence
+//! critical section, shared by app and OverlayTransport sends. Inline enqueue
+//! alone does not order concurrent threads. These tests cover sequential writes
+//! and bounded admission; `send_queues` tests cover concurrent stamp/enqueue.
 use super::*;
 use crate::transports::webrtc::peer::PEER_SEND_QUEUE_CAPACITY;
 use crate::transports::webrtc::tests::disconnect::{make_connected_pair, wait_for_state};

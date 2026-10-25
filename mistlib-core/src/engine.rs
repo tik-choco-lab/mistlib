@@ -26,6 +26,8 @@ pub struct MistEngine {
     pub runtime: Arc<dyn AsyncRuntime>,
     pub aoi_nodes: Arc<Mutex<HashSet<NodeId>>>,
     run_generation: AtomicU64,
+    // Synchronous per-peer admission, with one async transport writer per queue.
+    send_queues: action::SendQueues,
     // Inner Arc lets us clone the handler out of the Mutex before calling on_event,
     // so the lock is not held during the (potentially slow) handler invocation.
     event_handler: Arc<Mutex<Arc<dyn EngineEventHandler>>>,
@@ -44,6 +46,7 @@ impl MistEngine {
             runtime,
             aoi_nodes: Arc::new(Mutex::new(HashSet::new())),
             run_generation: AtomicU64::new(0),
+            send_queues: Default::default(),
             event_handler: Arc::new(Mutex::new(Arc::new(DummyEngineEventHandler))),
             cleanup_done: Mutex::new(None),
         })

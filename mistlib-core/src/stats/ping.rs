@@ -42,6 +42,7 @@ fn send_ping_all(
                 to: target.clone(),
                 data: bytes::Bytes::from(data),
                 method: DeliveryMethod::Unreliable,
+                lane: crate::action::SendLane::Control,
             })
         })
         .collect()
@@ -56,14 +57,14 @@ pub(crate) fn tick_actions(
     let mut actions = Vec::new();
 
     for target in connected_nodes {
-        let misses = STATS.note_ping_sent(target);
+        let misses = STATS.note_ping_sent(target, timeout_count);
         // Edge-triggered: `misses` only ever equals `timeout_count` on the tick
         // it first crosses the threshold (it keeps climbing past it on every
-        // later miss), so this fires exactly once per suspect episode until a
-        // PONG resets the streak.
+        // later miss), so this fires exactly once per suspect episode until an
+        // inbound frame resets the streak.
         if timeout_count > 0 && misses == timeout_count {
             tracing::warn!(
-                "[Stats] peer {} missed {} consecutive PONGs; marking as disconnect-suspect \
+                "[Stats] peer {} had {} consecutive ping rounds without inbound activity; marking as disconnect-suspect \
                  so the transport's reconnect-grace flow can confirm or clear it",
                 target,
                 misses
@@ -97,6 +98,7 @@ pub(crate) fn handle_ping(
             to: from,
             data: bytes::Bytes::from(data),
             method: DeliveryMethod::Unreliable,
+            lane: crate::action::SendLane::Control,
         }],
         Err(e) => {
             tracing::warn!("[Stats] failed to serialize pong envelope: {}", e);
@@ -105,14 +107,14 @@ pub(crate) fn handle_ping(
     }
 }
 
-pub(crate) fn handle_pong(from: NodeId, payload: &[u8], timeout_count: u32) -> Vec<OverlayAction> {
+pub(crate) fn handle_pong(from: NodeId, payload: &[u8]) -> Vec<OverlayAction> {
     if payload.len() < 8 {
         return Vec::new();
     }
     let sent_time = u64::from_le_bytes(payload[..8].try_into().unwrap_or_default());
     let now = monotonic_micros();
     let rtt_ms = now.saturating_sub(sent_time) as f32 / 1000.0;
-    let was_suspect = STATS.note_pong_received(&from, timeout_count);
+    let was_suspect = STATS.note_pong_received(&from);
     STATS.set_rtt(from.clone(), rtt_ms);
 
     if was_suspect {
@@ -129,6 +131,32 @@ mod tests {
 
     fn node(id: &str) -> NodeId {
         NodeId(id.to_string())
+    }
+
+    #[test]
+    fn transport_bytes_reset_misses_and_clear_suspect_only_on_growth() {
+        use crate::stats::{MistStats, TransportReceiveCounter};
+        let stats = MistStats::new();
+        let peer = node("byte-growth");
+        let mut counter = TransportReceiveCounter::default();
+        assert!(!counter.observe("transport", 100));
+        for _ in 0..=3 {
+            stats.note_ping_sent(&peer, 3);
+        }
+        assert_eq!(stats.ping_consecutive_misses(&peer), 3);
+        assert!(!counter.observe("transport", 100));
+        assert_eq!(stats.note_ping_sent(&peer, 3), 4);
+        assert!(counter.observe("transport", 101));
+        assert!(stats.note_inbound_activity(&peer));
+        assert_eq!(stats.ping_consecutive_misses(&peer), 0);
+        assert_eq!(stats.note_ping_sent(&peer, 3), 0);
+        // A new counter, reset counter, or changed selected pair is a baseline.
+        assert!(!counter.observe("transport", 1));
+        assert!(!counter.observe("other-pair", 1000));
+        assert!(!TransportReceiveCounter::default().observe("transport", 1000));
+        assert_eq!(stats.note_ping_sent(&peer, 3), 1);
+        assert!(counter.observe("other-pair", 1001));
+        assert!(!stats.note_inbound_activity(&peer));
     }
 
     #[test]
@@ -155,7 +183,7 @@ mod tests {
 
     #[test]
     fn handle_pong_short_payload_is_noop() {
-        let actions = handle_pong(node("peer"), b"short", 5);
+        let actions = handle_pong(node("peer"), b"short");
         assert!(actions.is_empty());
     }
 
@@ -200,7 +228,7 @@ mod tests {
         assert_eq!(STATS.ping_consecutive_misses(&peer), 1);
 
         let payload = 42u64.to_le_bytes().to_vec();
-        let actions = handle_pong(peer.clone(), &payload, 5);
+        let actions = handle_pong(peer.clone(), &payload);
         assert_eq!(STATS.ping_consecutive_misses(&peer), 0);
         assert!(
             actions.is_empty(),
@@ -254,6 +282,37 @@ mod tests {
     }
 
     #[test]
+    fn inbound_activity_prevents_suspicion_without_pongs() {
+        let local = node("ping-activity-local");
+        let peer = node("ping-activity-peer");
+        let peers = std::slice::from_ref(&peer);
+        let threshold = 3;
+        for _ in 0..threshold {
+            tick_actions(&local, 1, peers, threshold);
+        }
+        assert_eq!(STATS.ping_consecutive_misses(&peer), threshold - 1);
+        assert!(!STATS.note_inbound_activity(&peer));
+        assert_eq!(STATS.ping_consecutive_misses(&peer), 0);
+        for _ in 0..20 {
+            let actions = tick_actions(&local, 1, peers, threshold);
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, OverlayAction::SuspectDisconnected { .. })));
+            assert_eq!(STATS.ping_consecutive_misses(&peer), 0);
+            assert!(!STATS.note_inbound_activity(&peer));
+        }
+        // Silence after sustained data must still start a fresh suspect episode.
+        let mut suspects = 0;
+        for _ in 0..threshold + 4 {
+            suspects += tick_actions(&local, 1, peers, threshold)
+                .iter()
+                .filter(|a| matches!(a, OverlayAction::SuspectDisconnected { .. }))
+                .count();
+        }
+        assert_eq!(suspects, 1);
+    }
+
+    #[test]
     fn handle_pong_clears_suspect_after_threshold_is_crossed() {
         let local = node("ping-test-local-f");
         let peer = node("ping-test-peer-f");
@@ -271,7 +330,7 @@ mod tests {
         assert!(saw_suspect, "test setup should have crossed the threshold");
 
         let payload = 7u64.to_le_bytes().to_vec();
-        let actions = handle_pong(peer.clone(), &payload, timeout_count);
+        let actions = handle_pong(peer.clone(), &payload);
         assert_eq!(
             actions.len(),
             1,
@@ -283,7 +342,7 @@ mod tests {
         ));
 
         // A later PONG (peer already cleared) must not re-emit ClearSuspect.
-        let actions = handle_pong(peer.clone(), &payload, timeout_count);
+        let actions = handle_pong(peer.clone(), &payload);
         assert!(actions.is_empty());
     }
 }
