@@ -18,7 +18,7 @@ pub use app::{
     clear_raw_handler, get_config, get_connected_nodes, get_connected_nodes_async,
     get_connection_state, get_connection_state_async, get_connection_state_value,
     get_connection_state_value_async, get_room_connections, get_room_connections_async, get_stats,
-    init, init_and_join, init_with_config, join_room, leave_room, leave_room_id,
+    init, init_and_join, init_with_config, join_room, leave_all_rooms, leave_room, leave_room_id,
     publish_local_track, register_event_callback, register_event_callback_v2, register_local_track,
     register_log_callback, register_media_track_handler, register_media_track_handler_async,
     register_raw_handler, remove_local_track, send_message, send_message_direct,

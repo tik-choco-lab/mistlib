@@ -10,7 +10,11 @@
 // builds one (`build_session`), the first time a given room_id is joined;
 // joining an already-active room is just an idempotent re-announce
 // (`request_peers`), matching the pre-multi-room behavior for a single
-// room. `leave_room`/`leave_room_id` tear a session down completely
+// room. Public WASM `leave_room(id)` tears down only that room;
+// `leave_all_rooms()` tears down all sessions and cancels all pending joins.
+// Missing/undefined `leave_room()` keeps the old leave-all behavior with a
+// one-time deprecation warning; `leave_room_id(id)` is a deprecated alias.
+// Internal L0 `leave_room()` still means all rooms. These APIs tear a session down completely
 // (`teardown_session`) rather than reusing it, so a subsequent join to the
 // same room always builds a brand new engine/transport/signaler -- this
 // sidesteps the SPEC-11 leave/rejoin race (a stale transport's in-flight

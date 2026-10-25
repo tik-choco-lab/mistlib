@@ -298,7 +298,8 @@ export async function browserClient(browserType, url, directory, name, { trace =
               if (!m.init_with_config(c.node, JSON.stringify(c.config))) throw new Error('init rejected');
               break;
             case 'join': await m.join_room_async(c.room); break;
-            case 'leave': await m.leave_room_id_async(c.room); break;
+            case 'leave': await m.leave_room_async(c.room); break;
+            case 'leave-all': m.leave_all_rooms(); break;
             case 'position': m.update_position_in_room(c.room, ...c.position); break;
             case 'send': m.send_message_in_room(c.room, c.target, new Uint8Array(c.data), 0); break;
             case 'stats': return JSON.parse(m.get_stats());

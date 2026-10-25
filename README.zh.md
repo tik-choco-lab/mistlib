@@ -101,13 +101,16 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 | 调用 | 作用 |
 | --- | --- |
 | `init_with_config(id, json)` | 创建节点。配置无效时返回 `false` |
-| `join_room(id)` / `leave_room_id(id)` | 加入或离开房间 |
+| `join_room(id)` / `leave_room(id)` (WASM), `leave_room_id(ptr,len)` (native 0.7) | 加入或离开指定房间 |
+| `leave_all_rooms()` | 离开所有房间 |
 | `update_position(x, y, z)` | 上报自身位置 |
 | `send_message(target, bytes, delivery)` | 发送给某个节点，或以 `""` 广播至整个房间 |
 | `get_neighbors()` / `get_all_nodes()` | 以 JSON 获取当前房间的视图 |
 | `storage_add(name, bytes)` / `storage_get(cid)` | 内容寻址存储 |
 | `register_event_callback(fn)` | 节点、兴趣区域与房间事件 |
 | `get_version()` / `get_build_info()` | 获取发布版本及实际加载的构建信息 |
+
+WASM 的 `leave_room_id(id)` 是已弃用的别名；无参数的 `leave_room()` 仍离开所有房间，并仅警告一次。native 0.7 保留已弃用的 `void leave_room(void)`（所有房间）和 `void leave_room_id(const uint8_t*, size_t)` 符号。native `leave_room(ptr,len)` 计划在 0.8 引入。
 
 `get_build_info()` 返回包含 `version`、`commit`、`dirty`、`profile` 和 `target` 的 JSON 字符串。
 即使发布版本相同，也可以确认其对应的源代码提交以及是否包含本地修改。

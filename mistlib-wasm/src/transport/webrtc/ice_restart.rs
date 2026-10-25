@@ -21,3 +21,14 @@ pub fn should_trigger_ice_restart(
 ) -> bool {
     is_new_grace && is_initiator && signaling_is_stable
 }
+
+/// A transient consent-check failure must not restart a path that is still
+/// receiving SCTP/DTLS traffic. An in-place restart resets the native peer's
+/// candidate pairs, so it can turn a recoverable blip into a lost association.
+pub const ICE_RESTART_DEBOUNCE_MS: u32 = 2_000;
+
+pub fn restart_has_inbound_silence(last_rx_age: Option<std::time::Duration>) -> bool {
+    last_rx_age.is_none_or(|age| {
+        age >= std::time::Duration::from_millis(u64::from(ICE_RESTART_DEBOUNCE_MS))
+    })
+}

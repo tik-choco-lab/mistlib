@@ -103,13 +103,16 @@ send_message("", new TextEncoder().encode("hello"), Delivery.Reliable); // "" �
 | 呼び出し | 役割 |
 | --- | --- |
 | `init_with_config(id, json)` | ノードを生成する。設定が不正なら `false` を返す |
-| `join_room(id)` / `leave_room_id(id)` | ルームへの参加・退出 |
+| `join_room(id)` / `leave_room(id)` (WASM), `leave_room_id(ptr,len)` (native 0.7) | 指定ルームへの参加・退出 |
+| `leave_all_rooms()` | 全ルームから退出 |
 | `update_position(x, y, z)` | 自分の位置を報告する |
 | `send_message(target, bytes, delivery)` | 特定のピアへ、または `""` でルーム全体へ送信 |
 | `get_neighbors()` / `get_all_nodes()` | 現在のルームの見え方を JSON で取得 |
 | `storage_add(name, bytes)` / `storage_get(cid)` | コンテンツアドレス指定ストレージ |
 | `register_event_callback(fn)` | ピア・AOI・ルームのイベント |
 | `get_version()` / `get_build_info()` | リリース版と、実際にロードしたビルドの情報を取得 |
+
+WASM の `leave_room_id(id)` は非推奨 alias。引数なし `leave_room()` は全ルーム退出を維持し、一度だけ警告します。native 0.7 は非推奨の `void leave_room(void)`（全ルーム）と `void leave_room_id(const uint8_t*, size_t)` を維持します。native `leave_room(ptr,len)` は 0.8 で導入予定です。
 
 `get_build_info()` は `version`、`commit`、`dirty`、`profile`、`target` を含む JSON 文字列を返す。
 同じリリース版でも、基準になったコミットとローカル変更の有無を確認できる。

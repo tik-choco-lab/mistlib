@@ -2,6 +2,7 @@
 mod ice_restart;
 
 use ice_restart::should_trigger_ice_restart;
+use std::time::Duration;
 
 #[test]
 fn triggers_only_for_a_new_initiator_grace_with_stable_signaling() {
@@ -19,4 +20,21 @@ fn triggers_only_for_a_new_initiator_grace_with_stable_signaling() {
             "case: {name}"
         );
     }
+}
+
+#[test]
+fn live_sctp_path_defers_restart_but_silence_allows_repair() {
+    use ice_restart::{restart_has_inbound_silence, ICE_RESTART_DEBOUNCE_MS};
+    let window = u64::from(ICE_RESTART_DEBOUNCE_MS);
+    // Transport-counter growth counts even when reliable reassembly is stalled.
+    for age in [0, 50, window - 1] {
+        assert!(!restart_has_inbound_silence(Some(Duration::from_millis(
+            age
+        ))));
+    }
+    assert!(restart_has_inbound_silence(Some(Duration::from_millis(
+        window
+    ))));
+    assert!(restart_has_inbound_silence(Some(Duration::from_secs(30))));
+    assert!(restart_has_inbound_silence(None));
 }

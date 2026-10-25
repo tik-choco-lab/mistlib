@@ -233,7 +233,7 @@ def main():
         "init_with_config": ([C.c_char_p, size, C.c_char_p, size], C.c_bool),
         "join_room": ([C.c_char_p, size], None),
         "leave_room_id": ([C.c_char_p, size], None),
-        "leave_room": ([], None),
+        "leave_all_rooms": ([], None),
         "update_position_in_room": ([C.c_char_p, size, C.c_float, C.c_float, C.c_float], None),
         "send_message_in_room": ([C.c_char_p, size, C.c_char_p, size, C.c_char_p, size, C.c_uint32], None),
         "get_build_info": ([pointer, size], C.c_uint32),
@@ -292,6 +292,8 @@ def main():
                     raise ValueError("init_with_config rejected configuration")
             elif op in ("join", "leave"):
                 getattr(lib, "join_room" if op == "join" else "leave_room_id")(room, len(room))
+            elif op == "leave-all":
+                lib.leave_all_rooms()
             elif op == "position":
                 lib.update_position_in_room(room, len(room), *command["position"])
             elif op == "send":

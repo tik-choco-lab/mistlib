@@ -32,7 +32,7 @@ impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
 
     /// start starts the timer.
     pub(crate) fn start(&mut self) -> bool {
-        // this timer is already closed
+        // Already armed; the observer retires the handle on timeout.
         if self.close_tx.is_some() {
             return false;
         }
@@ -60,8 +60,7 @@ impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
         true
     }
 
-    /// stops the timer. this is similar to stop() but subsequent start() call
-    /// will fail (the timer is no longer usable)
+    /// Stops the timer and permits a subsequent start, including after expiry.
     pub(crate) fn stop(&mut self) {
         self.close_tx.take();
     }

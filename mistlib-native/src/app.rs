@@ -263,8 +263,13 @@ pub fn init_with_config(id: String, data: &[u8]) -> bool {
     true
 }
 
-pub fn leave_room() {
+pub fn leave_all_rooms() {
     ENGINE.l0.leave_room();
+}
+
+/// Deprecated name since 0.7.0: use `leave_all_rooms`.
+pub fn leave_room() {
+    leave_all_rooms();
 }
 
 /// Leaves only `room_id`, leaving every other active room untouched.
@@ -273,7 +278,7 @@ pub fn leave_room_id(room_id: String) {
 }
 
 pub fn shutdown() {
-    leave_room();
+    leave_all_rooms();
 }
 
 pub fn update_position(x: f32, y: f32, z: f32) {

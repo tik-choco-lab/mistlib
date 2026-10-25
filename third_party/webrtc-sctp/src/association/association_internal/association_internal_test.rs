@@ -571,3 +571,75 @@ async fn test_assoc_max_message_size_explicit() -> Result<()> {
 
     Ok(())
 }
+
+// After an idle packet has used the delayed-ACK timer, the next idle packet
+// must get its own ACK without needing another DATA packet or a sender RTO.
+#[tokio::test(start_paused = true)]
+async fn test_delayed_ack_rearms_after_expiry() -> Result<()> {
+    delayed_ack_rearms_after_expiry(true).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_ordered_delayed_ack_rearms_after_expiry() -> Result<()> {
+    delayed_ack_rearms_after_expiry(false).await
+}
+
+async fn delayed_ack_rearms_after_expiry(unordered: bool) -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "receiver".to_owned(),
+    });
+    let (wake_tx, mut wake_rx) = mpsc::channel(1);
+    a.awake_write_loop_ch = Arc::new(wake_tx);
+    a.peer_last_tsn = 100;
+    a.set_state(AssociationState::Established);
+    let stream = a.open_stream(1, PayloadProtocolIdentifier::Binary)?;
+    let a = Arc::new(Mutex::new(a));
+    a.lock().await.ack_timer = Some(AckTimer::new(Arc::downgrade(&a), ACK_INTERVAL));
+
+    for tsn in 101..=103 {
+        {
+            let mut a = a.lock().await;
+            a.handle_chunk_start();
+            a.handle_data(&ChunkPayloadData {
+                tsn,
+                stream_identifier: 1,
+                unordered,
+                stream_sequence_number: (tsn - 101) as u16,
+                beginning_fragment: true,
+                ending_fragment: true,
+                payload_type: PayloadProtocolIdentifier::Binary,
+                user_data: Bytes::from_static(b"data"),
+                ..Default::default()
+            })
+            .await?;
+            a.handle_chunk_end();
+            assert_eq!(a.ack_state, AckState::Delay);
+        }
+        // Auto-advance paused time to the delayed ACK, with no second DATA.
+        tokio::time::timeout(
+            ACK_INTERVAL + tokio::time::Duration::from_millis(10),
+            wake_rx.recv(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("isolated DATA TSN {tsn} must trigger its delayed ACK"))
+        .expect("write loop must remain open");
+        let mut a = a.lock().await;
+        let packets = a.gather_outbound_sack_packets(vec![]).await;
+        assert_eq!(packets.len(), 1);
+        let sack = packets[0].chunks[0]
+            .as_any()
+            .downcast_ref::<ChunkSelectiveAck>()
+            .unwrap();
+        assert_eq!(sack.cumulative_tsn_ack, tsn);
+        assert_eq!(a.stats.get_num_ack_timeouts(), u64::from(tsn - 100));
+        assert_eq!(a.ack_state, AckState::Idle);
+        let mut buffer = [0; 4];
+        assert_eq!(stream.read_sctp(&mut buffer).await?.0, 4);
+        assert_eq!(&buffer, b"data");
+    }
+    assert!(!a.lock().await.ack_timer.as_ref().unwrap().is_running());
+    Ok(())
+}

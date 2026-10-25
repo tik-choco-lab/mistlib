@@ -103,13 +103,16 @@ Call `update_position` as your avatar moves — it is what drives topology and a
 | Call | Does |
 | --- | --- |
 | `init_with_config(id, json)` | Create the node. Returns `false` if the config is invalid |
-| `join_room(id)` / `leave_room_id(id)` | Enter or leave a room |
+| `join_room(id)` / `leave_room(id)` (WASM), `leave_room_id(ptr,len)` (native 0.7) | Enter or leave one room |
+| `leave_all_rooms()` | Leave every room |
 | `update_position(x, y, z)` | Report where you are |
 | `send_message(target, bytes, delivery)` | Send to one peer, or to the room with `""` |
 | `get_neighbors()` / `get_all_nodes()` | Current view of the room, as JSON |
 | `storage_add(name, bytes)` / `storage_get(cid)` | Content-addressed storage |
 | `register_event_callback(fn)` | Peer, area-of-interest and room events |
 | `get_version()` / `get_build_info()` | Get the release version and the exact loaded build |
+
+In WASM, `leave_room_id(id)` is a deprecated alias; `leave_room()` without an ID still leaves all rooms and warns once. Native 0.7 preserves the deprecated `void leave_room(void)` (all rooms) and `void leave_room_id(const uint8_t*, size_t)` symbols. Native `leave_room(ptr,len)` is planned for 0.8.
 
 `get_build_info()` returns a JSON string containing `version`, `commit`, `dirty`, `profile`, and
 `target`. It identifies the source commit and whether tracked local changes were present.

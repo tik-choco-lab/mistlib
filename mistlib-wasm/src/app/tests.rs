@@ -364,6 +364,31 @@ mod join_state_tests {
     }
 
     #[wasm_bindgen_test]
+    fn ffi_leave_room_preserves_other_rooms_and_all_variants_drain() {
+        use crate::ffi;
+        for legacy in [false, true] {
+            for room in ["ffi-leave-a", "ffi-leave-b"] {
+                insert_session(room.into(), make_dummy_session(NodeId(room.into())));
+            }
+            if legacy {
+                ffi::leave_room_id("ffi-leave-a".into()).unwrap();
+            } else {
+                ffi::leave_room(Some("ffi-leave-a".into())).unwrap();
+            }
+            assert!(!session_exists("ffi-leave-a"));
+            assert!(session_exists("ffi-leave-b"));
+            insert_session("ffi-leave-a".into(), make_dummy_session(NodeId("a".into())));
+            if legacy {
+                ffi::leave_room(None).unwrap();
+            } else {
+                ffi::leave_all_rooms();
+            }
+            assert!(!session_exists("ffi-leave-a"));
+            assert!(!session_exists("ffi-leave-b"));
+        }
+    }
+
+    #[wasm_bindgen_test]
     fn session_engine_callbacks_can_remove_their_session() {
         let room = "w18-registry-reentry";
         let session = make_dummy_session(NodeId("w18-local".into()));

@@ -41,12 +41,38 @@ pub(super) async fn trigger_ice_restart(
     room_id: String,
     negotiation_delivery: Arc<RwLock<NegotiationDelivery>>,
 ) {
+    // Like the native repair path, allow natural recovery before renegotiating.
+    // Keep deferring while inbound data proves the old path is alive. Do not
+    // hold `negotiating` during this wait: a remote repair must still be able to
+    // complete. Closing/replacing this Peer closes its PC and ends the loop.
+    loop {
+        if peer.pc.ice_connection_state() != RtcIceConnectionState::Disconnected {
+            return;
+        }
+        gloo_timers::future::TimeoutFuture::new(super::ice_restart::ICE_RESTART_DEBOUNCE_MS).await;
+        if peer.pc.ice_connection_state() != RtcIceConnectionState::Disconnected {
+            return;
+        }
+        if super::ice_restart::restart_has_inbound_silence(
+            peer.inbound_activity.last_rx().map(|rx| rx.elapsed()),
+        ) {
+            break;
+        }
+        tracing::debug!(
+            "Deferring ICE restart for {}: inbound path is active",
+            remote_id.0
+        );
+    }
     let _negotiating = peer.negotiating.lock().await;
     let pc = &peer.pc;
 
     // The browser can recover before this spawned task runs or while it is
     // waiting for another negotiation. Never restart a recovered/closed PC.
-    if pc.ice_connection_state() != RtcIceConnectionState::Disconnected {
+    if pc.ice_connection_state() != RtcIceConnectionState::Disconnected
+        || !super::ice_restart::restart_has_inbound_silence(
+            peer.inbound_activity.last_rx().map(|rx| rx.elapsed()),
+        )
+    {
         tracing::debug!(
             "Skipping ICE restart for {}: ICE no longer disconnected",
             remote_id.0
@@ -89,7 +115,11 @@ pub(super) async fn trigger_ice_restart(
     // the peer was disconnected after we acquired the lock. Until setLocal-
     // Description, we can still discard the stale proposal without committing
     // another negotiation. After commit, the exchange must run to completion.
-    if pc.ice_connection_state() != RtcIceConnectionState::Disconnected {
+    if pc.ice_connection_state() != RtcIceConnectionState::Disconnected
+        || !super::ice_restart::restart_has_inbound_silence(
+            peer.inbound_activity.last_rx().map(|rx| rx.elapsed()),
+        )
+    {
         tracing::debug!(
             "Skipping ICE restart for {}: ICE recovered during createOffer",
             remote_id.0

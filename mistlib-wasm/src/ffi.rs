@@ -176,19 +176,46 @@ pub fn is_room_joined(room_id: String) -> bool {
     crate::app::is_room_joined(room_id)
 }
 
+/// Leaves the specified room. Missing/undefined is a deprecated leave-all call.
 #[wasm_bindgen]
-pub fn leave_room() {
+pub fn leave_room(room_id: Option<String>) -> Result<(), JsValue> {
+    match room_id {
+        Some(room_id) => crate::app::leave_room_id(room_id),
+        None => {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| {
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "leave_room() without a room ID is deprecated; use leave_all_rooms()",
+                ));
+            });
+            leave_all_rooms();
+            Ok(())
+        }
+    }
+}
+
+/// Leaves every active room and cancels every pending join.
+#[wasm_bindgen]
+pub fn leave_all_rooms() {
     crate::app::leave_room();
 }
 
+/// @deprecated Since 0.7.0: use `leave_room(room_id)`.
 #[wasm_bindgen]
 pub fn leave_room_id(room_id: String) -> Result<(), JsValue> {
-    crate::app::leave_room_id(room_id)
+    leave_room(Some(room_id))
 }
 
+/// Leaves one room and waits for signaling/transport cleanup before resolving.
+#[wasm_bindgen]
+pub fn leave_room_async(room_id: String) -> js_sys::Promise {
+    crate::app::leave_room_id_async(room_id)
+}
+
+/// @deprecated Since 0.7.0: use `leave_room_async(room_id)`.
 #[wasm_bindgen]
 pub fn leave_room_id_async(room_id: String) -> js_sys::Promise {
-    crate::app::leave_room_id_async(room_id)
+    leave_room_async(room_id)
 }
 
 #[wasm_bindgen]

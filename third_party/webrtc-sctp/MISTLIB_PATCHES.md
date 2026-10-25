@@ -74,3 +74,24 @@ not a hard control-latency guarantee under network congestion or loss.
 Socket-free regressions cover alternation, repeated bulk refill, stable peeks,
 and fragment contiguity. Run `cargo test --manifest-path
 third_party/webrtc-sctp/Cargo.toml -p webrtc-sctp --locked queue::queue_test::test_pending_queue`.
+
+## SPEC-20 P4 delayed-ACK timer lifecycle (2026-10-25)
+
+The delayed-ACK timer is one-shot, but its expiry callback retained `close_tx`.
+After emitting a SACK, the association returned to `AckState::Idle`; the next
+isolated DATA entered `Delay` while `AckTimer::start` rejected the stale handle.
+Its SACK then depended on another packet or sender retransmission. Retire the
+handle in `AssociationInternal::on_ack_timeout` under the existing association
+lock before requesting the SACK. Keep the ACK interval, wire format, receive
+window, reliability, and congestion policy unchanged.
+
+Paused-time association regressions deliver isolated ordered/unordered messages,
+await each write-loop wakeup without sending a second packet, inspect the emitted
+SACK, verify its cumulative TSN, and read the delivered payload. Both fail on
+the original implementation after the first expiry and pass with the fix.
+Run the standalone crate tests above, or filter by `delayed_ack_rearms_after_expiry`.
+
+This is an independently confirmed receiver defect, not a complete explanation
+of Firefox/native WAN stalls: the timer-only timing cohort still exhibited ICE
+restart and association replacement. See SPEC-20's P4 memo and the dated storage
+evaluation for the separate browser repair investigation and acceptance results.

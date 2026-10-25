@@ -106,17 +106,28 @@ pub unsafe extern "C" fn init_with_config(
     crate::app::init_with_config(local_id, config_raw)
 }
 
+/// Leaves every active room.
 #[no_mangle]
-pub extern "C" fn leave_room() {
-    crate::app::leave_room();
+pub extern "C" fn leave_all_rooms() {
+    crate::app::leave_all_rooms();
 }
 
+/// Deprecated since 0.7.0: use `leave_all_rooms()`.
+/// This legacy C symbol still takes no arguments and leaves every room.
+/// In 0.8 it is planned to become `leave_room(room_ptr, room_len)`.
 #[no_mangle]
+pub extern "C" fn leave_room() {
+    leave_all_rooms();
+}
+
+/// Deprecated name since 0.7.0; retained for native ABI compatibility.
+/// Use this per-room symbol until 0.8 introduces `leave_room(room_ptr, room_len)`.
 /// Leaves only `room_id`'s session, leaving every other active room
 /// untouched. Not-joined is a no-op.
 ///
 /// # Safety
 /// `room_ptr` must be valid for `room_len` bytes.
+#[no_mangle]
 pub unsafe extern "C" fn leave_room_id(room_ptr: *const u8, room_len: usize) {
     let room_raw = unsafe { std::slice::from_raw_parts(room_ptr, room_len) };
     let room_id = String::from_utf8_lossy(room_raw).to_string();
@@ -431,6 +442,35 @@ pub unsafe extern "C" fn get_config(buffer: *mut u8, buffer_len: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leave_exports_preserve_native_abi_and_scope() {
+        use crate::engine::tests::session_registry::{fake_session, REGISTRY_TEST_LOCK};
+        use crate::engine::ENGINE;
+        // No ambient Tokio runtime: native leave calls synchronously finish teardown.
+        let _guard = ENGINE.runtime.block_on(REGISTRY_TEST_LOCK.lock());
+        let all: extern "C" fn() = leave_all_rooms;
+        let legacy_all: extern "C" fn() = leave_room;
+        let legacy_one: unsafe extern "C" fn(*const u8, usize) = leave_room_id;
+        for leave in [all, legacy_all] {
+            ENGINE.runtime.block_on(async {
+                ENGINE.remove_all_sessions().await;
+                ENGINE.insert_session("a".into(), fake_session("a")).await;
+                ENGINE.insert_session("b".into(), fake_session("b")).await;
+            });
+            unsafe { legacy_one(b"a".as_ptr(), 1) };
+            ENGINE.runtime.block_on(async {
+                assert!(!ENGINE.has_session("a").await);
+                assert!(ENGINE.has_session("b").await);
+                ENGINE.insert_session("a".into(), fake_session("a")).await;
+            });
+            leave();
+            assert!(ENGINE
+                .runtime
+                .block_on(ENGINE.sessions_snapshot())
+                .is_empty());
+        }
+    }
 
     #[test]
     fn node_id_array_accepts_only_string_arrays() {

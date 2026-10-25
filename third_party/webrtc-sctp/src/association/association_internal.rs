@@ -2275,6 +2275,12 @@ impl AssociationInternal {
 #[async_trait]
 impl AckTimerObserver for AssociationInternal {
     async fn on_ack_timeout(&mut self) {
+        // Retire this one-shot timer before requesting the SACK. Otherwise start()
+        // sees the expired handle and later isolated DATA waits for another packet
+        // (or the sender's retransmission) instead of receiving a delayed ACK.
+        if let Some(ack_timer) = &mut self.ack_timer {
+            ack_timer.stop();
+        }
         log::trace!(
             "[{}] ack timed out (ack_state: {})",
             self.name,

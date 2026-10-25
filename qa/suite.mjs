@@ -201,7 +201,7 @@ async function runPair(kinds, url) {
       let total = 0, maxConnectionMs = 0, maxDeliveryMs = 0;
       for (let cycle = 0; cycle < policy.rejoinCycles; cycle++) {
         const marks = await checkpoint();
-        await clients[1].command({ op: 'leave', room });
+        await clients[1].command({ op: 'leave', room }); // per-room leave; preserves the other room
         await until(() => clients[0].events(), events => events.slice(marks[0]).some(event =>
           event.kind === 'disconnected' && event.sender === ids[1] && event.room === room),
         policy.connectionDeadlineMs, 'leave observed by the other peer');

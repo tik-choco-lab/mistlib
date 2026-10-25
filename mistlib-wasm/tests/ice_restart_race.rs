@@ -4,17 +4,39 @@ use async_trait::async_trait;
 use js_sys::{Function, Reflect};
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingType};
 use mistlib_core::types::NodeId;
-use mistlib_wasm::transport::webrtc::{negotiation_delivery::NegotiationDelivery, Peer};
+use mistlib_wasm::transport::webrtc::negotiation_delivery::NegotiationDelivery;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
 use web_sys::RtcPeerConnection;
 
-// Compile the actual async restart path; replace only its signaling delivery
-// endpoint so this test needs neither a browser connection nor retry timers.
+// Compile the actual async restart path and activity tracker against a minimal
+// Peer with the same private fields. No real browser connection is needed.
+#[path = "../src/transport/webrtc/disconnect_grace.rs"]
+#[allow(dead_code)]
+mod disconnect_grace;
+#[path = "../src/transport/webrtc/ice_restart.rs"]
+#[allow(dead_code)]
+mod ice_restart;
 #[path = "../src/transport/webrtc/restart.rs"]
 mod restart;
+
+struct Peer {
+    pc: RtcPeerConnection,
+    negotiating: futures::lock::Mutex<()>,
+    inbound_activity: disconnect_grace::InboundActivity,
+}
+
+impl Peer {
+    fn new(pc: RtcPeerConnection) -> Self {
+        Self {
+            pc,
+            negotiating: futures::lock::Mutex::new(()),
+            inbound_activity: disconnect_grace::InboundActivity::new(),
+        }
+    }
+}
 
 async fn send_negotiation_reliably(
     signaler: Arc<dyn Signaler>,
@@ -111,10 +133,31 @@ async fn recovery_while_waiting_for_negotiation_lock_skips_restart() {
     let guard = peer.negotiating.lock().await;
     let mut restart = Box::pin(trigger(peer.clone(), signals.clone()));
     assert!(futures::poll!(restart.as_mut()).is_pending());
+    gloo_timers::future::TimeoutFuture::new(ice_restart::ICE_RESTART_DEBOUNCE_MS + 10).await;
+    assert!(futures::poll!(restart.as_mut()).is_pending());
     Reflect::set(&peer.pc, &"iceConnectionState".into(), &"connected".into()).unwrap();
     drop(guard);
     restart.await;
     assert_eq!(calls(&peer, "offers"), 0.0);
+    assert_eq!(calls(&peer, "locals"), 0.0);
+    assert_eq!(signals.0.load(Ordering::Relaxed), 0);
+}
+
+#[wasm_bindgen_test]
+async fn inbound_sctp_during_disconnect_defers_restart_until_natural_recovery() {
+    let peer = mock_peer("disconnected");
+    let signals = Arc::new(Signals::default());
+    let mut restart = Box::pin(trigger(peer.clone(), signals.clone()));
+    assert!(futures::poll!(restart.as_mut()).is_pending());
+    gloo_timers::future::TimeoutFuture::new(ice_restart::ICE_RESTART_DEBOUNCE_MS + 10).await;
+    // The transport sweeper sees SACK/DTLS traffic even if reliable messages
+    // cannot complete. Such activity must prevent replacing the live path.
+    peer.inbound_activity.record_transport_bytes("sctp", 100);
+    peer.inbound_activity.record_transport_bytes("sctp", 200);
+    assert!(futures::poll!(restart.as_mut()).is_pending());
+    assert_eq!(calls(&peer, "offers"), 0.0);
+    Reflect::set(&peer.pc, &"iceConnectionState".into(), &"connected".into()).unwrap();
+    restart.await;
     assert_eq!(calls(&peer, "locals"), 0.0);
     assert_eq!(signals.0.load(Ordering::Relaxed), 0);
 }

@@ -95,7 +95,7 @@ class ConcurrentGetTest(unittest.TestCase):
             "storage_get": get, "send_message_in_room": send,
         }
         lib = SimpleNamespace(**{name: Function(fn) for name, fn in functions.items()})
-        for name in ("init_with_config", "join_room", "leave_room_id", "leave_room",
+        for name in ("init_with_config", "join_room", "leave_room_id", "leave_all_rooms",
                      "update_position_in_room", "storage_add"):
             setattr(lib, name, Function())
 
