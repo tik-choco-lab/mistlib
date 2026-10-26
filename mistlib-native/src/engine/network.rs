@@ -13,7 +13,7 @@ impl super::MistEngine {
     /// (`ctx.cancel`) or its transport's event channel closes. Unlike the
     /// single-session original, this no longer re-reads shared engine state
     /// per event: `ctx` *is* the running session for the lifetime of this loop.
-    pub(super) async fn process_network_events(
+    pub(crate) async fn process_network_events(
         &self,
         mut rx: mpsc::UnboundedReceiver<NetworkEvent>,
         ctx: Arc<SessionCtx>,
@@ -219,7 +219,6 @@ mod tests {
     use mistlib_core::transport::{NetworkEventHandler, Transport};
     use mistlib_core::types::{ConnectionState, DeliveryMethod};
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Condvar, Mutex as StdMutex};
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
@@ -340,8 +339,7 @@ mod tests {
             overlay: Some(overlay),
             node_store: Arc::new(StdMutex::new(NodeStore::new())),
             aoi_nodes: Arc::new(StdMutex::new(HashSet::new())),
-            had_connected_peers: AtomicBool::new(false),
-            all_connections_lost_dispatched: AtomicBool::new(false),
+            connection_loss: Default::default(),
             cancel: CancellationToken::new(),
         });
         (ctx, handler)

@@ -124,6 +124,7 @@ impl MistEngine {
         mut sig_rx: mpsc::UnboundedReceiver<MessageContent>,
     ) -> Result<(), String> {
         self.await_previous_cleanup().await;
+        self.connection_loss.reset();
 
         let run_generation = self
             .run_generation

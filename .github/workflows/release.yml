@@ -53,6 +53,15 @@ jobs:
             } catch (error) {
               if (error.status !== 404) throw error;
             }
+            if (process.env.VERSION.includes('-')) {
+              const versionCore = process.env.VERSION.split('-')[0];
+              try {
+                await github.rest.git.getRef({...context.repo, ref: `tags/v${versionCore}`});
+                throw new Error('Prerelease core already has a stable tag; start a new beta cycle.');
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
             try {
               const latest = (await github.rest.repos.getLatestRelease(context.repo)).data.tag_name;
               const core = value => {

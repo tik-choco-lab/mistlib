@@ -2,6 +2,7 @@ pub mod action;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod events;
 pub mod layers;
 pub mod overlay;
 pub mod runtime;

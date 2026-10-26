@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from gate import require
-from package import validate_version
+from package import npm_dist_tag, validate_version
 from verify import verify
 
 
@@ -33,6 +33,8 @@ def main():
             raise
     else:
         core = lambda value: tuple(map(int, validate_version(value).split("-")[0].split(".")))
+        require("-" not in args.version or core(args.version) != core(current),
+                "prerelease core is already stable on npm; start a new beta cycle")
         require(core(args.version) >= core(current), "candidate would downgrade the current stable npm release")
     try:
         with urlopen(f"https://registry.npmjs.org/@tik-choco%2Fmistlib/{args.version}", timeout=30) as response:
@@ -47,7 +49,7 @@ def main():
     npm_version = subprocess.check_output(["npm", "--version"], text=True).strip()
     require(tuple(map(int, npm_version.split("."))) >= (11, 5, 1), "npm >= 11.5.1 is required for trusted publishing")
     subprocess.run(["npm", "publish", str(tarball.resolve()), "--access", "public", "--tag",
-                    "next" if "-" in args.version else "latest"], check=True)
+                    npm_dist_tag(args.version)], check=True)
 
 
 if __name__ == "__main__":

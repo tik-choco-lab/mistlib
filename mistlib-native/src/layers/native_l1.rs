@@ -63,12 +63,12 @@ impl L1Notifier for NativeL1Transport {
     }
 
     fn notify_node_position_updated(&self, node_id: &NodeId, x: f32, y: f32, z: f32) {
-        let payload = format!("{{\"x\":{}, \"y\":{}, \"z\":{}}}", x, y, z);
+        let payload = mistlib_core::events::position_payload(x, y, z);
         crate::events::dispatch_event(
             crate::events::EVENT_NODE_POSITION_UPDATED,
             &self.room_id,
             node_id,
-            payload.as_bytes(),
+            &payload,
         );
     }
 }

@@ -8,59 +8,33 @@ pub fn set_log_level(level: &str) -> bool {
     crate::app::set_log_level(level)
 }
 
-pub const EVENT_RAW: u32 = crate::app::EVENT_RAW;
-pub const EVENT_OVERLAY: u32 = crate::app::EVENT_OVERLAY;
-pub const EVENT_NEIGHBORS: u32 = crate::app::EVENT_NEIGHBORS;
-pub const EVENT_AOI_ENTERED: u32 = crate::app::EVENT_AOI_ENTERED;
-pub const EVENT_AOI_LEFT: u32 = crate::app::EVENT_AOI_LEFT;
-pub const EVENT_PEER_CONNECTED: u32 = crate::app::EVENT_PEER_CONNECTED;
-pub const EVENT_PEER_DISCONNECTED: u32 = crate::app::EVENT_PEER_DISCONNECTED;
-pub const EVENT_AOI_NODES: u32 = crate::app::EVENT_AOI_NODES;
-pub const EVENT_ROOM_JOINED: u32 = crate::app::EVENT_ROOM_JOINED;
-pub const EVENT_ROOM_JOIN_FAILED: u32 = crate::app::EVENT_ROOM_JOIN_FAILED;
-pub const EVENT_ROOM_LEFT: u32 = crate::app::EVENT_ROOM_LEFT;
-pub const MEDIA_EVENT_TRACK_ADDED: u32 = crate::app::MEDIA_EVENT_TRACK_ADDED;
-pub const MEDIA_EVENT_TRACK_REMOVED: u32 = crate::app::MEDIA_EVENT_TRACK_REMOVED;
+pub use mistlib_core::events::*;
 
 pub const DELIVERY_RELIABLE: u32 = crate::app::DELIVERY_RELIABLE;
 pub const DELIVERY_UNRELIABLE_ORDERED: u32 = crate::app::DELIVERY_UNRELIABLE_ORDERED;
 pub const DELIVERY_UNRELIABLE: u32 = crate::app::DELIVERY_UNRELIABLE;
 pub const DELIVERY_RELIABLE_UNORDERED: u32 = crate::app::DELIVERY_RELIABLE_UNORDERED;
 
-// wasm-bindgen cannot export a free `pub const`, so the constants above are
-// invisible to JS -- importing `EVENT_PEER_CONNECTED` from the generated module
-// is a link-time error that takes the whole import statement down with it. These
-// enums are what JS actually sees; wasm-bindgen emits them as frozen objects
-// (`MistEvent.PeerConnected === 5`) plus matching TypeScript declarations.
-// The consts stay for Rust callers, and the const assertions below make the two
-// impossible to drift apart.
-
-/// Event ids passed as the first argument of the `register_event_callback`
-/// callback. Media events are numbered separately, see [`MistMediaEvent`].
-#[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MistEvent {
-    Raw = 0,
-    Overlay = 1,
-    Neighbors = 2,
-    AoiEntered = 3,
-    AoiLeft = 4,
-    PeerConnected = 5,
-    PeerDisconnected = 6,
-    AoiNodes = 7,
-    RoomJoined = 8,
-    RoomJoinFailed = 9,
-    RoomLeft = 10,
+// wasm-bindgen requires literal discriminants. Expand both JS enums from the
+// core tables so there is no second numbering to maintain in this engine.
+macro_rules! define_app_events {
+    ($($name:ident, $constant:ident, $variant:ident, $code:literal;)*) => {
+        /// Application callback codes (shared with native).
+        #[wasm_bindgen]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum MistEvent { $($variant = $code,)* }
+    };
 }
-
-/// Event ids passed to the `register_media_event_callback` callback. Numbered
-/// from 100 so they never collide with [`MistEvent`].
-#[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MistMediaEvent {
-    TrackAdded = 100,
-    TrackRemoved = 101,
+macro_rules! define_media_events {
+    ($($name:ident, $constant:ident, $variant:ident, $code:literal;)*) => {
+        /// Media callback codes, in a separate callback from application events.
+        #[wasm_bindgen]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum MistMediaEvent { $($variant = $code,)* }
+    };
 }
+mistlib_core::application_event_codes!(define_app_events);
+mistlib_core::media_event_codes!(define_media_events);
 
 /// Delivery guarantee for `send_message`, mapping onto the underlying WebRTC
 /// data channel configuration.
@@ -77,7 +51,7 @@ pub enum Delivery {
     ReliableUnordered = 3,
 }
 
-// A mismatch here means JS and Rust disagree about a wire-visible number, which
+// A mismatch here means JS and Rust disagree about an application callback code, which
 // would surface as silently misrouted events rather than as a build failure.
 const _: () = {
     assert!(MistEvent::Raw as u32 == EVENT_RAW);
@@ -88,6 +62,8 @@ const _: () = {
     assert!(MistEvent::PeerConnected as u32 == EVENT_PEER_CONNECTED);
     assert!(MistEvent::PeerDisconnected as u32 == EVENT_PEER_DISCONNECTED);
     assert!(MistEvent::AoiNodes as u32 == EVENT_AOI_NODES);
+    assert!(MistEvent::NodePositionUpdated as u32 == EVENT_NODE_POSITION_UPDATED);
+    assert!(MistEvent::AllConnectionsLost as u32 == EVENT_ALL_CONNECTIONS_LOST);
     assert!(MistEvent::RoomJoined as u32 == EVENT_ROOM_JOINED);
     assert!(MistEvent::RoomJoinFailed as u32 == EVENT_ROOM_JOIN_FAILED);
     assert!(MistEvent::RoomLeft as u32 == EVENT_ROOM_LEFT);

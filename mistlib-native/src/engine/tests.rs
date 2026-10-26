@@ -33,7 +33,6 @@ pub(crate) mod session_registry {
     use mistlib_core::transport::{NetworkEventHandler, Transport};
     use mistlib_core::types::{ConnectionState, DeliveryMethod};
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{LazyLock, Mutex as StdMutex};
     use tokio::sync::Mutex as AsyncMutex;
     use tokio_util::sync::CancellationToken;
@@ -103,8 +102,7 @@ pub(crate) mod session_registry {
             overlay: None,
             node_store: Arc::new(StdMutex::new(NodeStore::new())),
             aoi_nodes: Arc::new(StdMutex::new(HashSet::new())),
-            had_connected_peers: AtomicBool::new(false),
-            all_connections_lost_dispatched: AtomicBool::new(false),
+            connection_loss: Default::default(),
             cancel: CancellationToken::new(),
         })
     }
@@ -250,8 +248,7 @@ pub(crate) mod session_registry {
             overlay: None,
             node_store: Arc::new(StdMutex::new(NodeStore::new())),
             aoi_nodes: Arc::new(StdMutex::new(HashSet::new())),
-            had_connected_peers: AtomicBool::new(false),
-            all_connections_lost_dispatched: AtomicBool::new(false),
+            connection_loss: Default::default(),
             cancel: CancellationToken::new(),
         })
     }

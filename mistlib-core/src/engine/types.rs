@@ -52,6 +52,30 @@ pub enum EngineEvent {
     AoiEntered(NodeId),
     AoiLeft(NodeId),
     AoiNodesUpdated(Vec<u8>),
+    NodePositionUpdated(NodeId, Vec<u8>),
+    AllConnectionsLost(NodeId),
+}
+
+impl EngineEvent {
+    /// Common callback code, sender and bytes. The adapter supplies its room id.
+    pub fn into_application_event(self) -> (u32, NodeId, Vec<u8>) {
+        use crate::events::*;
+        let rust = || NodeId("rust".to_string());
+        match self {
+            Self::RawMessage(id, data) => (EVENT_RAW, id, data.to_vec()),
+            Self::OverlayMessage(id, data) => (EVENT_OVERLAY, id, data),
+            Self::NeighborsUpdated(data) => (EVENT_NEIGHBORS, rust(), data),
+            Self::AoiEntered(id) => (EVENT_AOI_ENTERED, id, b"entered".to_vec()),
+            Self::AoiLeft(id) => (EVENT_AOI_LEFT, id, b"left".to_vec()),
+            Self::AoiNodesUpdated(data) => (EVENT_AOI_NODES, rust(), data),
+            Self::NodePositionUpdated(id, data) => (EVENT_NODE_POSITION_UPDATED, id, data),
+            Self::AllConnectionsLost(id) => (
+                EVENT_ALL_CONNECTIONS_LOST,
+                id,
+                ALL_CONNECTIONS_LOST_PAYLOAD.to_vec(),
+            ),
+        }
+    }
 }
 
 pub trait EngineEventHandler: Send + Sync {

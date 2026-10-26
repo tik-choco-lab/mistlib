@@ -50,6 +50,36 @@ class PublishTest(unittest.TestCase):
                             publish.assert_not_called()
                     verify.assert_called_once_with(Path("quality.json"), dist, "a" * 40, "1.2.3")
 
+    def test_prerelease_order_and_dist_tags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dist = Path(temp)
+            tarball = dist / "candidate.tgz"
+            tarball.write_bytes(b"verified")
+            for candidate, current, tag in (("1.2.3-beta.3", "1.2.3", None),
+                                            ("1.2.3-beta.3", "1.2.4", None),
+                                            ("1.2.3-beta.3", "1.2.2", "beta"),
+                                            ("1.2.3-rc.1", "1.2.2", "rc"),
+                                            ("1.2.3-123", "1.2.2", "next")):
+                argv = ["npm_publish.py", "--dist", str(dist), "--receipt", "quality.json",
+                        "--commit", "a" * 40, "--version", candidate]
+                with self.subTest(candidate=candidate, current=current), patch.object(sys, "argv", argv), \
+                     patch.object(npm_publish, "verify", return_value={"files": {tarball.name: "unused"}}), \
+                     patch.object(npm_publish, "urlopen") as registry, \
+                     patch.object(npm_publish.subprocess, "check_output", return_value="11.12.1"), \
+                     patch.object(npm_publish.subprocess, "run") as publish:
+                    def response(url, **kwargs):
+                        if url.endswith("/latest"):
+                            return io.BytesIO(json.dumps({"version": current}).encode())
+                        raise HTTPError(url, 404, "fixture", {}, None)
+                    registry.side_effect = response
+                    if tag is None:
+                        with self.assertRaises(ValueError):
+                            npm_publish.main()
+                        publish.assert_not_called()
+                    else:
+                        npm_publish.main()
+                        self.assertEqual(publish.call_args.args[0][-2:], ["--tag", tag])
+
     def test_failed_verification_never_contacts_registry(self):
         with patch.object(sys, "argv", ["npm_publish.py", "--dist", "dist", "--receipt", "quality.json", "--commit", "a" * 40, "--version", "1.2.3"]), \
              patch.object(npm_publish, "verify", side_effect=ValueError("changed bytes")), \

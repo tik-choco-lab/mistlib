@@ -31,18 +31,26 @@ impl super::MistEngine {
     /// signaling loop spawned alongside it -- each session runs entirely
     /// independently of any other active room.
     pub async fn run(&self, ctx: Arc<SessionCtx>) -> crate::error::Result<()> {
+        let network_rx = self.start_session(&ctx).await?;
+        self.process_network_events(network_rx, ctx).await;
+        Ok(())
+    }
+
+    /// Completes startup before the room layer reports readiness. The network
+    /// pump is kept separate so ROOM_JOINED never waits for the session to end.
+    pub(crate) async fn start_session(
+        &self,
+        ctx: &Arc<SessionCtx>,
+    ) -> crate::error::Result<mpsc::UnboundedReceiver<NetworkEvent>> {
         let (network_tx, network_rx) = mpsc::unbounded_channel::<NetworkEvent>();
         let (sig_tx, sig_rx) = mpsc::channel::<MessageContent>(1024);
-
         ctx.reset_connection_loss_tracking();
-        self.connect_bootstrap_signaler(&ctx, sig_tx).await?;
-        self.start_transports(&ctx, network_tx).await?;
-        self.start_overlay(&ctx).await;
-        self.announce_to_room(&ctx).await?;
+        self.connect_bootstrap_signaler(ctx, sig_tx).await?;
+        self.start_transports(ctx, network_tx).await?;
+        self.start_overlay(ctx).await;
+        self.announce_to_room(ctx).await?;
         self.spawn_signaling_loop(sig_rx, ctx.clone());
-        self.process_network_events(network_rx, ctx).await;
-
-        Ok(())
+        Ok(network_rx)
     }
 
     async fn connect_bootstrap_signaler(

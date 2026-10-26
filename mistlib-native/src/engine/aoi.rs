@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use super::{
     dispatch_event, EVENT_ALL_CONNECTIONS_LOST, EVENT_AOI_ENTERED, EVENT_AOI_LEFT, EVENT_AOI_NODES,
     EVENT_NEIGHBORS,
@@ -7,25 +5,6 @@ use super::{
 use super::{rust_node_id, SessionCtx, ENGINE};
 
 impl SessionCtx {
-    fn should_dispatch_all_connections_lost(&self, connected_count: usize) -> bool {
-        if connected_count > 0 {
-            self.had_connected_peers.store(true, Ordering::Relaxed);
-            self.all_connections_lost_dispatched
-                .store(false, Ordering::Relaxed);
-            return false;
-        }
-
-        if self.had_connected_peers.load(Ordering::Relaxed)
-            && !self.all_connections_lost_dispatched.load(Ordering::Relaxed)
-        {
-            self.all_connections_lost_dispatched
-                .store(true, Ordering::Relaxed);
-            return true;
-        }
-
-        false
-    }
-
     pub async fn check_and_dispatch_aoi(&self) {
         let connected_ids = self
             .overlay
@@ -105,15 +84,14 @@ impl SessionCtx {
             std::collections::HashSet::new()
         };
 
-        if self.should_dispatch_all_connections_lost(connected_ids.len()) {
+        if self.connection_loss.update(connected_ids.len()) {
             let from = ENGINE.self_id.lock().unwrap().clone();
-            let payload = serde_json::json!({
-                "reason": "allConnectionsLost",
-                "connectedCount": connected_ids.len(),
-            })
-            .to_string()
-            .into_bytes();
-            dispatch_event(EVENT_ALL_CONNECTIONS_LOST, &self.room_id, &from, &payload);
+            dispatch_event(
+                EVENT_ALL_CONNECTIONS_LOST,
+                &self.room_id,
+                &from,
+                mistlib_core::events::ALL_CONNECTIONS_LOST_PAYLOAD,
+            );
         }
 
         let nodes = {

@@ -265,8 +265,9 @@ export async function browserClient(browserType, url, directory, name, { trace =
         },
       };
       module.register_event_callback((kind, sender, data, room) => {
-        if (kind === 0 && control.receive(room, sender, data)) return;
-        window.qa.events.push({ kind: ({ 0: 'raw', 5: 'connected', 6: 'disconnected', 7: 'aoi' })[kind] || String(kind),
+        if (kind === module.MistEvent.Raw && control.receive(room, sender, data)) return;
+        window.qa.events.push({ kind: ({ [module.MistEvent.Raw]: 'raw', [module.MistEvent.PeerConnected]: 'connected',
+          [module.MistEvent.PeerDisconnected]: 'disconnected', [module.MistEvent.AoiNodes]: 'aoi' })[kind] || String(kind),
           sender, room, data: Array.from(data) });
       });
     }, process.env.QA_RTC_DIAGNOSTICS === '1' || Boolean(process.env.QA_CHROME_SCTP_LOG));

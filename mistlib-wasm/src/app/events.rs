@@ -1,6 +1,5 @@
 use super::{
-    EVENT_AOI_ENTERED, EVENT_AOI_LEFT, EVENT_AOI_NODES, EVENT_CALLBACK, EVENT_NEIGHBORS,
-    EVENT_OVERLAY, EVENT_PEER_CONNECTED, EVENT_PEER_DISCONNECTED, EVENT_RAW, EVENT_ROOM_JOINED,
+    EVENT_CALLBACK, EVENT_PEER_CONNECTED, EVENT_PEER_DISCONNECTED, EVENT_ROOM_JOINED,
     EVENT_ROOM_JOIN_FAILED, EVENT_ROOM_LEFT,
 };
 use mistlib_core::engine::{EngineEvent, EngineEventHandler};
@@ -37,16 +36,9 @@ impl EngineEventHandler for WasmEngineEventHandler {
         let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
         if let Some(f) = callback {
             let room_id = self.room_id.clone();
-            let (event_type, from_id, payload_vec) = match event {
-                EngineEvent::RawMessage(id, data) => (EVENT_RAW, id.0, data.to_vec()),
-                EngineEvent::OverlayMessage(id, data) => (EVENT_OVERLAY, id.0, data),
-                EngineEvent::NeighborsUpdated(data) => (EVENT_NEIGHBORS, "rust".to_string(), data),
-                EngineEvent::AoiEntered(id) => (EVENT_AOI_ENTERED, id.0, vec![]),
-                EngineEvent::AoiLeft(id) => (EVENT_AOI_LEFT, id.0, vec![]),
-                EngineEvent::AoiNodesUpdated(data) => (EVENT_AOI_NODES, "rust".to_string(), data),
-            };
+            let (event_type, from_id, payload_vec) = event.into_application_event();
             wasm_bindgen_futures::spawn_local(async move {
-                dispatch_event(&f, event_type, &from_id, &payload_vec, &room_id);
+                dispatch_event(&f, event_type, &from_id.0, &payload_vec, &room_id);
             });
         }
     }
@@ -103,7 +95,7 @@ pub fn emit_peer_connected(node_id: NodeId, room_id: String) {
     let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
     if let Some(f) = callback {
         wasm_bindgen_futures::spawn_local(async move {
-            dispatch_event(&f, EVENT_PEER_CONNECTED, &node_id.0, &[], &room_id);
+            dispatch_event(&f, EVENT_PEER_CONNECTED, &node_id.0, b"joined", &room_id);
         });
     }
 }
@@ -125,7 +117,7 @@ pub fn emit_peer_disconnected(node_id: NodeId, room_id: String) {
     let callback = EVENT_CALLBACK.with(|cb| cb.borrow().as_ref().cloned());
     if let Some(f) = callback {
         wasm_bindgen_futures::spawn_local(async move {
-            dispatch_event(&f, EVENT_PEER_DISCONNECTED, &node_id.0, &[], &room_id);
+            dispatch_event(&f, EVENT_PEER_DISCONNECTED, &node_id.0, b"left", &room_id);
         });
     }
 }

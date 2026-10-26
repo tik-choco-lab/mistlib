@@ -11,16 +11,7 @@ pub type EventCallbackV2 =
     unsafe extern "C" fn(u32, *const u8, usize, *const u8, usize, *const u8, usize);
 pub type RustEventCallback = Arc<dyn Fn(u32, String, Vec<u8>) + Send + Sync + 'static>;
 
-pub const EVENT_RAW: u32 = 0;
-pub const EVENT_OVERLAY: u32 = 1;
-pub const EVENT_JOIN: u32 = 2;
-pub const EVENT_LEAVE: u32 = 3;
-pub const EVENT_NEIGHBORS: u32 = 4;
-pub const EVENT_AOI_ENTERED: u32 = 5;
-pub const EVENT_AOI_LEFT: u32 = 6;
-pub const EVENT_NODE_POSITION_UPDATED: u32 = 7;
-pub const EVENT_AOI_NODES: u32 = 8;
-pub const EVENT_ALL_CONNECTIONS_LOST: u32 = 9;
+pub use mistlib_core::events::*;
 
 pub fn dispatch_event(message_type: u32, room_id: &str, from: &NodeId, data: &[u8]) {
     if ENGINE
@@ -44,7 +35,7 @@ async fn mark_connected(ctx: &Arc<SessionCtx>, node_id: NodeId) {
         let mut rt = overlay.routing_table.lock().unwrap();
         rt.on_connected(node_id.clone());
     }
-    dispatch_event(EVENT_JOIN, &ctx.room_id, &node_id, b"joined");
+    dispatch_event(EVENT_PEER_CONNECTED, &ctx.room_id, &node_id, b"joined");
 }
 
 /// Marks `node_id` connected within a specific room's session. This is the
@@ -74,7 +65,7 @@ pub fn on_connected_primary(node_id: NodeId) {
 async fn mark_disconnected(ctx: Option<&Arc<SessionCtx>>, room_id: &str, node_id: &NodeId) {
     reset_storage_senders(ctx, room_id, node_id);
     mistlib_core::stats::STATS.remove_rtt(node_id);
-    dispatch_event(EVENT_LEAVE, room_id, node_id, b"left");
+    dispatch_event(EVENT_PEER_DISCONNECTED, room_id, node_id, b"left");
 }
 
 // Invalidate routes before waking resolvers, including WANTs to routed senders

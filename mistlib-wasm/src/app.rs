@@ -125,19 +125,7 @@ fn session_knows_target(engine: &Arc<MistEngine>, target: &NodeId) -> bool {
         })
 }
 
-pub const EVENT_RAW: u32 = 0;
-pub const EVENT_OVERLAY: u32 = 1;
-pub const EVENT_NEIGHBORS: u32 = 2;
-pub const EVENT_AOI_ENTERED: u32 = 3;
-pub const EVENT_AOI_LEFT: u32 = 4;
-pub const EVENT_PEER_CONNECTED: u32 = 5;
-pub const EVENT_PEER_DISCONNECTED: u32 = 6;
-pub const EVENT_AOI_NODES: u32 = 7;
-pub const EVENT_ROOM_JOINED: u32 = 8;
-pub const EVENT_ROOM_JOIN_FAILED: u32 = 9;
-pub const EVENT_ROOM_LEFT: u32 = 10;
-pub const MEDIA_EVENT_TRACK_ADDED: u32 = 100;
-pub const MEDIA_EVENT_TRACK_REMOVED: u32 = 101;
+pub use mistlib_core::events::*;
 pub use mistlib_core::types::{
     DELIVERY_RELIABLE, DELIVERY_RELIABLE_UNORDERED, DELIVERY_UNRELIABLE,
     DELIVERY_UNRELIABLE_ORDERED,

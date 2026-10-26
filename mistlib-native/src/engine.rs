@@ -46,8 +46,7 @@ pub struct SessionCtx {
     pub(crate) overlay: Option<Arc<OverlayRouter>>,
     pub(crate) node_store: Arc<StdMutex<NodeStore>>,
     pub(crate) aoi_nodes: Arc<StdMutex<HashSet<NodeId>>>,
-    pub(crate) had_connected_peers: AtomicBool,
-    pub(crate) all_connections_lost_dispatched: AtomicBool,
+    pub(crate) connection_loss: mistlib_core::events::ConnectionLossTracker,
     /// Cancels this session's background loops (AOI/neighbor + overlay tick,
     /// the network event pump, and the signaling loop) without touching any
     /// other active session. Cancelled once, from `leave_room`/`leave_room_id`.
@@ -144,10 +143,7 @@ impl SessionCtx {
     }
 
     pub(crate) fn reset_connection_loss_tracking(&self) {
-        self.had_connected_peers
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.all_connections_lost_dispatched
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.connection_loss.reset();
     }
 }
 
@@ -177,8 +173,7 @@ pub struct MistEngine {
     pub(crate) self_id: StdMutex<NodeId>,
     pub(crate) l0: Arc<crate::layers::native_l0::NativeL0>,
     /// Set once `init`/`init_with_config` has run. `join_room` before that is
-    /// a no-op (there is no `self_id`/`Config` worth building a session from
-    /// yet) -- mirrors the old `EngineState::Idle` guard.
+    /// rejected with ROOM_JOIN_FAILED (there is no configured identity yet).
     pub(crate) initialized: AtomicBool,
 }
 
@@ -314,7 +309,7 @@ fn spawn_event_dispatch_thread(
             let v2 = *global_callback_v2.lock().unwrap();
 
             if v1.is_none() && v2.is_none() {
-                if matches!(message_type, EVENT_JOIN | EVENT_LEAVE) {
+                if matches!(message_type, EVENT_PEER_CONNECTED | EVENT_PEER_DISCONNECTED) {
                     tracing::debug!(
                         "dropping FFI join/leave event for {from}: no callback registered"
                     );

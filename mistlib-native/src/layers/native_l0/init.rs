@@ -10,7 +10,7 @@ use mistlib_core::signaling::{
     RoutedSignaler, RoutedSignalingHandler, Signaler, SignalingHandler, SignalingRoute,
 };
 use mistlib_core::types::NodeId;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +35,7 @@ fn set_signaling_url(url: String) {
 /// Builds one room's full session stack (signaler, WebRTC transport,
 /// overlay/DNVE3, node store) but does not start or announce it. The caller
 /// (`room::join_room`) inserts the result into the session registry and then
-/// calls `ENGINE.run(ctx)`.
+/// starts it before reporting ROOM_JOINED and running the network pump.
 pub(super) async fn build_session_context(room_id: String, local_id: NodeId) -> Arc<SessionCtx> {
     let config = ENGINE.config.lock().unwrap().clone();
     let node_store = Arc::new(StdMutex::new(NodeStore::new()));
@@ -81,8 +81,7 @@ pub(super) async fn build_session_context(room_id: String, local_id: NodeId) -> 
         overlay: Some(router),
         node_store,
         aoi_nodes: Arc::new(StdMutex::new(std::collections::HashSet::new())),
-        had_connected_peers: AtomicBool::new(false),
-        all_connections_lost_dispatched: AtomicBool::new(false),
+        connection_loss: Default::default(),
         cancel: CancellationToken::new(),
     })
 }
