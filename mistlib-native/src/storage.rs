@@ -1,5 +1,9 @@
 pub mod fs;
 pub mod meta;
+pub mod provider;
+pub use provider::{
+    fetch_block, register_block_provider, BlockProvider, BlockProviderHandle, FetchOptions,
+};
 pub mod resolver;
 
 use crate::engine::SessionCtx;
@@ -236,61 +240,66 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
         return;
     }
 
-    if let Some(storage) = STORAGE.get() {
-        let loaded = storage.get_block(&cid).await;
-        tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, found = loaded.as_ref().is_ok_and(|block| block.is_some()), error = ?loaded.as_ref().err(), "Storage: WANT load result");
-        let block = loaded.ok().flatten();
-
-        if let Some(data) = block {
-            let limit = ctx
-                .webrtc_transport
-                .as_ref()
-                .and_then(|transport| transport.message_size_limit(&from));
-            let chunk_size = chunk_size_for_limit(&cid, limit);
-            let Some(total_chunks) = have_chunk_count(data.len(), chunk_size) else {
-                tracing::warn!(
-                    "Storage: refusing to serve oversized block {} ({} bytes, {} chunks)",
-                    cid,
-                    data.len(),
-                    data.len().div_ceil(chunk_size)
-                );
-                return;
-            };
-
-            tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, bytes = data.len(), chunk_size, total_chunks, "Storage: WANT response layout");
-            if let Err(error) = mistlib_core::storage::responder::send_block(
-                ctx.transport.as_ref(),
-                &from,
-                &cid,
-                &data,
-                chunk_size,
-                total_chunks,
-                |index| {
-                    Box::pin(async move {
-                        if total_chunks > 1 && index % 8 == 0 {
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                },
-            )
-            .await
-            {
-                tracing::debug!(%cid, peer = %from, %error, "Storage: WANT response stopped after send failure");
+    let block = match provider::get_block(&ctx.room_id, &from, &cid).await {
+        Some(data) => Some(data),
+        None => {
+            if let Some(storage) = STORAGE.get() {
+                let loaded = storage.get_block(&cid).await;
+                tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, found = loaded.as_ref().is_ok_and(|block| block.is_some()), error = ?loaded.as_ref().err(), "Storage: WANT load result");
+                loaded.ok().flatten()
+            } else {
+                tracing::debug!(%cid, room = %ctx.room_id, "Storage: WANT response ended: storage unavailable");
                 return;
             }
-
-            tracing::debug!(
-                "Storage: WANT response ended for {} to {} ({} bytes, {} chunks queued)",
-                cid,
-                from.0,
-                data.len(),
-                total_chunks.max(1)
-            );
-        } else {
-            tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, "Storage: WANT response ended: block unavailable");
         }
+    };
+    if let Some(data) = block {
+        let limit = ctx
+            .webrtc_transport
+            .as_ref()
+            .and_then(|transport| transport.message_size_limit(&from));
+        let chunk_size = chunk_size_for_limit(&cid, limit);
+        let Some(total_chunks) = have_chunk_count(data.len(), chunk_size) else {
+            tracing::warn!(
+                "Storage: refusing to serve oversized block {} ({} bytes, {} chunks)",
+                cid,
+                data.len(),
+                data.len().div_ceil(chunk_size)
+            );
+            return;
+        };
+
+        tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, bytes = data.len(), chunk_size, total_chunks, "Storage: WANT response layout");
+        if let Err(error) = mistlib_core::storage::responder::send_block(
+            ctx.transport.as_ref(),
+            &from,
+            &cid,
+            &data,
+            chunk_size,
+            total_chunks,
+            |index| {
+                Box::pin(async move {
+                    if total_chunks > 1 && index % 8 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+            },
+        )
+        .await
+        {
+            tracing::debug!(%cid, peer = %from, %error, "Storage: WANT response stopped after send failure");
+            return;
+        }
+
+        tracing::debug!(
+            "Storage: WANT response ended for {} to {} ({} bytes, {} chunks queued)",
+            cid,
+            from.0,
+            data.len(),
+            total_chunks.max(1)
+        );
     } else {
-        tracing::debug!(%cid, room = %ctx.room_id, "Storage: WANT response ended: storage unavailable");
+        tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, "Storage: WANT response ended: block unavailable");
     }
 }
 
@@ -305,38 +314,30 @@ pub async fn handle_query(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeI
         return;
     }
 
-    if let Some(storage) = STORAGE.get() {
-        use mistlib_core::types::DeliveryMethod;
-
+    let block_exists = if provider::has_block(&ctx.room_id, &from, &cid).await {
+        true
+    } else if let Some(storage) = STORAGE.get() {
         let loaded = storage.get_block(&cid).await;
         tracing::debug!(%cid, room = %ctx.room_id, error = ?loaded.as_ref().err(), "Storage: QUERY load result");
-        let block_exists = loaded.ok().flatten().is_some();
-
-        if block_exists {
-            let msg = resolver::build_have_status_message(&cid);
-            let result = ctx
-                .transport
-                .send(
-                    &from,
-                    bytes::Bytes::from(msg),
-                    DeliveryMethod::ReliableOrdered,
-                )
-                .await;
-            tracing::debug!(
-                "Storage: QUERY response ended for {} from {}: {:?}",
-                cid,
-                from.0,
-                result
-            );
-        } else {
-            tracing::debug!(
-                "Storage: QUERY response ended for {} from {}: not held",
-                cid,
-                from.0
-            );
-        }
+        loaded.ok().flatten().is_some()
     } else {
         tracing::debug!(%cid, room = %ctx.room_id, "Storage: QUERY response ended: storage unavailable");
+        return;
+    };
+
+    if block_exists {
+        let msg = resolver::build_have_status_message(&cid);
+        let result = ctx
+            .transport
+            .send(
+                &from,
+                bytes::Bytes::from(msg),
+                mistlib_core::types::DeliveryMethod::ReliableOrdered,
+            )
+            .await;
+        tracing::debug!(%cid, peer = %from.0, ?result, "Storage: QUERY response ended");
+    } else {
+        tracing::debug!(%cid, peer = %from.0, "Storage: QUERY response ended: not held");
     }
 }
 

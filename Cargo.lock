@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "mistlib-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "mistlib-native"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "mistlib-wasm"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "bincode",

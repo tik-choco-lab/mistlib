@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, watch};
@@ -22,6 +23,7 @@ const MAX_WANT_PEERS: usize = 1024;
 
 type PeerCache = Arc<Mutex<HashMap<String, Vec<NodeId>>>>;
 type PeerNotifiers = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>;
+type RoomPeerNotifiers = Arc<Mutex<HashMap<(String, String), Vec<oneshot::Sender<NodeId>>>>>;
 
 /// Counts are retained by the attempt even after its registration completes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,6 +47,7 @@ struct PendingWant {
     progress: watch::Sender<ChunkProgress>,
     peers: Vec<NodeId>,
     tx: oneshot::Sender<Vec<u8>>,
+    byte_limit: Option<(usize, oneshot::Sender<usize>)>,
 }
 
 struct ChunkAssembly {
@@ -151,6 +154,32 @@ impl WantState {
             .send_modify(|counter| *counter = counter.wrapping_add(1));
     }
 
+    // Fail only bounded callers on this path; unrelated storage_get waiters
+    // keep their original admission policy and partial data.
+    fn enforce_byte_limits(&mut self, cid: &str, sender: &NodeId, room: &str, bytes: usize) {
+        if let Some(wants) = self.pending.get_mut(cid) {
+            let mut index = 0;
+            while index < wants.len() {
+                let want = &wants[index];
+                if want.peers.contains(sender)
+                    && want.paths.contains(room)
+                    && want
+                        .byte_limit
+                        .as_ref()
+                        .is_some_and(|(limit, _)| bytes > *limit)
+                {
+                    let want = wants.remove(index);
+                    if let Some((_, error)) = want.byte_limit {
+                        let _ = error.send(bytes);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        self.prune();
+    }
+
     fn fulfill(&mut self, cid: &str, sender: &NodeId, room: &str, data: Vec<u8>) {
         if let Some(wants) = self.pending.remove(cid) {
             // Unverified bytes may only complete waiters that requested this sender.
@@ -179,6 +208,7 @@ pub struct WantRegistry {
     counters: Arc<super::telemetry::StorageCounters>,
     peer_cache: PeerCache,
     peer_notifiers: PeerNotifiers,
+    room_peer_notifiers: RoomPeerNotifiers,
 }
 
 impl Default for WantRegistry {
@@ -194,6 +224,7 @@ impl WantRegistry {
             counters: super::telemetry::STORAGE_COUNTERS.clone(),
             peer_cache: Arc::new(Mutex::new(HashMap::new())),
             peer_notifiers: Arc::new(Mutex::new(HashMap::new())),
+            room_peer_notifiers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -216,6 +247,29 @@ impl WantRegistry {
     /// immediately before each send, so even teardown during enqueue is retained.
     pub fn register_attempt(&self, cid: &str, sender: NodeId) -> WantAttempt {
         self.register_attempt_for_peers(cid, vec![sender], false)
+    }
+
+    /// A resolver attempt with a per-caller payload limit. The error receiver
+    /// reports the observed size before that payload is copied or stored.
+    /// The registry's existing block bound remains an additional ceiling.
+    pub fn register_bounded_attempt(
+        &self,
+        cid: &str,
+        sender: NodeId,
+        max_bytes: usize,
+    ) -> (WantAttempt, oneshot::Receiver<usize>) {
+        let attempt = self.register_attempt(cid, sender);
+        let (tx, rx) = oneshot::channel();
+        let mut state = self.state.lock().unwrap();
+        if let Some(want) = state
+            .pending
+            .values_mut()
+            .flatten()
+            .find(|w| w.id == attempt.id)
+        {
+            want.byte_limit = Some((max_bytes.min(MAX_WANT_BLOCK_BYTES), tx));
+        }
+        (attempt, rx)
     }
 
     fn register_attempt_for_peers(
@@ -262,6 +316,7 @@ impl WantRegistry {
                 progress,
                 peers,
                 tx,
+                byte_limit: None,
             });
         attempt
     }
@@ -322,9 +377,19 @@ impl WantRegistry {
     }
 
     pub fn fulfill_in(&self, room: &str, cid: &str, sender: &NodeId, data: Vec<u8>) {
+        self.fulfill_data_in(room, cid, sender, Cow::Owned(data));
+    }
+
+    /// Network receive path: apply limits before copying the borrowed payload.
+    pub fn fulfill_slice_in(&self, room: &str, cid: &str, sender: &NodeId, data: &[u8]) {
+        self.fulfill_data_in(room, cid, sender, Cow::Borrowed(data));
+    }
+
+    fn fulfill_data_in(&self, room: &str, cid: &str, sender: &NodeId, data: Cow<'_, [u8]>) {
         let mut state = self.state.lock().unwrap();
         state.prune();
         let counters = state.observe(cid, sender, room, false);
+        state.enforce_byte_limits(cid, sender, room, data.len());
         let accepted = data.len() <= MAX_WANT_BLOCK_BYTES && state.accepts(cid, sender, room);
         tracing::debug!(%cid, peer = %sender.0, %room, len = data.len(), accepted, ?counters,
             reason = if accepted { "complete" } else { "oversized or no WANT on path" }, "Storage: HAVE received");
@@ -334,7 +399,7 @@ impl WantRegistry {
             let counters = state.observe(cid, sender, room, true);
             tracing::debug!(%cid, peer = %sender.0, %room, ?counters, "Storage: HAVE accepted; response complete");
             state.advance_progress(sender);
-            state.fulfill(cid, sender, room, data);
+            state.fulfill(cid, sender, room, data.into_owned());
         } else {
             self.counters.rejected();
         }
@@ -364,16 +429,51 @@ impl WantRegistry {
         chunk_total: u16,
         data: Vec<u8>,
     ) {
+        self.fulfill_chunk_data_in(
+            room,
+            cid,
+            sender,
+            chunk_index,
+            chunk_total,
+            Cow::Owned(data),
+        );
+    }
+
+    /// Network receive path: no payload allocation precedes byte admission.
+    pub fn fulfill_chunk_slice_in(
+        &self,
+        room: &str,
+        cid: &str,
+        sender: &NodeId,
+        chunk_index: u16,
+        chunk_total: u16,
+        data: &[u8],
+    ) {
+        self.fulfill_chunk_data_in(
+            room,
+            cid,
+            sender,
+            chunk_index,
+            chunk_total,
+            Cow::Borrowed(data),
+        );
+    }
+
+    fn fulfill_chunk_data_in(
+        &self,
+        room: &str,
+        cid: &str,
+        sender: &NodeId,
+        chunk_index: u16,
+        chunk_total: u16,
+        data: Cow<'_, [u8]>,
+    ) {
         // One lock makes observation, admission, completion and reset atomic.
         let mut state = self.state.lock().unwrap();
         state.prune();
         let counters = state.observe(cid, sender, room, false);
         tracing::debug!(%cid, peer = %sender.0, %room, chunk_index, chunk_total, len = data.len(), ?counters, "Storage: chunk received");
-        if chunk_total == 0
-            || chunk_total > MAX_WANT_CHUNKS
-            || chunk_index >= chunk_total
-            || data.len() > MAX_WANT_BLOCK_BYTES
-        {
+        if chunk_total == 0 || chunk_total > MAX_WANT_CHUNKS || chunk_index >= chunk_total {
             tracing::debug!(%cid, %room, chunk_index, reason = "invalid header or oversized chunk", "Storage: chunk rejected");
             self.counters.rejected();
             return;
@@ -396,12 +496,18 @@ impl WantRegistry {
                 self.counters.duplicate(data.len());
                 return;
             }
-            if entry.bytes + data.len() > MAX_WANT_BLOCK_BYTES {
-                tracing::debug!(%cid, %room, chunk_index, reason = "block byte limit", "Storage: chunk rejected");
-                self.counters.rejected();
-                return;
-            }
-        } else if state.assemblies.len() >= MAX_WANT_ASSEMBLIES {
+        }
+        let bytes = state
+            .assemblies
+            .get(&key)
+            .map_or(0, |entry| entry.bytes)
+            .saturating_add(data.len());
+        state.enforce_byte_limits(cid, sender, room, bytes);
+        if !state.accepts(cid, sender, room) || bytes > MAX_WANT_BLOCK_BYTES {
+            self.counters.rejected();
+            return;
+        }
+        if !state.assemblies.contains_key(&key) && state.assemblies.len() >= MAX_WANT_ASSEMBLIES {
             tracing::debug!(%cid, %room, chunk_index, reason = "assembly count limit", "Storage: chunk rejected");
             self.counters.rejected();
             return;
@@ -429,7 +535,7 @@ impl WantRegistry {
             });
         self.counters.accepted(data.len());
         entry.bytes += data.len();
-        entry.chunks[chunk_index as usize] = Some(data);
+        entry.chunks[chunk_index as usize] = Some(data.into_owned());
         entry.received_chunks += 1;
         let complete = entry.received_chunks == entry.total_chunks;
         let assembly_received = entry.received_chunks;
@@ -456,6 +562,13 @@ impl WantRegistry {
             senders.retain(|tx| !tx.is_closed());
             !senders.is_empty()
         });
+        self.room_peer_notifiers
+            .lock()
+            .unwrap()
+            .retain(|_, senders| {
+                senders.retain(|tx| !tx.is_closed());
+                !senders.is_empty()
+            });
     }
 
     /// Senders with open WANT registrations, excluding abandoned or completed requests.
@@ -558,6 +671,10 @@ impl WantRegistry {
         state.assemblies.retain(|(key, _, _), _| key != cid);
         state.prune();
         self.peer_notifiers.lock().unwrap().remove(cid);
+        self.room_peer_notifiers
+            .lock()
+            .unwrap()
+            .retain(|(_, key), _| key != cid);
     }
 
     pub fn register_peer_notifier(&self, cid: &str) -> oneshot::Receiver<()> {
@@ -570,6 +687,36 @@ impl WantRegistry {
             .or_default()
             .push(tx);
         rx
+    }
+
+    /// Subscribe before QUERY, without consulting the process-wide peer cache.
+    /// Only HAVE_STATUS received in this room can complete this discovery.
+    pub fn register_peer_notifier_in(&self, room: &str, cid: &str) -> oneshot::Receiver<NodeId> {
+        let (tx, rx) = oneshot::channel();
+        self.cancel_closed();
+        let mut notifiers = self.room_peer_notifiers.lock().unwrap();
+        if notifiers.values().map(Vec::len).sum::<usize>() < MAX_PENDING_WANTS {
+            notifiers
+                .entry((room.to_string(), cid.to_string()))
+                .or_default()
+                .push(tx);
+        }
+        rx
+    }
+
+    /// Preserve legacy resolver notifications while also notifying room-scoped discovery.
+    pub fn register_peer_in(&self, room: &str, cid: &str, peer: NodeId) {
+        if let Some(notifiers) = self
+            .room_peer_notifiers
+            .lock()
+            .unwrap()
+            .remove(&(room.to_string(), cid.to_string()))
+        {
+            for tx in notifiers {
+                let _ = tx.send(peer.clone());
+            }
+        }
+        self.register_peer(cid, peer);
     }
 
     pub fn register_peer(&self, cid: &str, peer_id: NodeId) {
@@ -824,6 +971,73 @@ pub fn build_have_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_attempt_rejects_before_payload_storage_and_cleans_assemblies() {
+        let registry = WantRegistry::new();
+        let sender = peer("bounded");
+        let (mut attempt, mut exceeded) =
+            registry.register_bounded_attempt("cid", sender.clone(), 4);
+        registry.track_path(attempt.id, "room");
+        registry.fulfill_slice_in("other", "cid", &sender, b"oversize");
+        registry.fulfill_slice_in("room", "cid", &peer("wrong"), b"oversize");
+        assert!(exceeded.try_recv().is_err());
+        registry.fulfill_chunk_slice_in("room", "cid", &sender, 0, 2, b"123");
+        // Duplicates and contradictory totals do not consume the caller's budget.
+        registry.fulfill_chunk_slice_in("room", "cid", &sender, 0, 2, b"123");
+        registry.fulfill_chunk_slice_in("room", "cid", &sender, 1, 3, b"ignored");
+        assert!(exceeded.try_recv().is_err());
+        registry.fulfill_chunk_slice_in("room", "cid", &sender, 1, 2, b"45");
+        assert_eq!(exceeded.try_recv().unwrap(), 5);
+        assert!(attempt.data.try_recv().is_err());
+        let state = registry.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.assemblies.is_empty());
+        drop(state);
+
+        // Ordinary HAVE and an individual huge chunk fail without an assembly.
+        for chunks in [false, true] {
+            let (attempt, mut exceeded) =
+                registry.register_bounded_attempt("cid", sender.clone(), 0);
+            registry.track_path(attempt.id, "room");
+            if chunks {
+                registry.fulfill_chunk_slice_in("room", "cid", &sender, 0, MAX_WANT_CHUNKS, b"x");
+            } else {
+                registry.fulfill_slice_in("room", "cid", &sender, b"x");
+            }
+            assert_eq!(exceeded.try_recv().unwrap(), 1);
+            assert!(registry.state.lock().unwrap().assemblies.is_empty());
+        }
+        let (attempt, mut exceeded) = registry.register_bounded_attempt("empty", sender.clone(), 0);
+        registry.track_path(attempt.id, "room");
+        registry.fulfill_slice_in("room", "empty", &sender, b"");
+        assert_eq!(attempt.data.blocking_recv().unwrap(), b"");
+        assert!(exceeded.try_recv().is_err());
+    }
+
+    #[test]
+    fn room_discovery_is_independent_bounded_and_prunes_closed_receivers() {
+        let registry = WantRegistry::new();
+        let mut wanted = registry.register_peer_notifier_in("room", "cid");
+        let mut other = registry.register_peer_notifier_in("other", "cid");
+        registry.register_peer_in("room", "cid", peer("provider"));
+        assert_eq!(wanted.try_recv().unwrap(), peer("provider"));
+        assert!(other.try_recv().is_err());
+        drop(other);
+        registry.cancel_closed();
+        assert!(registry.room_peer_notifiers.lock().unwrap().is_empty());
+        let waiters: Vec<_> = (0..MAX_PENDING_WANTS)
+            .map(|_| registry.register_peer_notifier_in("room", "cid"))
+            .collect();
+        let mut rejected = registry.register_peer_notifier_in("room", "cid");
+        assert_eq!(
+            rejected.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+        drop(waiters);
+        registry.cancel_closed();
+        assert!(registry.room_peer_notifiers.lock().unwrap().is_empty());
+    }
     use crate::storage::cid::{compute_cid, MULTICODEC_RAW};
 
     #[test]

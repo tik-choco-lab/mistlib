@@ -8,6 +8,9 @@ use tokio::sync::mpsc;
 
 use super::SessionCtx;
 
+#[cfg(test)]
+mod storage_tests;
+
 impl super::MistEngine {
     /// Pumps `ctx`'s network events until the session is torn down
     /// (`ctx.cancel`) or its transport's event channel closes. Unlike the
@@ -176,14 +179,14 @@ impl super::MistEngine {
                 });
             }
             StorageFrame::HaveStatus { cid } => {
-                crate::storage::handle_have_status(from_origin, cid.to_string());
+                crate::storage::WANT_REGISTRY.register_peer_in(&ctx.room_id, cid, from_origin);
             }
             StorageFrame::Have { cid, data } => {
-                crate::storage::WANT_REGISTRY.fulfill_in(
+                crate::storage::WANT_REGISTRY.fulfill_slice_in(
                     &ctx.room_id,
                     cid,
                     &from_origin,
-                    data.to_vec(),
+                    data,
                 );
             }
             StorageFrame::HaveChunk {
@@ -192,13 +195,13 @@ impl super::MistEngine {
                 chunk_total,
                 data,
             } => {
-                crate::storage::WANT_REGISTRY.fulfill_chunk_in(
+                crate::storage::WANT_REGISTRY.fulfill_chunk_slice_in(
                     &ctx.room_id,
                     cid,
                     &from_origin,
                     chunk_index,
                     chunk_total,
-                    data.to_vec(),
+                    data,
                 );
             }
         }

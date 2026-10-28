@@ -49,6 +49,43 @@ pub fn verify_cid(cid_str: &str, data: &[u8], expected_codec: u64) -> bool {
     compute_cid(data, expected_codec) == cid_str
 }
 
+/// Decode the codec of a CIDv1/base32lower/SHA2-256 CID. Unsupported hash
+/// algorithms and malformed envelopes are rejected rather than guessed.
+pub fn cid_codec(cid: &str) -> Option<u64> {
+    if !is_valid_cid(cid) {
+        return None;
+    }
+    let mut decoded = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0;
+    for byte in cid.bytes().skip(1) {
+        let value = match byte {
+            b'a'..=b'z' => byte - b'a',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return None,
+        };
+        buffer = (buffer << 5) | u32::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            decoded.push((buffer >> bits) as u8);
+        }
+    }
+    // Canonical encoding also rejects nonzero padding and extra trailing symbols.
+    if base32lower_encode(&decoded) != cid[1..] {
+        return None;
+    }
+    let (version, rest) = unsigned_varint::decode::u64(&decoded).ok()?;
+    let (codec, rest) = unsigned_varint::decode::u64(rest).ok()?;
+    let (hash, rest) = unsigned_varint::decode::u64(rest).ok()?;
+    let (length, digest) = unsigned_varint::decode::u64(rest).ok()?;
+    (version == CID_VERSION
+        && hash == MULTIHASH_SHA2_256
+        && length == u64::from(MULTIHASH_SHA2_256_LEN)
+        && digest.len() == usize::from(MULTIHASH_SHA2_256_LEN))
+    .then_some(codec)
+}
+
 /// Upper bound on a CID string's length. Every CID `compute_cid` emits is
 /// exactly 59 chars (`b` + base32 of a 36-byte CIDv1/sha2-256 envelope); the
 /// generous ceiling leaves room for future codecs while still bounding the
@@ -85,6 +122,28 @@ pub fn is_valid_cid(cid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_codec_requires_supported_hash_and_valid_cid_envelope() {
+        for codec in [MULTICODEC_RAW, MULTICODEC_DAG_CBOR, 0x129, u64::MAX] {
+            let cid = compute_cid(b"block", codec);
+            assert_eq!(cid_codec(&cid), Some(codec));
+            assert!(verify_cid(&cid, b"block", cid_codec(&cid).unwrap()));
+            assert!(!verify_cid(&cid, b"changed", codec));
+        }
+        for mut envelope in [
+            vec![2, 0x55, 0x12, 32], // unsupported CID version
+            vec![1, 0x55, 0x13, 32], // unsupported hash
+            vec![1, 0x55, 0x12, 31], // wrong digest length
+        ] {
+            envelope.extend_from_slice(&[0; 32]);
+            assert!(cid_codec(&format!("b{}", base32lower_encode(&envelope))).is_none());
+        }
+        let truncated = [1, 0x55, 0x12, 32];
+        assert!(cid_codec(&format!("b{}", base32lower_encode(&truncated))).is_none());
+        assert!(cid_codec("babc").is_none());
+        assert!(cid_codec("../../block").is_none());
+    }
 
     #[test]
     fn computed_cids_are_accepted() {

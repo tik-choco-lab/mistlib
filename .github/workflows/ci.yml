@@ -16,4 +16,7 @@ concurrency:
 
 jobs:
   quality:
+    # release.sh pushes the same "release: v*" commit to develop and main, and
+    # Release runs this gate on main; do not run it twice for one commit.
+    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release: v')"
     uses: ./.github/workflows/quality.yml
