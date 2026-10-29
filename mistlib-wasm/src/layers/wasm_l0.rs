@@ -487,7 +487,20 @@ async fn build_session(
     let (sig_tx, sig_rx) = mpsc::unbounded_channel::<MessageContent>();
     if let Err(err) = signaler.connect(sig_tx).await {
         tracing::error!("WASM signaling connection failed: {:?}", err);
+        if let Err(close_err) = signaler.close().await {
+            tracing::warn!("WASM signaling cleanup after failed join: {:?}", close_err);
+        }
         return Err(err);
+    }
+
+    // The engine is still Idle here: its leave cleanup cannot close this
+    // signaler yet. Cancel before scheduling run(), which starts on a microtask.
+    if crate::app::clear_cancelled_pending(&room_id) {
+        signaler.close().await.map_err(|err| {
+            JsValue::from_str(&format!("WASM cancelled join cleanup failed: {err}"))
+        })?;
+        webrtc.close_all_peer_connections();
+        return Err(JsValue::from_str("join cancelled by leave"));
     }
 
     let engine_for_run = engine.clone();

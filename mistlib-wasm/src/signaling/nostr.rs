@@ -17,6 +17,9 @@ use web_sys::WebSocket;
 use web_time::Duration;
 
 mod connection;
+mod connection_state;
+#[cfg(test)]
+mod connection_tests;
 mod handler;
 mod keepalive;
 mod pacing;
@@ -59,6 +62,9 @@ pub struct WasmNostrSignaler {
     codec_config: NostrCodecConfig,
     crypto: InvitePskCrypto,
     sockets: Arc<Mutex<Vec<WebSocket>>>,
+    socket_handlers: std::rc::Rc<std::cell::RefCell<Vec<connection::SocketHandlers>>>,
+    reconnect_state: Arc<Mutex<connection_state::ReconnectState>>,
+    reconnect_cancel: tokio::sync::watch::Sender<u64>,
     room_id: Arc<Mutex<Option<String>>>,
     discovery_table: Arc<Mutex<DiscoveryTable>>,
     bootstrap: Arc<Mutex<DiscoveryBootstrap>>,
@@ -100,6 +106,9 @@ impl WasmNostrSignaler {
             codec_config,
             crypto,
             sockets: Arc::new(Mutex::new(Vec::new())),
+            socket_handlers: Default::default(),
+            reconnect_state: Default::default(),
+            reconnect_cancel: tokio::sync::watch::channel(0).0,
             room_id: Arc::new(Mutex::new(None)),
             discovery_table: Arc::new(Mutex::new(DiscoveryTable::default())),
             bootstrap: Arc::new(Mutex::new(DiscoveryBootstrap::default())),
@@ -418,7 +427,13 @@ impl WasmNostrSignaler {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *epoch = epoch.saturating_add(1);
-        *epoch
+        let current = *epoch;
+        self.reconnect_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(current);
+        self.reconnect_cancel.send_replace(current);
+        current
     }
 
     pub(super) fn reconnect_epoch_matches(&self, expected_epoch: u64) -> bool {
@@ -441,6 +456,16 @@ impl WasmNostrSignaler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|current| !js_sys::Object::is(current.as_ref(), ws.as_ref()));
+        let handlers = {
+            let mut handlers = self.socket_handlers.borrow_mut();
+            handlers
+                .iter()
+                .position(|handlers| js_sys::Object::is(handlers.ws.as_ref(), ws.as_ref()))
+                .map(|index| handlers.remove(index))
+        };
+        if let Some(handlers) = handlers {
+            handlers.detach();
+        }
     }
 }
 
@@ -623,13 +648,7 @@ impl Signaler for WasmNostrSignaler {
         self.cancel_discovery_refresh();
         self.cancel_relay_keepalive();
         self.next_reconnect_epoch();
-        let sockets = {
-            let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *sockets)
-        };
-        for ws in sockets {
-            let _ = ws.close();
-        }
+        self.close_sockets();
         self.room_id
             .lock()
             .unwrap_or_else(|e| e.into_inner())

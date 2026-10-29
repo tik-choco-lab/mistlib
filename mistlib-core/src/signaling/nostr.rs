@@ -4,6 +4,7 @@ mod outbox;
 pub use outbox::{DiscoveryOutbox, DiscoveryPriority};
 mod exchange;
 pub use exchange::DiscoveryExchanges;
+pub mod closed;
 pub mod codec;
 pub mod crypto;
 pub mod dedupe;

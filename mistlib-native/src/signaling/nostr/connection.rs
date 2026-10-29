@@ -1,17 +1,46 @@
 use super::NostrSignaler;
+use futures::future::join_all;
 use futures_util::{SinkExt, StreamExt};
+use mistlib_core::signaling::nostr::closed::{
+    is_permanent_closed_reason, ClosedAction, ClosedResubscribe,
+};
 use mistlib_core::signaling::nostr::{
     discovery_filter, message_filter, parse_relay_message, req_frame_json, RelayMessage,
 };
-use mistlib_core::signaling::reconnect::random_reconnect_backoff_delay;
+use mistlib_core::signaling::reconnect::ReconnectBackoff;
 use mistlib_core::signaling::MessageContent;
 use mistlib_core::stats::STATS;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
+
+pub(super) const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct SubscriptionRetry {
+    backoff: ClosedResubscribe,
+    pending: Option<CancellationToken>,
+    gave_up: bool,
+}
+
+impl SubscriptionRetry {
+    fn on_accepted(&mut self) {
+        self.backoff.on_accepted();
+        self.cancel_pending();
+    }
+
+    fn cancel_pending(&mut self) {
+        if let Some(cancel) = self.pending.take() {
+            cancel.cancel();
+        }
+    }
+}
+
+type SubscriptionRetries = HashMap<String, Arc<Mutex<SubscriptionRetry>>>;
 
 /// Interval between keepalive `Ping` frames sent on each relay connection.
 ///
@@ -40,28 +69,35 @@ impl NostrSignaler {
         self.senders.lock().await.clear();
 
         let relays = self.resolve_relays().await?;
-        let mut connected = false;
-        for relay in &relays {
-            match self
-                .connect_relay_once(relay, incoming_tx.clone(), cancel.clone())
-                .await
-            {
-                Ok(disconnected) => {
-                    connected = true;
-                    self.spawn_relay_supervisor(
-                        relay.clone(),
-                        incoming_tx.clone(),
-                        cancel.clone(),
-                        disconnected,
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!("NostrSignaler: connect to {} failed: {:?}", relay, err);
+        let results = join_all(relays.iter().map(|relay| {
+            let incoming_tx = incoming_tx.clone();
+            let cancel = cancel.clone();
+            async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return false,
+                    result = self.connect_relay_once(relay, incoming_tx.clone(), cancel.clone()) => result,
+                };
+                match result {
+                    Ok(disconnected) => {
+                        self.spawn_relay_supervisor(
+                            relay.clone(),
+                            incoming_tx.clone(),
+                            cancel.clone(),
+                            disconnected,
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        tracing::warn!("NostrSignaler: connect to {} failed: {:?}", relay, err);
+                        false
+                    }
                 }
             }
-        }
+        }))
+        .await;
 
-        if !connected {
+        if cancel.is_cancelled() || !results.into_iter().any(|connected| connected) {
             return Err(crate::error::MistError::Network(
                 "NostrSignaler: failed to connect to any relay".to_string(),
             ));
@@ -77,23 +113,24 @@ impl NostrSignaler {
         mut disconnected: oneshot::Receiver<()>,
     ) {
         let signaler = self.clone();
+        let mut backoff = ReconnectBackoff::new();
+        backoff.on_connected(web_time::Instant::now());
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = &mut disconnected => {}
                 }
+                backoff.on_disconnected(web_time::Instant::now());
 
                 // Consume each disconnect notification once, then keep
                 // retrying until a new connection supplies a fresh receiver.
-                let mut attempt = 0_u32;
                 loop {
-                    let delay = random_reconnect_backoff_delay(attempt);
+                    let delay = backoff.next_delay();
                     tokio::select! {
                         _ = cancel.cancelled() => return,
                         _ = tokio::time::sleep(delay) => {}
                     }
-                    attempt = attempt.saturating_add(1);
 
                     tracing::info!("NostrSignaler: reconnecting to {}", relay);
                     let result = tokio::select! {
@@ -102,6 +139,7 @@ impl NostrSignaler {
                     };
                     match result {
                         Ok(next_disconnected) => {
+                            backoff.on_connected(web_time::Instant::now());
                             tracing::info!("NostrSignaler: reconnected to {}", relay);
                             disconnected = next_disconnected;
                             break;
@@ -126,8 +164,19 @@ impl NostrSignaler {
         cancel: CancellationToken,
     ) -> crate::error::Result<oneshot::Receiver<()>> {
         tracing::info!("NostrSignaler: connecting to {}", relay);
-        let (ws_stream, _) = connect_async(relay)
-            .await
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(crate::error::MistError::Network("NostrSignaler: connection cancelled".into()));
+            }
+            result = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, connect_async(relay)) => result,
+        };
+        let (ws_stream, _) = result
+            .map_err(|_| {
+                crate::error::MistError::Network(format!(
+                    "NostrSignaler: connect to {relay} timed out"
+                ))
+            })?
             .map_err(|err| crate::error::MistError::Network(err.to_string()))?;
         let (mut write, mut read) = ws_stream.split();
         let (tx, mut rx) = mpsc::channel::<String>(1024);
@@ -167,7 +216,11 @@ impl NostrSignaler {
                     _ = writer_cancel.cancelled() => break,
                     maybe_frame = rx.recv() => {
                         let Some(frame) = maybe_frame else { break };
-                        if let Err(err) = write.send(Message::Text(frame.into())).await {
+                        let result = tokio::select! {
+                            _ = writer_cancel.cancelled() => break,
+                            result = write.send(Message::Text(frame.into())) => result,
+                        };
+                        if let Err(err) = result {
                             tracing::warn!("NostrSignaler: relay write failed: {}", err);
                             break;
                         }
@@ -181,7 +234,11 @@ impl NostrSignaler {
                             );
                             break;
                         }
-                        if let Err(err) = write.send(Message::Ping(Vec::new().into())).await {
+                        let result = tokio::select! {
+                            _ = writer_cancel.cancelled() => break,
+                            result = write.send(Message::Ping(Vec::new().into())) => result,
+                        };
+                        if let Err(err) = result {
                             tracing::warn!("NostrSignaler: relay ping failed: {}", err);
                             break;
                         }
@@ -200,6 +257,7 @@ impl NostrSignaler {
         let reader_disconnected = disconnected_tx.clone();
         let reader_last_activity = last_activity.clone();
         tokio::spawn(async move {
+            let mut retries = HashMap::new();
             loop {
                 tokio::select! {
                     _ = reader_cancel.cancelled() => break,
@@ -237,9 +295,12 @@ impl NostrSignaler {
                                 continue;
                             }
                         };
-                        signaler
-                            .handle_relay_message(parsed, incoming_tx.clone(), &reader_tx)
-                            .await;
+                        tokio::select! {
+                            _ = reader_cancel.cancelled() => break,
+                            _ = signaler.handle_relay_message(
+                                parsed, incoming_tx.clone(), &reader_tx, &reader_cancel, &mut retries,
+                            ) => {}
+                        }
                     }
                 }
             }
@@ -257,24 +318,79 @@ impl NostrSignaler {
         message: RelayMessage,
         incoming_tx: mpsc::Sender<MessageContent>,
         relay_tx: &mpsc::Sender<String>,
+        cancel: &CancellationToken,
+        retries: &mut SubscriptionRetries,
     ) {
         match message {
-            RelayMessage::Event { event, .. } => {
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } => {
+                if let Some(retry) = retries.get(&subscription_id) {
+                    retry.lock().await.on_accepted();
+                }
                 if let Err(err) = self.process_event(event, incoming_tx).await {
                     tracing::warn!("NostrSignaler: event processing failed: {:?}", err);
+                }
+            }
+            RelayMessage::Eose { subscription_id } => {
+                if let Some(retry) = retries.get(&subscription_id) {
+                    retry.lock().await.on_accepted();
                 }
             }
             RelayMessage::Closed {
                 subscription_id,
                 message,
             } => {
-                tracing::warn!(
-                    "NostrSignaler: relay closed subscription {}: {}",
-                    subscription_id,
-                    message
-                );
-                self.resubscribe_after_closed(relay_tx, &subscription_id)
-                    .await;
+                let Some(ids) = self.subscription_ids.lock().await.clone() else {
+                    return;
+                };
+                retries.retain(|id, _| id == &ids.discovery || id == &ids.message);
+                if subscription_id != ids.discovery && subscription_id != ids.message {
+                    return;
+                }
+                let state = retries.entry(subscription_id.clone()).or_default().clone();
+                let mut retry = state.lock().await;
+                if retry.gave_up {
+                    return;
+                }
+                if retry.pending.is_some() && !is_permanent_closed_reason(&message) {
+                    return;
+                }
+                match retry.backoff.on_closed(&message) {
+                    ClosedAction::GiveUp => {
+                        retry.gave_up = true;
+                        retry.cancel_pending();
+                        tracing::warn!(
+                            "NostrSignaler: giving up subscription {} on this connection: {}",
+                            subscription_id,
+                            message
+                        );
+                    }
+                    ClosedAction::ResubscribeAfter(delay) => {
+                        let signaler = self.clone();
+                        let tx = relay_tx.clone();
+                        let cancel = cancel.child_token();
+                        retry.pending = Some(cancel.clone());
+                        drop(retry);
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {},
+                                _ = async {
+                                    tokio::time::sleep(delay).await;
+                                    // Serialize completion with the reader so an immediate
+                                    // CLOSED response can reserve the next retry.
+                                    let mut retry = state.lock().await;
+                                    if cancel.is_cancelled() {
+                                        return;
+                                    }
+                                    signaler.resubscribe_after_closed(&tx, &subscription_id).await;
+                                    retry.pending = None;
+                                } => {}
+                            }
+                        });
+                    }
+                }
             }
             status => log_relay_status(status),
         }
@@ -311,7 +427,7 @@ impl NostrSignaler {
         Ok(())
     }
 
-    /// Re-issues the room's REQ frames on `tx` after the relay sent a
+    /// Re-issues only the rejected subscription's REQ on `tx` after a
     /// `CLOSED` for one of our active subscriptions, so the peer keeps
     /// receiving events instead of silently losing the subscription.
     async fn resubscribe_after_closed(&self, tx: &mpsc::Sender<String>, subscription_id: &str) {
@@ -322,10 +438,22 @@ impl NostrSignaler {
         let Some(ids) = ids else {
             return;
         };
-        if subscription_id != ids.discovery && subscription_id != ids.message {
+        let filter = if subscription_id == ids.discovery {
+            discovery_filter(&self.codec_config, &room_id)
+        } else if subscription_id == ids.message {
+            let identity = self.current_identity().await;
+            message_filter(&self.codec_config, &room_id, &identity.public_key)
+        } else {
             return;
+        };
+        let result = async {
+            let frame = req_frame_json(subscription_id, &[filter])?;
+            tx.send(frame)
+                .await
+                .map_err(|err| mistlib_core::error::MistError::Signaling(err.to_string()))
         }
-        if let Err(err) = self.subscribe(tx, &room_id).await {
+        .await;
+        if let Err(err) = result {
             tracing::warn!(
                 "NostrSignaler: resubscribe after CLOSED failed for room {}: {:?}",
                 room_id,

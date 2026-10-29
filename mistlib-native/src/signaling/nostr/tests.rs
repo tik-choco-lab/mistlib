@@ -710,7 +710,7 @@ async fn active_room_resubscribes_with_same_subscription_ids_before_rotation() {
 }
 
 #[tokio::test]
-async fn closed_subscription_triggers_immediate_resubscribe_with_same_id() {
+async fn closed_subscription_triggers_delayed_resubscribe_with_same_id() {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
@@ -744,17 +744,15 @@ async fn closed_subscription_triggers_immediate_resubscribe_with_same_id() {
         };
         let message_sub_id = extract_sub_id(message_req.as_ref());
 
-        // Simulate the relay unilaterally closing our message subscription
-        // (e.g. rate limiting), which should trigger an immediate
-        // resubscribe rather than waiting for the periodic timer.
+        // Only the rejected message subscription should retry after the
+        // CLOSED backoff (1s with +/-20% jitter).
         let closed = serde_json::json!(["CLOSED", message_sub_id, "rate-limited"]).to_string();
         if ws.send(Message::Text(closed.into())).await.is_err() {
             return;
         }
 
-        // Look for a fresh REQ carrying the same subscription id, well
-        // before the periodic resubscribe interval would fire on its own.
-        let found = timeout(Duration::from_millis(150), async {
+        let started = tokio::time::Instant::now();
+        let found = timeout(Duration::from_millis(1400), async {
             loop {
                 let Some(Ok(msg)) = ws.next().await else {
                     return false;
@@ -763,7 +761,10 @@ async fn closed_subscription_triggers_immediate_resubscribe_with_same_id() {
                     continue;
                 };
                 let text = text.to_string();
-                if text.contains("REQ") && extract_sub_id(&text) == message_sub_id {
+                if text.starts_with("[\"REQ\"") {
+                    assert_eq!(extract_sub_id(&text), message_sub_id);
+                    assert!(started.elapsed() >= Duration::from_millis(800));
+                    assert!(started.elapsed() <= Duration::from_millis(1250));
                     return true;
                 }
             }
@@ -778,6 +779,7 @@ async fn closed_subscription_triggers_immediate_resubscribe_with_same_id() {
     cfg.relays = vec![format!("ws://{addr}")];
     let signaler = NostrSignaler::new(NodeId("alice".to_string()), cfg);
     signaler.set_room_id("room-closed").await.unwrap();
+    signaler.cancel_room_resubscribe();
     let (incoming_tx, _incoming_rx) = mpsc::channel(8);
 
     signaler
@@ -791,7 +793,7 @@ async fn closed_subscription_triggers_immediate_resubscribe_with_same_id() {
         .expect("done channel closed unexpectedly");
     assert!(
         resubscribed,
-        "CLOSED subscription should trigger an immediate resubscribe with the same id"
+        "CLOSED subscription should trigger a delayed resubscribe with the same id"
     );
 
     signaler.close().await.unwrap();
@@ -921,6 +923,7 @@ async fn invalid_event_does_not_block_later_valid_event_with_same_id() {
         .is_some());
 }
 
+mod connection_retry;
 mod discovery_retry;
 mod rejoin;
 mod replay;

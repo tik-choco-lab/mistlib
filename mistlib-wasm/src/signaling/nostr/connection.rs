@@ -1,9 +1,9 @@
+use super::connection_state::SocketState;
 use super::WasmNostrSignaler;
 use js_sys::Uint8Array;
 use mistlib_core::signaling::nostr::{
     discovery_filter, message_filter, parse_relay_message, req_frame_json, RelayMessage,
 };
-use mistlib_core::signaling::reconnect::random_reconnect_backoff_delay;
 use mistlib_core::signaling::MessageContent;
 use mistlib_core::stats::STATS;
 use std::cell::RefCell;
@@ -17,20 +17,39 @@ use web_time::{Duration, Instant};
 
 const CONNECT_TIMEOUT_MS: u32 = 15_000;
 
+type OpenWaiter = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
+pub(super) struct SocketHandlers {
+    pub(super) ws: WebSocket,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    _onopen: Closure<dyn FnMut(web_sys::Event)>,
+    _onerror: Closure<dyn FnMut(web_sys::Event)>,
+    _onclose: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl SocketHandlers {
+    pub(super) fn detach(self) {
+        self.ws.set_onmessage(None);
+        self.ws.set_onopen(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        // This may be called by one of these handlers. Keep its Closure alive
+        // until the callback returns; spawn_local first polls on a microtask.
+        spawn_local(async move { drop(self) });
+    }
+}
+
 impl WasmNostrSignaler {
     pub async fn connect(&self, tx: mpsc::UnboundedSender<MessageContent>) -> Result<(), JsValue> {
-        self.next_reconnect_epoch();
-        self.sockets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         let epoch = self.next_reconnect_epoch();
+        self.close_sockets();
+        let mut cancelled = self.reconnect_cancel.subscribe();
         let mut waiters = Vec::new();
         let relays = self.resolve_relays().await?;
 
         for relay in &relays {
             match self.open_relay(relay.clone(), tx.clone(), epoch).await {
-                Ok(waiter) => waiters.push(waiter),
+                Ok(connection) => waiters.push(connection),
                 Err(err) => {
                     web_sys::console::warn_1(
                         &format!("WasmNostrSignaler: connect to {relay} failed: {err:?}").into(),
@@ -40,33 +59,66 @@ impl WasmNostrSignaler {
         }
 
         let timeout = gloo_timers::future::TimeoutFuture::new(CONNECT_TIMEOUT_MS);
-        let wait_all = async move {
+        let wait_all = async {
             let mut opened_any = false;
-            for waiter in waiters {
+            for (ws, waiter) in waiters {
                 if matches!(waiter.await, Ok(Ok(()))) {
                     opened_any = true;
+                } else {
+                    self.remove_socket(&ws);
+                    let _ = ws.close();
                 }
             }
             opened_any
         };
-
-        match futures::future::select(Box::pin(wait_all), timeout).await {
+        let connection = futures::future::select(Box::pin(wait_all), timeout);
+        if !self.reconnect_epoch_matches(epoch) {
+            return Err(JsValue::from_str(
+                "WasmNostrSignaler: stale reconnect epoch",
+            ));
+        }
+        let result = match futures::future::select(
+            Box::pin(connection),
+            Box::pin(cancelled.changed()),
+        )
+        .await
+        {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => {
+                return Err(JsValue::from_str(
+                    "WasmNostrSignaler: stale reconnect epoch",
+                ))
+            }
+        };
+        match result {
             futures::future::Either::Left((true, _)) => Ok(()),
             futures::future::Either::Left((false, _)) => Err(JsValue::from_str(
                 "WasmNostrSignaler: failed to connect to any relay",
             )),
+            // A hung relay must not fail the join when another one already
+            // opened; sockets still connecting stay registered and subscribe
+            // from onopen if they eventually open.
+            futures::future::Either::Right((_, _)) if self.any_socket_open() => Ok(()),
             futures::future::Either::Right((_, _)) => Err(JsValue::from_str(
                 "WasmNostrSignaler: relay connection timed out",
             )),
         }
     }
 
-    async fn open_relay(
+    fn any_socket_open(&self) -> bool {
+        self.sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|ws| ws.ready_state() == WebSocket::OPEN)
+    }
+
+    pub(super) async fn open_relay(
         &self,
         relay: String,
         tx: mpsc::UnboundedSender<MessageContent>,
         epoch: u64,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, JsValue> {
+    ) -> Result<(WebSocket, OpenWaiter), JsValue> {
         if !self.reconnect_epoch_matches(epoch) {
             return Err(JsValue::from_str(
                 "WasmNostrSignaler: stale reconnect epoch",
@@ -109,14 +161,16 @@ impl WasmNostrSignaler {
             signaler.handle_relay_frame(&raw, &incoming_tx);
         }) as Box<dyn FnMut(MessageEvent)>);
         ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
-        onmessage_callback.forget();
 
         let (open_tx, open_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let open_tx = Rc::new(RefCell::new(Some(open_tx)));
+        let socket_state = Rc::new(RefCell::new(SocketState::default()));
 
         let subscribe_signaler = self.clone();
         let subscribe_ws = ws.clone();
         let open_tx_cb = open_tx.clone();
+        let opened_state = socket_state.clone();
+        let opened_relay = relay.clone();
         let onopen_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
             if !subscribe_signaler.reconnect_epoch_matches(epoch) {
                 let tx = open_tx_cb.borrow_mut().take();
@@ -125,6 +179,12 @@ impl WasmNostrSignaler {
                 }
                 return;
             }
+            opened_state.borrow_mut().on_open();
+            subscribe_signaler
+                .reconnect_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_connected(&opened_relay, Instant::now());
             if let Some(room_id) = subscribe_signaler.room_id() {
                 if let Err(err) = subscribe_signaler.send_subscriptions(&subscribe_ws, &room_id) {
                     let tx = open_tx_cb.borrow_mut().take();
@@ -148,21 +208,17 @@ impl WasmNostrSignaler {
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
         ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
-        onopen_callback.forget();
 
         let open_tx_cb = open_tx.clone();
-        let error_signaler = self.clone();
         let error_ws = ws.clone();
         let onerror_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
             let tx = open_tx_cb.borrow_mut().take();
             if let Some(tx) = tx {
-                error_signaler.remove_socket(&error_ws);
                 let _ = error_ws.close();
                 let _ = tx.send(Err("websocket failed to open".to_string()));
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
         ws.set_onerror(Some(onerror_callback.as_ref().unchecked_ref()));
-        onerror_callback.forget();
 
         let open_tx_cb = open_tx.clone();
         let signaler = self.clone();
@@ -170,35 +226,37 @@ impl WasmNostrSignaler {
         let reconnect_relay = relay.clone();
         let close_ws = ws.clone();
         let onclose_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            let tx = open_tx_cb.borrow_mut().take();
-            if let Some(tx) = tx {
-                signaler.remove_socket(&close_ws);
+            let was_open = socket_state.borrow_mut().on_close();
+            if let Some(tx) = open_tx_cb.borrow_mut().take() {
                 let _ = tx.send(Err("websocket closed before opening".to_string()));
-                return;
-            }
-            if !signaler.reconnect_epoch_matches(epoch) {
-                return;
             }
             signaler.remove_socket(&close_ws);
-            let signaler = signaler.clone();
-            let reconnect_tx = reconnect_tx.clone();
-            let reconnect_relay = reconnect_relay.clone();
-            spawn_local(async move {
-                signaler
-                    .reconnect_relay_loop(reconnect_relay, reconnect_tx, epoch)
-                    .await;
-            });
+            if !was_open || !signaler.reconnect_epoch_matches(epoch) {
+                return;
+            }
+            signaler
+                .reconnect_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_disconnected(&reconnect_relay, Instant::now());
+            signaler.spawn_reconnect(reconnect_relay.clone(), reconnect_tx.clone(), epoch);
         }) as Box<dyn FnMut(web_sys::Event)>);
         ws.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
-        onclose_callback.forget();
+        self.socket_handlers.borrow_mut().push(SocketHandlers {
+            ws: ws.clone(),
+            _onmessage: onmessage_callback,
+            _onopen: onopen_callback,
+            _onerror: onerror_callback,
+            _onclose: onclose_callback,
+        });
 
         self.spawn_idle_watchdog(ws.clone(), relay.clone(), last_activity, epoch);
 
         self.sockets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(ws);
-        Ok(open_rx)
+            .push(ws.clone());
+        Ok((ws, open_rx))
     }
 
     /// Watches a single relay connection for silence and force-closes it once
@@ -238,53 +296,138 @@ impl WasmNostrSignaler {
         });
     }
 
+    pub(super) fn close_sockets(&self) {
+        let sockets = std::mem::take(&mut *self.sockets.lock().unwrap_or_else(|e| e.into_inner()));
+        let handlers = std::mem::take(&mut *self.socket_handlers.borrow_mut());
+        for handlers in handlers {
+            handlers.detach();
+        }
+        for ws in sockets {
+            let _ = ws.close();
+        }
+    }
+
+    fn spawn_reconnect(
+        &self,
+        relay: String,
+        tx: mpsc::UnboundedSender<MessageContent>,
+        epoch: u64,
+    ) {
+        if !self
+            .reconnect_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .claim(&relay, epoch)
+        {
+            return;
+        }
+        let signaler = self.clone();
+        spawn_local(async move {
+            signaler
+                .reconnect_relay_loop(relay.clone(), tx, epoch)
+                .await;
+            signaler
+                .reconnect_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release(&relay, epoch);
+        });
+    }
+
     async fn reconnect_relay_loop(
         &self,
         relay: String,
         tx: mpsc::UnboundedSender<MessageContent>,
         epoch: u64,
     ) {
-        let mut attempt = 0_u32;
+        let mut cancelled = self.reconnect_cancel.subscribe();
         while self.reconnect_epoch_matches(epoch) {
-            let delay = random_reconnect_backoff_delay(attempt);
+            let delay = self
+                .reconnect_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .backoff(&relay)
+                .next_delay();
             let delay_ms = delay.as_millis().min(u128::from(u32::MAX)) as u32;
             web_sys::console::warn_1(
                 &format!(
-                    "WasmNostrSignaler: relay {relay} disconnected; reconnecting in {:?}",
-                    delay
+                    "WasmNostrSignaler: relay {relay} disconnected; reconnecting in {delay:?}"
                 )
                 .into(),
             );
-            gloo_timers::future::TimeoutFuture::new(delay_ms).await;
-            if !self.reconnect_epoch_matches(epoch) {
+            if matches!(
+                futures::future::select(
+                    gloo_timers::future::TimeoutFuture::new(delay_ms),
+                    Box::pin(cancelled.changed()),
+                )
+                .await,
+                futures::future::Either::Right(_)
+            ) || !self.reconnect_epoch_matches(epoch)
+            {
                 break;
             }
             match self.open_relay(relay.clone(), tx.clone(), epoch).await {
-                Ok(waiter) => match waiter.await {
-                    Ok(Ok(())) => break,
-                    Ok(Err(message)) => {
-                        web_sys::console::warn_1(
-                            &format!("WasmNostrSignaler: reconnect to {relay} failed: {message}")
-                                .into(),
-                        );
+                Ok((ws, waiter)) => {
+                    let result = self.wait_for_open(waiter, epoch, CONNECT_TIMEOUT_MS).await;
+                    // onclose may run before this waiter is polled. In that
+                    // case this loop still owns the relay and must continue.
+                    if result.is_ok() && ws.ready_state() == WebSocket::OPEN {
+                        break;
                     }
-                    Err(_) => {
-                        web_sys::console::warn_1(
-                            &format!(
-                                "WasmNostrSignaler: reconnect to {relay} open waiter canceled"
-                            )
+                    let message = result
+                        .err()
+                        .unwrap_or_else(|| "websocket closed after opening".to_string());
+                    self.remove_socket(&ws);
+                    let _ = ws.close();
+                    if !self.reconnect_epoch_matches(epoch) {
+                        break;
+                    }
+                    web_sys::console::warn_1(
+                        &format!("WasmNostrSignaler: reconnect to {relay} failed: {message}")
                             .into(),
-                        );
-                    }
-                },
+                    );
+                }
                 Err(err) => {
                     web_sys::console::warn_1(
                         &format!("WasmNostrSignaler: reconnect to {relay} failed: {err:?}").into(),
                     );
                 }
             }
-            attempt = attempt.saturating_add(1);
         }
+    }
+
+    pub(super) async fn wait_for_open(
+        &self,
+        waiter: OpenWaiter,
+        epoch: u64,
+        timeout_ms: u32,
+    ) -> Result<(), String> {
+        let mut cancelled = self.reconnect_cancel.subscribe();
+        if !self.reconnect_epoch_matches(epoch) {
+            return Err("stale reconnect epoch".to_string());
+        }
+        let attempt = async {
+            match futures::future::select(
+                waiter,
+                gloo_timers::future::TimeoutFuture::new(timeout_ms),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _)) => {
+                    result.unwrap_or_else(|_| Err("open waiter canceled".to_string()))
+                }
+                futures::future::Either::Right(_) => Err("relay connection timed out".to_string()),
+            }
+        };
+        let result = match futures::future::select(Box::pin(attempt), Box::pin(cancelled.changed()))
+            .await
+        {
+            futures::future::Either::Left((result, _)) if self.reconnect_epoch_matches(epoch) => {
+                result
+            }
+            _ => Err("stale reconnect epoch".to_string()),
+        };
+        result
     }
 
     pub(super) fn subscription_frames(

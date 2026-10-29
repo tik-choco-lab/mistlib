@@ -1,6 +1,6 @@
 [package]
 name = "mistlib-core"
-version = "0.7.2"
+version = "0.7.3-beta.1"
 edition = "2021"
 license = "MPL-2.0"
 

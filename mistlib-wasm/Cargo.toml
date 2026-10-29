@@ -1,6 +1,6 @@
 [package]
 name = "mistlib-wasm"
-version = "0.7.2"
+version = "0.7.3-beta.1"
 edition = "2021"
 license = "MPL-2.0"
 
@@ -37,6 +37,8 @@ web-sys = { version = "0.3", features = [
     "RtcIceConnectionState",
     "RtcPeerConnectionState",
     "Window",
+    "RequestCache",
+    "RequestInit",
     "Response",
     "console",
     "WebSocket",

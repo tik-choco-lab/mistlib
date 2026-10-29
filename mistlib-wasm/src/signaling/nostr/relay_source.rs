@@ -46,7 +46,12 @@ async fn fetch_relay_list(url: &str) -> Result<String, JsValue> {
 async fn fetch_relay_list_inner(url: &str) -> Result<String, JsValue> {
     let window = web_sys::window()
         .ok_or_else(|| JsValue::from_str("WasmNostrSignaler: window is unavailable"))?;
-    let response = JsFuture::from(window.fetch_with_str(url)).await?;
+    // The relay list host sends Last-Modified without Cache-Control, so the
+    // default cache mode lets browsers reuse a stale list for hours via
+    // heuristic freshness. no-cache always revalidates (cheap 304 when unchanged).
+    let init = web_sys::RequestInit::new();
+    init.set_cache(web_sys::RequestCache::NoCache);
+    let response = JsFuture::from(window.fetch_with_str_and_init(url, &init)).await?;
     let response: web_sys::Response = response.dyn_into()?;
     if !response.ok() {
         return Err(JsValue::from_str(&format!(
