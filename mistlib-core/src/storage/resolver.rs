@@ -24,8 +24,8 @@ pub const DISCOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// (75 s total, below ATTEMPT_CAP). Never replays a bulk WANT.
 pub const MAX_DISCOVERY_QUERY_ROUNDS: u32 = 4;
 /// Provider stall-suspicion threshold, reset by accepted per-sender progress.
-/// A provider that has served during this attempt may recover until the fixed
-/// cap unless a confirmed reset starts the bounded recovery/replay path; a provider that never responds fails at idle.
+/// A serving provider replays after two reachable silent windows; temporary
+/// route loss can recover until the fixed cap. A never-serving provider fails at idle.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Allows four concurrent 1 MiB blocks over a roughly 30 KiB/s link, while
 /// guaranteeing that even a provider trickling data cannot keep an attempt or
@@ -33,8 +33,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const ATTEMPT_CAP: Duration = Duration::from_secs(300);
 /// Bounds a call to four provider attempts and at most one discovery phase.
 pub const MAX_ATTEMPTS: usize = 4;
-/// At most two additional targeted WANTs after confirmed connection resets.
-/// Silence on a live connection never triggers replay (avoids duplicate MiB transfers).
+/// Shared budget for additional targeted WANTs after resets or serving stalls.
 pub const MAX_RESET_REREQUESTS: usize = 2;
 /// Reachability can return between idle checks; poll during reset or QUERY recovery.
 const RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -129,6 +128,12 @@ struct QueryPath {
     room: String,
     peer: NodeId,
     resets: tokio::sync::watch::Receiver<u64>,
+}
+
+enum WantSend {
+    Sent,
+    Unreachable,
+    Failed,
 }
 
 impl DiscoveryFailure {
@@ -261,15 +266,36 @@ impl NetworkPeerResolver {
     }
 
     async fn send_want(&self, attempt: u64, cid: &str, target: &NodeId) -> bool {
+        let mut route_wait = Duration::ZERO;
+        loop {
+            match self.enqueue_want(attempt, cid, target).await {
+                WantSend::Sent => return true,
+                WantSend::Failed => return false,
+                WantSend::Unreachable => {
+                    if route_wait >= super::responder::RESPONDER_ROUTE_RECOVERY {
+                        return false;
+                    }
+                    let delay = RECONNECT_POLL_INTERVAL
+                        .min(super::responder::RESPONDER_ROUTE_RECOVERY - route_wait);
+                    self.runtime.sleep(delay).await;
+                    route_wait += delay;
+                }
+            }
+        }
+    }
+
+    async fn enqueue_want(&self, attempt: u64, cid: &str, target: &NodeId) -> WantSend {
         let mut want = vec![MSG_WANT];
         want.extend_from_slice(cid.as_bytes());
         let want = Bytes::from(want);
         let mut sent = false;
+        let mut reachable = false;
         for (room, transport) in self.transports.session_transports().await {
             if !transport.is_reachable(target) {
                 debug!(attempt, %cid, provider = %target.0, %room, "Storage: WANT path unreachable");
                 continue;
             }
+            reachable = true;
             // Attach before awaiting enqueue: even a synchronous reply or a
             // teardown while send is pending must see this attempt's path.
             let attached = self.registry.track_path(attempt, &room);
@@ -288,7 +314,13 @@ impl NetworkPeerResolver {
             }
             sent |= result.is_ok();
         }
-        sent
+        if sent {
+            WantSend::Sent
+        } else if reachable {
+            WantSend::Failed
+        } else {
+            WantSend::Unreachable
+        }
     }
 
     async fn attempt(&self, cid: &str, target: &NodeId) -> Option<Vec<u8>> {
@@ -322,7 +354,7 @@ impl NetworkPeerResolver {
         let mut progress = self.registry.progress(target);
         let progress_snapshot = progress.clone();
         let reset_snapshot = resets.clone();
-        // One cap covers initial send, reset recovery, every replay and idle wait.
+        // One cap covers initial route recovery, reset recovery, replays and idle waits.
         // The data receiver stays alive across generations; sender_reset clears
         // assemblies because reconnects may negotiate different chunk layouts.
         let data = data.fuse();
@@ -337,20 +369,21 @@ impl NetworkPeerResolver {
                     futures_util::pin_mut!(send, reset);
                     select_biased! {
                         result = reset => {
-                            if result.is_err() { return; }
+                            if result.is_err() { return true; }
                             true
                         },
                         sent = send => {
                             if !sent {
                                 info!("PeerResolver: WANT for {} could not be sent to {}", cid, target.0);
-                                return;
+                                return false;
                             }
                             false
                         },
                     }
                 };
                 let mut logged_stall = false;
-                if !reset_during_send {
+                let mut reachable_stalls = 0;
+                let reset_observed = if !reset_during_send {
                     loop {
                         let idle = async {
                             self.runtime.sleep(self.timings.idle_timeout).await;
@@ -361,12 +394,13 @@ impl NetworkPeerResolver {
                         futures_util::pin_mut!(idle, changed, reset);
                         select_biased! {
                             result = reset => {
-                                if result.is_err() { return; }
-                                break;
+                                if result.is_err() { return true; }
+                                break true;
                             },
                             result = changed => {
-                                if result.is_err() { return; }
+                                if result.is_err() { return true; }
                                 was_serving = true;
+                                reachable_stalls = 0;
                                 if logged_stall {
                                     debug!(attempt = attempt_id, %cid, provider = %target.0, "Storage: attempt progress resumed");
                                     logged_stall = false;
@@ -375,8 +409,8 @@ impl NetworkPeerResolver {
                             reachable = idle => {
                                 // Routing intentionally excludes Reconnecting peers (W9 send
                                 // diversion). Route loss alone is unconfirmed suspicion, not
-                                // absence. Only sender_reset may abandon the old stream and
-                                // trigger replay; the original cap bounds this wait.
+                                // absence. Two silent windows on a recovered/live route
+                                // can indicate a lost response; share the reset replay budget.
                                 let own = *own_progress.borrow();
                                 info!(attempt = attempt_id, %cid, provider = %target.0, reachable,
                                     reset_generation = *reset_snapshot.borrow(),
@@ -389,18 +423,24 @@ impl NetworkPeerResolver {
                                     "Storage: attempt stall window");
                                 if was_serving {
                                     logged_stall = true;
+                                    reachable_stalls = if reachable { reachable_stalls + 1 } else { 0 };
+                                    if reachable_stalls >= 2 {
+                                        break false;
+                                    }
                                     continue;
                                 }
                                 info!("PeerResolver: no data from {} for {:?} while fetching {} (reachable={})", target.0, self.timings.idle_timeout, cid, reachable);
-                                return;
+                                return false;
                             },
                         }
                     }
-                }
-                info!(attempt = attempt_id, generation = *resets.borrow(), "PeerResolver: sender {} reset while fetching {}", target.0, cid);
+                } else {
+                    true
+                };
+                info!(attempt = attempt_id, generation = *resets.borrow(), reset = reset_observed, "PeerResolver: recovering stalled response from {} while fetching {}", target.0, cid);
                 if rerequests >= MAX_RESET_REREQUESTS {
                     info!("PeerResolver: re-request bound reached for {} from {}", cid, target.0);
-                    return;
+                    return false;
                 }
                 // Repeated resets while disconnected coalesce into one recovery
                 // window. Neither progress nor resets can extend this idle budget.
@@ -419,14 +459,14 @@ impl NetworkPeerResolver {
                 futures_util::pin_mut!(recovery, idle);
                 select_biased! {
                     _ = idle => {
-                        info!("PeerResolver: {} did not become reachable within {:?} after reset during {}", target.0, self.timings.idle_timeout, cid);
-                        return;
+                        info!("PeerResolver: {} did not become reachable within {:?} during response recovery for {}", target.0, self.timings.idle_timeout, cid);
+                        return false;
                     },
                     _ = recovery => {},
                 }
                 // Keep W12's accepted service evidence for this attempt.
                 rerequests += 1;
-                info!("PeerResolver: re-requesting {} from {} after reset ({}/{})", cid, target.0, rerequests, MAX_RESET_REREQUESTS);
+                info!("PeerResolver: re-requesting {} from {} ({}/{})", cid, target.0, rerequests, MAX_RESET_REREQUESTS);
             }
         }.fuse();
         futures_util::pin_mut!(cap, data, attempt);
@@ -436,9 +476,21 @@ impl NetworkPeerResolver {
                 None
             },
             result = data => result.ok(),
-            // A synchronous send can fulfill data and close its watch senders
-            // in the same poll. Read the completed block before reporting failure.
-            _ = attempt => data.now_or_never().and_then(|result| result.ok()),
+            watches_closed = attempt => {
+                if watches_closed {
+                    // Completion closes watches too. Allow a concurrently published
+                    // result to arrive, bounded by both a short grace and the cap.
+                    let grace = self.runtime.sleep(RECONNECT_POLL_INTERVAL).fuse();
+                    futures_util::pin_mut!(grace);
+                    select_biased! {
+                        result = data => result.ok(),
+                        _ = cap => None,
+                        _ = grace => None,
+                    }
+                } else {
+                    data.now_or_never().and_then(|result| result.ok())
+                }
+            },
         };
         let own = *own_progress.borrow();
         debug!(attempt = attempt_id, %cid, provider = %target.0, completed = result.is_some(),
@@ -767,6 +819,7 @@ mod tests {
         Reject,
         Immediate(Vec<u8>),
         AfterReplay(Vec<u8>),
+        StalledUntilReplay(Vec<u8>),
         Chunks {
             block: Vec<u8>,
             delay: Duration,
@@ -892,6 +945,16 @@ mod tests {
                             2,
                             b"old-partial".to_vec(),
                         );
+                    }
+                }
+                Response::StalledUntilReplay(data) => {
+                    let count = self.sends.lock().unwrap().len();
+                    if count == 1 {
+                        self.registry
+                            .fulfill_chunk_in(&self.room, &cid, node, 0, 2, vec![7]);
+                    } else {
+                        self.registry
+                            .fulfill_chunk_in(&self.room, &cid, node, 1, 2, data);
                     }
                 }
                 Response::HangingSend => futures_util::future::pending().await,
@@ -1356,7 +1419,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn serving_evidence_survives_reset_without_silence_triggered_replays() {
+    async fn reset_and_serving_stall_share_the_rerequest_budget() {
         let registry = WantRegistry::new();
         let transport = Arc::new(FakeTransport::new(
             &registry,
@@ -1370,13 +1433,16 @@ mod tests {
             events.sender_reset(&peer("remote"), "");
         });
         let mut resolver = resolver(&registry, transport.clone());
-        resolver.timings.attempt_cap = Duration::from_secs(30);
+        resolver.timings.attempt_cap = Duration::from_secs(90);
         let start = Instant::now();
         assert!(resolver.attempt(TEST_CID, &peer("remote")).await.is_none());
-        assert_eq!(start.elapsed(), resolver.timings.attempt_cap);
-        // Exactly the initial WANT and the reset-triggered replay, despite
-        // crossing multiple idle windows on the live replacement connection.
-        assert_eq!(transport.targets(), [peer("remote"), peer("remote")]);
+        assert_eq!(start.elapsed(), Duration::from_secs(2) + 4 * IDLE_TIMEOUT);
+        // Service evidence survives reset. The next two reachable silent windows
+        // use the remaining replay budget, rather than starting a separate budget.
+        assert_eq!(
+            transport.targets(),
+            vec![peer("remote"); 1 + MAX_RESET_REREQUESTS]
+        );
     }
 
     fn slow_block() -> Response {
@@ -1514,6 +1580,140 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn initial_want_waits_for_a_temporary_route_gap_and_completes() {
+        let registry = WantRegistry::new();
+        registry.register_peer(TEST_CID, peer("remote"));
+        let transport = Arc::new(FakeTransport::new(
+            &registry,
+            vec![("remote", Response::Immediate(vec![8]))],
+        ));
+        transport.set_connection_state(&peer("remote"), ConnectionState::Reconnecting);
+        let recovering = transport.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            recovering.set_connection_state(&peer("remote"), ConnectionState::Connected);
+        });
+        let start = Instant::now();
+        assert_eq!(
+            resolver(&registry, transport.clone())
+                .resolve_block(TEST_CID)
+                .await,
+            Some(vec![8])
+        );
+        // The route can recover just after a poll on the same timer boundary.
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert!(start.elapsed() <= Duration::from_secs(2) + RECONNECT_POLL_INTERVAL);
+        assert_eq!(transport.targets(), [peer("remote")]);
+        transport.assert_queries_only(0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_want_route_recovery_is_bounded_and_fails_over() {
+        let registry = WantRegistry::new();
+        registry.register_peer(TEST_CID, peer("remote"));
+        registry.register_peer(TEST_CID, peer("fallback"));
+        let transport = Arc::new(FakeTransport::new(
+            &registry,
+            vec![("fallback", Response::Immediate(vec![9]))],
+        ));
+        transport.set_connection_state(&peer("remote"), ConnectionState::Reconnecting);
+        let start = Instant::now();
+        assert_eq!(
+            resolver(&registry, transport.clone())
+                .resolve_block(TEST_CID)
+                .await,
+            Some(vec![9])
+        );
+        assert_eq!(
+            start.elapsed(),
+            super::super::responder::RESPONDER_ROUTE_RECOVERY
+        );
+        assert_eq!(transport.targets(), [peer("fallback")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_route_recovery_obeys_the_original_attempt_cap() {
+        let registry = WantRegistry::new();
+        let transport = Arc::new(FakeTransport::new(&registry, vec![]));
+        transport.set_connection_state(&peer("remote"), ConnectionState::Reconnecting);
+        let mut resolver = resolver(&registry, transport.clone());
+        resolver.timings.attempt_cap = Duration::from_secs(1);
+        let start = Instant::now();
+        assert_eq!(resolver.attempt(TEST_CID, &peer("remote")).await, None);
+        assert_eq!(start.elapsed(), resolver.timings.attempt_cap);
+        assert!(transport.targets().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reachable_serving_stall_replays_after_two_windows_and_completes() {
+        let registry = WantRegistry::new();
+        let transport = Arc::new(FakeTransport::new(
+            &registry,
+            vec![("remote", Response::StalledUntilReplay(vec![8]))],
+        ));
+        let start = Instant::now();
+        assert_eq!(
+            resolver(&registry, transport.clone())
+                .attempt(TEST_CID, &peer("remote"))
+                .await,
+            Some(vec![7, 8])
+        );
+        assert_eq!(start.elapsed(), 2 * IDLE_TIMEOUT);
+        assert_eq!(transport.targets(), [peer("remote"), peer("remote")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_progress_clears_consecutive_reachable_stall_windows() {
+        let registry = WantRegistry::new();
+        let transport = Arc::new(FakeTransport::new(
+            &registry,
+            vec![("remote", Response::Silent)],
+        ));
+        let incoming = registry.clone();
+        tokio::spawn(async move {
+            for index in 0..3 {
+                let delay = if index == 0 {
+                    Duration::from_secs(1)
+                } else {
+                    IDLE_TIMEOUT + Duration::from_secs(1)
+                };
+                tokio::time::sleep(delay).await;
+                incoming.fulfill_chunk_from(TEST_CID, &peer("remote"), index, 3, vec![index as u8]);
+            }
+        });
+        assert_eq!(
+            resolver(&registry, transport.clone())
+                .attempt(TEST_CID, &peer("remote"))
+                .await,
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(transport.targets(), [peer("remote")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_at_the_second_stall_window_sends_only_one_replay() {
+        let registry = WantRegistry::new();
+        let transport = Arc::new(FakeTransport::new(
+            &registry,
+            vec![("remote", Response::AfterReplay(vec![8]))],
+        ));
+        let incoming = registry.clone();
+        tokio::spawn(async move {
+            // Publish reset before the idle timer. A reset arriving after a
+            // replay invalidates that response and legitimately needs another WANT.
+            tokio::time::sleep(2 * IDLE_TIMEOUT - Duration::from_millis(1)).await;
+            incoming.sender_reset(&peer("remote"), "");
+        });
+        assert_eq!(
+            resolver(&registry, transport.clone())
+                .attempt(TEST_CID, &peer("remote"))
+                .await,
+            Some(vec![8])
+        );
+        assert_eq!(transport.targets(), [peer("remote"), peer("remote")]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn connected_peer_with_only_prior_progress_still_fails_at_idle() {
         let registry = WantRegistry::new();
         let _other = registry.register_from(OTHER_CID, peer("silent"));
@@ -1536,7 +1736,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn silent_connected_serving_peer_is_bounded_by_fixed_cap() {
+    async fn silent_connected_serving_peer_stops_at_the_rerequest_bound() {
         let registry = WantRegistry::new();
         let transport = Arc::new(FakeTransport::new(
             &registry,
@@ -1551,12 +1751,20 @@ mod tests {
         ));
         let start = Instant::now();
         assert_eq!(
-            resolver(&registry, transport)
+            resolver(&registry, transport.clone())
                 .attempt(TEST_CID, &peer("silent"))
                 .await,
             None
         );
-        assert_eq!(start.elapsed(), ATTEMPT_CAP);
+        // Reachable silence now replays after two windows, sharing the reset bound.
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(1) + 2 * IDLE_TIMEOUT * (1 + MAX_RESET_REREQUESTS as u32)
+        );
+        assert_eq!(
+            transport.targets(),
+            vec![peer("silent"); 1 + MAX_RESET_REREQUESTS]
+        );
     }
 
     #[tokio::test(start_paused = true)]

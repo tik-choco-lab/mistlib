@@ -2,6 +2,12 @@
 //! descriptors only, with four active workers and 64 pending WANTs per peer.
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::sync::atomic::Ordering;
+use web_time::Duration;
+
+/// Covers ICE recovery and the router's next connection-state sync.
+pub const RESPONDER_ROUTE_RECOVERY: Duration = Duration::from_secs(5);
+const ROUTE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 pub enum WantAdmission<D> {
     Start(D),
@@ -82,10 +88,12 @@ mod tests {
     }
 }
 
-/// Shared provider loop. A failed local write ends the block immediately;
-/// already committed frames remain owned by their transport workers.
+/// Retry an unsubmitted frame across bounded route loss. Other write failures
+/// end the block; committed frames remain owned by their transport workers.
+#[allow(clippy::too_many_arguments)] // Keep the caller's negotiated chunk layout and pacing.
 pub async fn send_block(
     transport: &dyn crate::transport::Transport,
+    runtime: &dyn crate::runtime::AsyncRuntime,
     peer: &crate::types::NodeId,
     cid: &str,
     data: &[u8],
@@ -93,21 +101,54 @@ pub async fn send_block(
     total_chunks: u16,
     mut after_frame: impl FnMut(u16) -> crate::transport::send::SendFuture<'static, ()>,
 ) -> crate::error::Result<()> {
+    let counters = &super::telemetry::STORAGE_COUNTERS;
+    let mut route_wait = Duration::ZERO;
     for index in 0..total_chunks.max(1) {
-        let frame = super::protocol::build_have_payload(cid, data, index, total_chunks, chunk_size);
-        let result = transport
-            .send_response(
-                peer,
-                bytes::Bytes::from(frame),
-                crate::types::DeliveryMethod::ReliableOrdered,
-            )
-            .await;
-        let counters = &super::telemetry::STORAGE_COUNTERS;
-        if let Err(error) = result {
-            counters
-                .responder_write_errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(error);
+        let frame = bytes::Bytes::from(super::protocol::build_have_payload(
+            cid,
+            data,
+            index,
+            total_chunks,
+            chunk_size,
+        ));
+        let mut retried = false;
+        loop {
+            match transport
+                .send_response(
+                    peer,
+                    frame.clone(),
+                    crate::types::DeliveryMethod::ReliableOrdered,
+                )
+                .await
+            {
+                Ok(()) => {
+                    if retried {
+                        counters
+                            .responder_route_recoveries
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    break;
+                }
+                Err(error) => {
+                    counters
+                        .responder_write_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !matches!(error, crate::error::MistError::RouteNotFound(_))
+                        || route_wait >= RESPONDER_ROUTE_RECOVERY
+                    {
+                        return Err(error);
+                    }
+                    // One cumulative sleep budget for the entire block, even if
+                    // several separate route gaps interrupt different chunks.
+                    let delay = ROUTE_RETRY_INTERVAL.min(RESPONDER_ROUTE_RECOVERY - route_wait);
+                    runtime.sleep(delay).await;
+                    route_wait += delay;
+                    retried = true;
+                    counters
+                        .responder_route_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         let bytes = if total_chunks <= 1 {
             data.len()
@@ -131,29 +172,45 @@ pub async fn send_block(
 mod send_tests {
     use super::*;
     use crate::error::{MistError, Result};
+    use crate::runtime::{AsyncRuntime, BoxTask};
     use crate::transport::{NetworkEventHandler, Transport};
     use crate::types::{ConnectionState, DeliveryMethod, NodeId};
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
-    struct BrokenWriter(AtomicUsize);
+    struct TestRuntime;
     #[async_trait]
-    impl Transport for BrokenWriter {
+    impl AsyncRuntime for TestRuntime {
+        fn spawn(&self, future: BoxTask) {
+            tokio::spawn(future);
+        }
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    #[derive(Default)]
+    struct FlakyWriter {
+        attempts: AtomicUsize,
+        results: Mutex<VecDeque<Result<()>>>,
+        accepted: Mutex<Vec<Bytes>>,
+    }
+    #[async_trait]
+    impl Transport for FlakyWriter {
         async fn start(&self, _: Arc<dyn NetworkEventHandler>) -> Result<()> {
             Ok(())
         }
         async fn send(&self, _: &NodeId, _: Bytes, _: DeliveryMethod) -> Result<()> {
             panic!("must await write completion")
         }
-        async fn send_wait(&self, _: &NodeId, _: Bytes, _: DeliveryMethod) -> Result<()> {
-            if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
-                Err(MistError::Network("channel closed".into()))
-            } else {
-                Ok(())
-            }
+        async fn send_wait(&self, _: &NodeId, data: Bytes, _: DeliveryMethod) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.results.lock().unwrap().pop_front().unwrap_or(Ok(()))?;
+            self.accepted.lock().unwrap().push(data);
+            Ok(())
         }
         async fn broadcast(&self, _: Bytes, _: DeliveryMethod) -> Result<()> {
             unreachable!()
@@ -173,11 +230,18 @@ mod send_tests {
     }
     #[tokio::test(start_paused = true)]
     async fn first_write_error_stops_the_remaining_block_frames() {
-        let writer = BrokenWriter(AtomicUsize::new(0));
+        let writer = FlakyWriter::default();
+        writer
+            .results
+            .lock()
+            .unwrap()
+            .extend([Ok(()), Err(MistError::Network("channel closed".into()))]);
         let data = vec![0; 64 * 1024];
         let cid = crate::storage::cid::compute_cid(&data, 0x55);
+        let start = tokio::time::Instant::now();
         let result = send_block(
             &writer,
+            &TestRuntime,
             &NodeId("peer".into()),
             &cid,
             &data,
@@ -187,6 +251,95 @@ mod send_tests {
         )
         .await;
         assert!(result.is_err());
-        assert_eq!(writer.0.load(Ordering::SeqCst), 2);
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn route_loss_retries_the_same_chunk_then_sends_the_rest_in_order() {
+        let writer = FlakyWriter::default();
+        writer.results.lock().unwrap().extend([
+            Ok(()),
+            Err(MistError::RouteNotFound(NodeId("peer".into()))),
+            Err(MistError::RouteNotFound(NodeId("peer".into()))),
+            Err(MistError::RouteNotFound(NodeId("peer".into()))),
+            Ok(()),
+        ]);
+        let data = b"aabbccdd";
+        let cid = crate::storage::cid::compute_cid(data, 0x55);
+        let start = tokio::time::Instant::now();
+        send_block(
+            &writer,
+            &TestRuntime,
+            &NodeId("peer".into()),
+            &cid,
+            data,
+            2,
+            4,
+            |_| Box::pin(async {}),
+        )
+        .await
+        .unwrap();
+        let expected: Vec<_> = (0..4)
+            .map(|index| {
+                Bytes::from(super::super::protocol::build_have_payload(
+                    &cid, data, index, 4, 2,
+                ))
+            })
+            .collect();
+        assert_eq!(*writer.accepted.lock().unwrap(), expected);
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 7);
+        assert_eq!(start.elapsed(), 3 * ROUTE_RETRY_INTERVAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_route_loss_stops_after_the_recovery_window() {
+        let writer = FlakyWriter::default();
+        writer
+            .results
+            .lock()
+            .unwrap()
+            .extend((0..100).map(|_| Err(MistError::RouteNotFound(NodeId("peer".into())))));
+        let start = tokio::time::Instant::now();
+        let result = send_block(
+            &writer,
+            &TestRuntime,
+            &NodeId("peer".into()),
+            "cid",
+            b"data",
+            2,
+            2,
+            |_| Box::pin(async {}),
+        )
+        .await;
+        assert!(matches!(result, Err(MistError::RouteNotFound(_))));
+        assert_eq!(start.elapsed(), RESPONDER_ROUTE_RECOVERY);
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 26);
+        assert!(writer.accepted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_recovery_budget_is_shared_across_chunks() {
+        let writer = FlakyWriter::default();
+        writer.results.lock().unwrap().extend(
+            (0..15)
+                .map(|_| Err(MistError::RouteNotFound(NodeId("peer".into()))))
+                .chain([Ok(())])
+                .chain((0..100).map(|_| Err(MistError::RouteNotFound(NodeId("peer".into()))))),
+        );
+        let start = tokio::time::Instant::now();
+        let result = send_block(
+            &writer,
+            &TestRuntime,
+            &NodeId("peer".into()),
+            "cid",
+            b"data",
+            2,
+            2,
+            |_| Box::pin(async {}),
+        )
+        .await;
+        assert!(matches!(result, Err(MistError::RouteNotFound(_))));
+        assert_eq!(start.elapsed(), RESPONDER_ROUTE_RECOVERY);
+        assert_eq!(writer.accepted.lock().unwrap().len(), 1);
     }
 }

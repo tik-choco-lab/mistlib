@@ -186,6 +186,7 @@ async fn serve_want(
             tracing::debug!(%cid, peer = %from.0, room = %room_id, bytes = data.len(), chunk_size, total_chunks, "Storage: WANT response layout");
             if let Err(error) = mistlib_core::storage::responder::send_block(
                 ctx.transport.as_ref(),
+                &crate::runtime::WasmRuntime,
                 &from,
                 &cid,
                 &data,

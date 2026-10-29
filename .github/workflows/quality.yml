@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v7
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - id: version
@@ -70,14 +70,14 @@ jobs:
       # Excluded path dependencies with dev-dependencies require their own manifest.
       - run: cargo test --manifest-path third_party/webrtc-sctp/Cargo.toml -p webrtc-sctp --locked
       - run: cargo test --workspace --features mistlib-core/sim --doc --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           overwrite: true
           name: rust-test-results
           path: target/nextest/qa/junit.xml
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: failure-rust-attempt-${{ github.run_attempt }}
@@ -113,7 +113,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: qa-${{ matrix.target }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v7
@@ -133,20 +133,20 @@ jobs:
           python -c 'import glob,zipfile; zipfile.ZipFile(glob.glob("dist/*.zip")[0]).extractall("work/native")'
           version=$(python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print(version())')
           node qa/suite.mjs --native work/native/${{ matrix.binary }} --target ${{ matrix.target }} --out qa/results/native-${{ matrix.target }}.json --commit "$GITHUB_SHA" --version "$version" --soak-seconds '${{ inputs.soak-seconds }}'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           overwrite: true
           name: candidate-native-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           overwrite: true
           name: evidence-native-${{ matrix.target }}
           path: qa/results/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: failure-native-${{ matrix.target }}-attempt-${{ github.run_attempt }}
@@ -160,7 +160,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v7
@@ -172,7 +172,7 @@ jobs:
           tool: wasm-pack@0.15.0
       - run: wasm-pack build mistlib-wasm --target web --release -- --locked
       - run: python qa/package.py wasm --pkg mistlib-wasm/pkg --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           overwrite: true
           name: candidate-wasm
@@ -200,14 +200,14 @@ jobs:
         with:
           tool: wasm-bindgen-cli@0.2.114
       - run: node qa/wasm_tests.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           overwrite: true
           name: wasm-regression-results
           path: qa/results/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: failure-wasm-attempt-${{ github.run_attempt }}
@@ -224,7 +224,7 @@ jobs:
         browser: [chromium, firefox]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v7
@@ -237,11 +237,11 @@ jobs:
         working-directory: qa
       - run: npx --no-install playwright install --with-deps ${{ matrix.browser }}
         working-directory: qa
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: candidate-wasm
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: candidate-native-linux-x86_64
           path: dist
@@ -252,14 +252,14 @@ jobs:
           python -c 'import glob,zipfile; zipfile.ZipFile(glob.glob("dist/mistlib-native-*.zip")[0]).extractall("work/native")'
           version=$(python -c 'import sys; sys.path.insert(0,"qa"); from package import version; print(version())')
           node qa/suite.mjs --native work/native/libmistlib.so --package "dist/tik-choco-mistlib-$version.tgz" --browser ${{ matrix.browser }} --target linux-x86_64 --out qa/results/browser-${{ matrix.browser }}.json --commit "$GITHUB_SHA" --version "$version" --soak-seconds '${{ inputs.soak-seconds }}'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           overwrite: true
           name: evidence-browser-${{ matrix.browser }}
           path: qa/results/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: failure-browser-${{ matrix.browser }}-attempt-${{ github.run_attempt }}
@@ -273,25 +273,25 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Failed, cancelled, or skipped requirements must stop promotion
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: python -c 'import json,os; jobs=json.loads(os.environ["NEEDS"]); assert jobs and all(j["result"] == "success" for j in jobs.values()), jobs'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: candidate-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: evidence-*
           path: reports
           merge-multiple: true
       - run: python qa/gate.py --dist dist --reports reports --commit "$GITHUB_SHA" --version '${{ needs.rust.outputs.version }}' --out quality.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           overwrite: true
           name: quality-receipt

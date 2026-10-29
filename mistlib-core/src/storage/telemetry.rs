@@ -30,7 +30,9 @@ counters!(
     have_status_received,
     responder_chunks_submitted,
     responder_bytes_submitted,
-    responder_write_errors
+    responder_write_errors,
+    responder_route_retries,
+    responder_route_recoveries
 );
 
 pub static STORAGE_COUNTERS: LazyLock<Arc<StorageCounters>> =

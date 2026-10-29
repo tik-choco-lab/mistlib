@@ -272,6 +272,7 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
         tracing::debug!(%cid, peer = %from.0, room = %ctx.room_id, bytes = data.len(), chunk_size, total_chunks, "Storage: WANT response layout");
         if let Err(error) = mistlib_core::storage::responder::send_block(
             ctx.transport.as_ref(),
+            &TokioRuntime::new(tokio::runtime::Handle::current()),
             &from,
             &cid,
             &data,

@@ -189,7 +189,6 @@ impl WantState {
             if !remaining.is_empty() {
                 self.pending.insert(cid.to_string(), remaining);
             }
-            self.prune();
             let mut wants = authorized.into_iter().peekable();
             while let Some(want) = wants.next() {
                 if wants.peek().is_none() {
@@ -198,6 +197,9 @@ impl WantState {
                 }
                 let _ = want.tx.send(data.clone());
             }
+            // Publish every result before pruning the sender-wide progress watch.
+            // A resolver on another thread may finish as soon as that watch closes.
+            self.prune();
         }
     }
 }
@@ -971,6 +973,50 @@ pub fn build_have_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fulfill_publishes_all_results_before_pruning_progress() {
+        use futures_util::task::{waker, ArcWake};
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        struct InspectOnClose {
+            data: Mutex<Vec<oneshot::Receiver<Vec<u8>>>>,
+            observed: std::sync::atomic::AtomicBool,
+        }
+        impl ArcWake for InspectOnClose {
+            fn wake_by_ref(this: &Arc<Self>) {
+                // Run synchronously at watch closure, before fulfill can continue.
+                for receiver in this.data.lock().unwrap().iter_mut() {
+                    assert_eq!(receiver.try_recv(), Ok(vec![7]));
+                }
+                this.observed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let registry = WantRegistry::new();
+        let sender = peer("provider");
+        let first = registry.register_from("cid", sender.clone());
+        let second = registry.register_from("cid", sender.clone());
+        let mut progress = registry.progress(&sender);
+        let probe = Arc::new(InspectOnClose {
+            data: Mutex::new(vec![first, second]),
+            observed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let waker = waker(probe.clone());
+        let mut context = Context::from_waker(&waker);
+        let changed = progress.changed();
+        futures_util::pin_mut!(changed);
+        assert!(matches!(changed.as_mut().poll(&mut context), Poll::Pending));
+        // Exercise fulfill itself without the preceding progress notification.
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .fulfill("cid", &sender, "", vec![7]);
+        assert!(probe.observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn bounded_attempt_rejects_before_payload_storage_and_cleans_assemblies() {
