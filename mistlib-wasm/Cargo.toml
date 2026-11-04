@@ -1,6 +1,6 @@
 [package]
 name = "mistlib-wasm"
-version = "0.7.3-beta.2"
+version = "0.7.3-beta.3"
 edition = "2021"
 license = "MPL-2.0"
 
@@ -44,6 +44,8 @@ web-sys = { version = "0.3", features = [
     "WebSocket",
     "BinaryType",
     "MessageEvent",
+    "MessageChannel",
+    "MessagePort",
     "ErrorEvent",
     "Event",
     # OPFS (Origin Private File System)
@@ -55,6 +57,8 @@ web-sys = { version = "0.3", features = [
     "FileSystemWritableFileStream",
     "FileSystemSyncAccessHandle",
     "Navigator",
+    "Crypto",
+    "SubtleCrypto",
 ] }
 tokio = { version = "1.0", features = ["sync"] }
 serde = { version = "1.0", features = ["derive"] }

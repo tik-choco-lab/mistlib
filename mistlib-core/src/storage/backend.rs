@@ -5,6 +5,12 @@ use async_trait::async_trait;
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait BlockStore: HostSendSync {
+    /// Hosts may offload large block hashes while preserving the canonical CID.
+    /// The default keeps existing backends source-compatible.
+    async fn compute_cid(&self, data: &[u8], codec: u64) -> Result<String> {
+        Ok(super::cid::compute_cid(data, codec))
+    }
+
     async fn store_block(&self, cid: &str, data: &[u8]) -> Result<()>;
     async fn load_block(&self, cid: &str) -> Result<Option<Vec<u8>>>;
     async fn delete_block(&self, cid: &str) -> Result<()>;

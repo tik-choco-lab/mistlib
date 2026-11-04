@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::cid::compute_cid;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
@@ -1441,6 +1442,22 @@ fn network_discovery_failure_context_reaches_storage_callers() {
     assert!(
         matches!(error, MistError::Network(message) if message.contains("discovery query budget"))
     );
+}
+
+#[test]
+fn fetched_corrupt_block_is_rejected_before_cache_or_accounting() {
+    let cid = compute_cid(b"expected", MULTICODEC_RAW);
+    let engine = StorageEngine::new(
+        MemBlockStore::new(),
+        CountingResolver::new(HashMap::from([(cid.clone(), b"changed".to_vec())])),
+        1024 * 1024,
+        None,
+        SpatialPolicy::default(),
+    );
+    let error = block_on(engine.resolve_or_fetch(&cid, MULTICODEC_RAW)).unwrap_err();
+    assert!(matches!(error, MistError::Internal(message) if message == "Hash mismatch"));
+    assert!(engine.store.blocks.lock().unwrap().is_empty());
+    assert_eq!(engine.manager.lock().unwrap().current_usage(), 0);
 }
 
 #[tokio::test(start_paused = true)]

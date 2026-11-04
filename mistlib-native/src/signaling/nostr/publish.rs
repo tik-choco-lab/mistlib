@@ -1,4 +1,4 @@
-use super::NostrSignaler;
+use super::{signaling_label, NostrSignaler};
 use mistlib_core::signaling::nostr::DiscoveryPriority;
 use mistlib_core::signaling::nostr::{
     build_discovery_event_with_joined_at, build_message_event_with_sequence_and_joined_at,
@@ -134,7 +134,20 @@ impl NostrSignaler {
         &self,
         event: &mistlib_core::signaling::nostr::NostrEvent,
     ) -> mistlib_core::error::Result<()> {
+        self.measurements.lock().unwrap().register(
+            event,
+            "discovery",
+            "broadcast",
+            web_time::Instant::now(),
+        );
         let frame = event_frame_json(event)?;
+        self.governor.lock().unwrap().register(
+            &event.id,
+            frame.clone(),
+            "discovery",
+            "broadcast",
+            web_time::Instant::now(),
+        );
         self.publish_frame(frame).await
     }
 
@@ -148,6 +161,12 @@ impl NostrSignaler {
             room_id,
             joined_at,
         )?;
+        tracing::debug!(
+            "[NostrIdentity] node={} pubkey={} joined_at={}",
+            self.local_node_id.0,
+            identity.public_key,
+            joined_at.unwrap_or(0)
+        );
         self.publish_event(&event).await
     }
 
@@ -156,11 +175,27 @@ impl NostrSignaler {
         receiver_pubkey: &str,
         data: &SignalingData,
     ) -> mistlib_core::error::Result<()> {
-        self.publish_message_in_session(receiver_pubkey, data, self.session_epoch(), false, false)
-            .await
-            .map(|_| ())
+        self.publish_message_in_session(
+            receiver_pubkey,
+            data,
+            self.session_epoch(),
+            false,
+            false,
+            None,
+        )
+        .await
+        .and_then(|sent| {
+            if !sent && data.signaling_type == SignalingType::Request {
+                Err(mistlib_core::error::MistError::Signaling(
+                    "request publication skipped (session changed or binding retired)".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn publish_message_in_session(
         &self,
         receiver_pubkey: &str,
@@ -168,6 +203,7 @@ impl NostrSignaler {
         expected_epoch: u64,
         proactive: bool,
         reserved: bool,
+        priority: Option<DiscoveryPriority>,
     ) -> mistlib_core::error::Result<bool> {
         // `Rejoin` is synthesized locally by this signaler for its own
         // transport to consume (see `SignalingType::Rejoin`'s doc comment)
@@ -191,6 +227,30 @@ impl NostrSignaler {
                     .load(std::sync::atomic::Ordering::SeqCst)
                     >= mistlib_core::signaling::nostr::TARGET_PEERS)
         {
+            if data.signaling_type == SignalingType::Request && priority.is_none() {
+                tracing::info!(
+                    "[PairBackoff] action=skip node={} reason=session_or_reservation_changed",
+                    data.receiver_id
+                );
+            }
+            return Ok(false);
+        }
+        if self
+            .discovery_table
+            .lock()
+            .await
+            .is_superseded(receiver_pubkey)
+        {
+            if data.signaling_type == SignalingType::Request && priority.is_none() {
+                tracing::info!(
+                    "[PairBackoff] action=skip node={} reason=binding_retired",
+                    data.receiver_id
+                );
+            }
+            tracing::debug!(
+                "[DiscoveryRetired] action=drop reason=outbound pubkey={}",
+                receiver_pubkey
+            );
             return Ok(false);
         }
         let sequence = self.next_outgoing_sequence(receiver_pubkey).await;
@@ -219,10 +279,40 @@ impl NostrSignaler {
                     .load(std::sync::atomic::Ordering::SeqCst)
                     >= mistlib_core::signaling::nostr::TARGET_PEERS)
         {
+            if data.signaling_type == SignalingType::Request && priority.is_none() {
+                tracing::info!(
+                    "[PairBackoff] action=skip node={} reason=session_or_reservation_changed",
+                    data.receiver_id
+                );
+            }
             return Ok(false);
         }
+        let label = match priority {
+            Some(DiscoveryPriority::Reply) => "request_reply",
+            Some(DiscoveryPriority::Probe) => "request_probe",
+            Some(DiscoveryPriority::Ordinary) => "request_ordinary",
+            None => signaling_label(&data.signaling_type),
+        };
+        self.measurements.lock().unwrap().register(
+            &event,
+            label,
+            receiver_pubkey,
+            web_time::Instant::now(),
+        );
+        let frame = event_frame_json(&event)?;
+        {
+            let mut governor = self.governor.lock().unwrap();
+            governor.bind_peer(&data.receiver_id.0, receiver_pubkey);
+            governor.register(
+                &event.id,
+                frame.clone(),
+                label,
+                receiver_pubkey,
+                web_time::Instant::now(),
+            );
+        }
         self.publish_frame_guarded(
-            event_frame_json(&event)?,
+            frame,
             reserved.then_some((receiver_pubkey, expected_epoch, proactive)),
         )
         .await
@@ -300,8 +390,9 @@ impl NostrSignaler {
         receiver_pubkey: &str,
         room_id: &str,
         expected_epoch: u64,
-        proactive: bool,
+        priority: DiscoveryPriority,
     ) -> mistlib_core::error::Result<bool> {
+        let proactive = priority == DiscoveryPriority::Probe;
         let request = SignalingData {
             sender_id: self.local_node_id.clone(),
             receiver_id: NodeId::broadcast(),
@@ -309,7 +400,14 @@ impl NostrSignaler {
             data: String::new(),
             signaling_type: SignalingType::Request,
         };
-        self.publish_message_in_session(receiver_pubkey, &request, expected_epoch, proactive, true)
-            .await
+        self.publish_message_in_session(
+            receiver_pubkey,
+            &request,
+            expected_epoch,
+            proactive,
+            true,
+            Some(priority),
+        )
+        .await
     }
 }

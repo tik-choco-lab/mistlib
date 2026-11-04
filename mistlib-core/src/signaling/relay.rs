@@ -48,6 +48,9 @@ impl RoutedSignaler {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signaler for RoutedSignaler {
+    fn has_overlay_route(&self, peer: &NodeId) -> bool {
+        self.overlay.has_signaling_route(peer)
+    }
     async fn send_signaling(&self, to: &NodeId, msg: MessageContent) -> crate::error::Result<()> {
         if to.is_server() || to.is_broadcast() {
             return self.bootstrap.send_signaling(to, msg).await;
@@ -93,12 +96,40 @@ impl Signaler for RoutedSignaler {
     /// Forwarded to the bootstrap signaler, which is the one holding expiring
     /// per-peer state. The overlay keeps none, so there is nothing to refresh
     /// on that side.
+    fn note_peer_connected(&self, peer: &NodeId) {
+        self.bootstrap.note_peer_connected(peer);
+    }
+
+    async fn peer_retry_token(&self, peer: &NodeId) -> Option<String> {
+        self.bootstrap.peer_retry_token(peer).await
+    }
+    async fn retry_peer(&self, peer: &NodeId) -> crate::error::Result<()> {
+        self.bootstrap.retry_peer(peer).await
+    }
+
+    fn end_connection_attempt(&self, peer: &NodeId) {
+        self.bootstrap.end_connection_attempt(peer);
+    }
+
     async fn note_peer_alive(&self, peer: &NodeId) {
         self.bootstrap.note_peer_alive(peer).await;
     }
 
     async fn maintain_bootstrap(&self, connected_peers: usize) {
         self.bootstrap.maintain_bootstrap(connected_peers).await;
+    }
+
+    async fn reset_session_with_reason(&self, reason: &str) -> crate::error::Result<()> {
+        // Identity rotation does not change a known peer's bootstrap ingress.
+        // Clearing this on a no-rotation recovery strands subsequent nudges in
+        // the overlay with RouteNotFound, since discovery is already progressed.
+        if reason != "isolation_recovery" {
+            self.peer_routes
+                .lock()
+                .expect("signaling route lock poisoned")
+                .clear();
+        }
+        self.bootstrap.reset_session_with_reason(reason).await
     }
 
     async fn reset_session(&self) -> crate::error::Result<()> {

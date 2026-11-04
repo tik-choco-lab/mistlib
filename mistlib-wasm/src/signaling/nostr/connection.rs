@@ -21,6 +21,7 @@ type OpenWaiter = tokio::sync::oneshot::Receiver<Result<(), String>>;
 
 pub(super) struct SocketHandlers {
     pub(super) ws: WebSocket,
+    pub(super) relay: String,
     _onmessage: Closure<dyn FnMut(MessageEvent)>,
     _onopen: Closure<dyn FnMut(web_sys::Event)>,
     _onerror: Closure<dyn FnMut(web_sys::Event)>,
@@ -40,7 +41,19 @@ impl SocketHandlers {
 }
 
 impl WasmNostrSignaler {
+    pub(super) fn relay_key(&self, ws: &WebSocket) -> mistlib_core::error::Result<String> {
+        self.socket_handlers
+            .borrow()
+            .iter()
+            .find(|h| js_sys::Object::is(h.ws.as_ref(), ws.as_ref()))
+            .map(|h| h.relay.clone())
+            .ok_or_else(|| {
+                mistlib_core::error::MistError::Signaling("unregistered relay socket".into())
+            })
+    }
+
     pub async fn connect(&self, tx: mpsc::UnboundedSender<MessageContent>) -> Result<(), JsValue> {
+        *self.retry_incoming.lock().unwrap() = Some(tx.clone());
         let epoch = self.next_reconnect_epoch();
         self.close_sockets();
         let mut cancelled = self.reconnect_cancel.subscribe();
@@ -138,7 +151,9 @@ impl WasmNostrSignaler {
 
         let signaler = self.clone();
         let incoming_tx = tx.clone();
+        let probe_ws = ws.clone();
         let onmessage_last_activity = last_activity.clone();
+        let observed_relay = relay.clone();
         let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {
             *onmessage_last_activity.borrow_mut() = Instant::now();
             let raw = if let Ok(ab) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
@@ -158,6 +173,10 @@ impl WasmNostrSignaler {
                 return;
             };
             STATS.add_receive(raw.len() as u64);
+            if let Some(close) = super::keepalive::probe_close_frame(&raw) {
+                let _ = probe_ws.send_with_str(&close);
+            }
+            signaler.observe_relay_frame(&raw, &observed_relay);
             signaler.handle_relay_frame(&raw, &incoming_tx);
         }) as Box<dyn FnMut(MessageEvent)>);
         ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
@@ -180,6 +199,11 @@ impl WasmNostrSignaler {
                 return;
             }
             opened_state.borrow_mut().on_open();
+            subscribe_signaler
+                .governor
+                .lock()
+                .unwrap()
+                .open(&opened_relay, Instant::now());
             subscribe_signaler
                 .reconnect_state
                 .lock()
@@ -230,6 +254,11 @@ impl WasmNostrSignaler {
             if let Some(tx) = open_tx_cb.borrow_mut().take() {
                 let _ = tx.send(Err("websocket closed before opening".to_string()));
             }
+            signaler
+                .governor
+                .lock()
+                .unwrap()
+                .disconnected(&reconnect_relay);
             signaler.remove_socket(&close_ws);
             if !was_open || !signaler.reconnect_epoch_matches(epoch) {
                 return;
@@ -244,12 +273,14 @@ impl WasmNostrSignaler {
         ws.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
         self.socket_handlers.borrow_mut().push(SocketHandlers {
             ws: ws.clone(),
+            relay: relay.clone(),
             _onmessage: onmessage_callback,
             _onopen: onopen_callback,
             _onerror: onerror_callback,
             _onclose: onclose_callback,
         });
 
+        self.ensure_governor_worker();
         self.spawn_idle_watchdog(ws.clone(), relay.clone(), last_activity, epoch);
 
         self.sockets
@@ -282,7 +313,8 @@ impl WasmNostrSignaler {
                 }
 
                 let elapsed = last_activity.borrow().elapsed();
-                if is_relay_idle(elapsed, super::RELAY_IDLE_THRESHOLD_MS) {
+                let threshold = super::RELAY_IDLE_THRESHOLD_MS;
+                if is_relay_idle(elapsed, threshold) {
                     web_sys::console::warn_1(
                         &format!(
                             "WasmNostrSignaler: relay {relay} silent for {elapsed:?}; forcing reconnect"
@@ -454,6 +486,7 @@ impl WasmNostrSignaler {
         ws: &WebSocket,
         room_id: &str,
     ) -> mistlib_core::error::Result<()> {
+        let relay = self.relay_key(ws)?;
         for frame in self.subscription_frames(room_id)? {
             ws.send_with_str(&frame).map_err(|e| {
                 mistlib_core::error::MistError::Network(format!(
@@ -461,9 +494,42 @@ impl WasmNostrSignaler {
                     e
                 ))
             })?;
+            self.measurements
+                .lock()
+                .unwrap()
+                .sent(&frame, &relay, Instant::now());
             STATS.add_send(frame.len() as u64);
         }
         Ok(())
+    }
+
+    fn observe_relay_frame(&self, raw: &str, relay: &str) {
+        let Ok(Some(message)) = parse_relay_message(raw) else {
+            return;
+        };
+        self.governor
+            .lock()
+            .unwrap()
+            .observe(relay, &message, Instant::now());
+        let mut stats = self.measurements.lock().unwrap();
+        match message {
+            RelayMessage::Ok {
+                event_id,
+                accepted,
+                message,
+            } => stats.status(&event_id, accepted, &message, relay, Instant::now()),
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } => {
+                stats.received();
+                tracing::debug!("[NostrReceive] relay={relay} subscription={} event_id={} kind={} pubkey={} created_at={}", subscription_id, event.id, event.kind, event.pubkey, event.created_at);
+            }
+            RelayMessage::Eose { subscription_id } => {
+                tracing::debug!("[NostrEOSE] relay={relay} subscription={subscription_id}")
+            }
+            _ => {}
+        }
     }
 
     fn handle_relay_frame(&self, raw: &str, incoming_tx: &mpsc::UnboundedSender<MessageContent>) {
@@ -506,18 +572,7 @@ pub(super) fn is_relay_idle(elapsed: Duration, threshold_ms: u32) -> bool {
 
 fn log_relay_status(message: RelayMessage) {
     match message {
-        RelayMessage::Ok {
-            event_id,
-            accepted,
-            message,
-        } => {
-            if !accepted {
-                web_sys::console::warn_1(
-                    &format!("WasmNostrSignaler: relay rejected event {event_id}: {message}")
-                        .into(),
-                );
-            }
-        }
+        RelayMessage::Ok { .. } => {}
         RelayMessage::Notice(message) => {
             web_sys::console::warn_1(&format!("WasmNostrSignaler: relay notice: {message}").into());
         }

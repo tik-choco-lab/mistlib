@@ -1690,3 +1690,109 @@ async fn nostr_historical_requests_are_bounded_paced_and_cancelled() {
         "old worker cannot escape close"
     );
 }
+
+#[wasm_bindgen_test]
+fn measurement_preserves_event_bytes_and_subscription_ids() {
+    let signaler = WasmNostrSignaler::new(
+        NodeId("measurement".into()),
+        NostrSignalingConfig::default(),
+    );
+    let before = signaler.subscription_frames("measurement-room").unwrap();
+    let event = mistlib_core::signaling::nostr::build_discovery_event_with_joined_at(
+        &signaler.codec_config,
+        &signaler.crypto,
+        &signaler.identity,
+        "measurement-room",
+        Some(1),
+    )
+    .unwrap();
+    let frame = mistlib_core::signaling::nostr::event_frame_json(&event).unwrap();
+    let mut stats = signaler.measurements.lock().unwrap();
+    let now = web_time::Instant::now();
+    stats.register(&event, "discovery", "broadcast", now);
+    stats.sent(&frame, "ws://127.0.0.1", now);
+    stats.status(
+        &event.id,
+        false,
+        "rate-limited: slow down",
+        "ws://127.0.0.1",
+        now,
+    );
+    stats.reset();
+    drop(stats);
+    assert_eq!(
+        mistlib_core::signaling::nostr::event_frame_json(&event).unwrap(),
+        frame
+    );
+    let after = signaler.subscription_frames("measurement-room").unwrap();
+    for (before, after) in before.iter().zip(after.iter()) {
+        let before: serde_json::Value = serde_json::from_str(before).unwrap();
+        let after: serde_json::Value = serde_json::from_str(after).unwrap();
+        assert_eq!(before[1], after[1]);
+    }
+}
+
+#[wasm_bindgen_test(async)]
+async fn normalized_websocket_url_uses_the_configured_governor_key() {
+    use mistlib_core::signaling::nostr::RelayMessage;
+    use web_time::Instant;
+    let s = WasmNostrSignaler::new(NodeId("relay-key".into()), NostrSignalingConfig::default());
+    let configured = "ws://127.0.0.1:9";
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (ws, _opened) = s.open_relay(configured.into(), tx, 0).await.unwrap();
+    assert_eq!(ws.url(), format!("{configured}/"));
+    let key = s.relay_key(&ws).unwrap();
+    assert_eq!(key, configured);
+    let now = Instant::now();
+    let frame = r#"["EVENT",{"id":"key-test"}]"#.to_string();
+    {
+        let mut g = s.governor.lock().unwrap();
+        g.register("key-test", frame.clone(), "offer", "peer", now);
+        g.enqueue(&key, frame.clone(), now);
+        assert_eq!(g.poll(&key, now), Some(frame.clone()));
+        g.observe(
+            configured,
+            &RelayMessage::Ok {
+                event_id: "key-test".into(),
+                accepted: false,
+                message: "rate-limited: burst".into(),
+            },
+            now,
+        );
+        assert_eq!(g.poll(&key, now + Duration::from_secs(1)), Some(frame));
+        g.observe(
+            configured,
+            &RelayMessage::Ok {
+                event_id: "key-test".into(),
+                accepted: false,
+                message: "rate-limited: retry".into(),
+            },
+            now + Duration::from_secs(1),
+        );
+        g.disconnected(configured);
+        // Pending retries keep the worker alive through a socket outage.
+        assert!(g.has_pending());
+        g.open(configured, now + Duration::from_secs(3));
+        assert!(g.poll(&key, now + Duration::from_secs(3)).is_some());
+    }
+    s.close().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+fn isolated_keepalive_has_no_history_and_closes_on_its_eose() {
+    use super::keepalive::{probe_close_frame, probe_frame};
+    let s = WasmNostrSignaler::new(NodeId("keepalive".into()), NostrSignalingConfig::default());
+    let frame: serde_json::Value =
+        serde_json::from_str(&probe_frame(&s.codec_config, "room").unwrap()).unwrap();
+    assert_eq!(frame[0], "REQ");
+    assert_eq!(frame[2]["limit"], 0);
+    assert!(frame[2]["#d"].is_array());
+    let close = probe_close_frame(r#"["EOSE","mistlib-keepalive"]"#).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&close).unwrap(),
+        serde_json::json!(["CLOSE", "mistlib-keepalive"])
+    );
+    assert!(probe_close_frame(r#"["EOSE","ordinary-room-subscription"]"#).is_none());
+    // This threshold applies equally while isolated and connected.
+    assert!(is_relay_idle(Duration::from_secs(60), 60_000));
+}

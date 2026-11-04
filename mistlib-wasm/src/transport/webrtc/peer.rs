@@ -126,6 +126,10 @@ async fn send_candidate_with_retries(
 }
 
 pub struct Peer {
+    pub(super) recovery_backoff: Arc<Mutex<mistlib_core::signaling::courtesy::RecoveryBackoff>>,
+    failure_recorded: std::sync::atomic::AtomicBool,
+    pub(super) pair_backoff: Arc<Mutex<mistlib_core::signaling::courtesy::PairBackoff>>,
+    pub(super) signaler: Option<Arc<dyn Signaler>>,
     pub bulk_telemetry: mistlib_core::transport::send::QueueTelemetry,
     pub(super) pacing: RwLock<Option<Arc<super::pacing::WasmPacing>>>,
     pub generation: u64,
@@ -230,6 +234,10 @@ impl Peer {
 
     pub fn new(pc: RtcPeerConnection) -> Self {
         Self {
+            recovery_backoff: Default::default(),
+            pair_backoff: Default::default(),
+            failure_recorded: Default::default(),
+            signaler: None,
             pacing: RwLock::new(None),
             generation: {
                 static NEXT_GENERATION: std::sync::atomic::AtomicU64 =
@@ -544,7 +552,24 @@ impl Peer {
             .remove(&DeliveryMethod::ReliableUnordered);
     }
 
+    /// Shared by ICE, DC, watchdog and explicit cleanup for this PC generation.
+    pub(super) fn record_failure(&self, node: &NodeId) {
+        if self.failure_recorded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(signaler) = &self.signaler {
+            signaler.end_connection_attempt(node);
+        }
+        self.pair_backoff.lock().unwrap().failed(
+            node,
+            web_time::Instant::now(),
+            js_sys::Math::random(),
+        );
+    }
+
     pub fn close_all(&self, node: &NodeId) {
+        // Intentional replacement/disconnect/close suppresses queued callbacks.
+        self.failure_recorded.store(true, Ordering::SeqCst);
         if let Some(pacing) = self.pacing.read().unwrap().as_ref() {
             pacing.budget.close();
         }
@@ -654,6 +679,11 @@ impl Peer {
                 state
             );
             // Browser getters and all effects run outside the state-map guard.
+            let isolated_before = !conn_states
+                .read()
+                .unwrap()
+                .values()
+                .any(|s| *s == ConnectionState::Connected);
             let has_open_channel = matches!(
                 state,
                 web_sys::RtcIceConnectionState::Connected
@@ -695,6 +725,16 @@ impl Peer {
                         // case -- only the DC `onopen` path's own
                         // `prev != Connected` check decides whether to emit.
                         if new_state == ConnectionState::Connected {
+                            peer_state
+                                .pair_backoff
+                                .lock()
+                                .unwrap()
+                                .connection_established(
+                                    &remote_id_state,
+                                    isolated_before,
+                                    web_time::Instant::now(),
+                                    js_sys::Math::random(),
+                                );
                             let peer_flush = peer_state.clone();
                             let remote_id_flush = remote_id_state.clone();
                             wasm_bindgen_futures::spawn_local(async move {
@@ -786,6 +826,15 @@ impl Peer {
                     }
                     web_sys::RtcIceConnectionState::Failed
                     | web_sys::RtcIceConnectionState::Closed => {
+                        let is_current = peers_state
+                            .read()
+                            .unwrap()
+                            .get(&remote_id_state)
+                            .is_some_and(|peer| Arc::ptr_eq(peer, &peer_state));
+                        if !is_current {
+                            return;
+                        }
+                        peer_state.record_failure(&remote_id_state);
                         {
                             let mut disconnected = disconnected_since_state
                                 .write()
@@ -1162,8 +1211,23 @@ impl Peer {
 
             let prev = {
                 let mut lock = states_open.write().unwrap_or_else(|e| e.into_inner());
+                let isolated_before = !lock.values().any(|s| *s == ConnectionState::Connected);
+                peer_open
+                    .pair_backoff
+                    .lock()
+                    .unwrap()
+                    .connection_established(
+                        &from_msg,
+                        isolated_before,
+                        web_time::Instant::now(),
+                        js_sys::Math::random(),
+                    );
                 lock.insert(from_msg.clone(), ConnectionState::Connected)
             };
+            peer_open.recovery_backoff.lock().unwrap().connected();
+            if let Some(signaler) = &peer_open.signaler {
+                signaler.note_peer_connected(&from_msg);
+            }
             disconnected_open
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1214,6 +1278,7 @@ impl Peer {
             };
 
             let Some(peer) = peer else { return };
+            peer.record_failure(&from_close);
 
             {
                 let mut lock = states_close.write().unwrap_or_else(|e| e.into_inner());

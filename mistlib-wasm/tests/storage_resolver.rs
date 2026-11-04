@@ -1,5 +1,6 @@
 // Compile the actual wasm adapter on the host and in Node, replacing only its
-// session lookup. This catches accidentally inheriting PeerResolver's no-op
+// session lookup (and using a no-op browser scheduler on native). This catches
+// accidentally inheriting PeerResolver's no-op
 // prefetch/default error method without needing a browser room or OPFS.
 use async_trait::async_trait;
 use mistlib_core::error::Result;
@@ -7,6 +8,24 @@ use mistlib_core::runtime::{AsyncRuntime, BoxTask};
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+#[path = "../src/storage/cooperative.rs"]
+mod cooperative;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod cooperative {
+    pub struct PollBudget;
+    impl PollBudget {
+        pub fn new(_: web_time::Duration) -> Self {
+            Self
+        }
+        pub async fn run<F: std::future::Future>(&self, future: F) -> F::Output {
+            future.await
+        }
+    }
+}
 
 mod app {
     use super::*;
@@ -86,6 +105,9 @@ mod adapter {
         let queries = Arc::new(Queries(super::Mutex::new(Vec::new())));
         let registry = WantRegistry::new();
         let resolver = WasmPeerResolver {
+            // These synchronous adapter tests use block_on; browser tests in
+            // storage::tests exercise actual task boundaries and cancellation.
+            budget: super::cooperative::PollBudget::new(web_time::Duration::MAX),
             inner: NetworkPeerResolver::new(
                 Arc::new(mistlib_core::storage::resolver::FixedTransportSource(vec![
                     queries.clone(),
@@ -120,6 +142,7 @@ mod adapter {
             async fn sleep(&self, _: web_time::Duration) {}
         }
         let resolver = WasmPeerResolver {
+            budget: super::cooperative::PollBudget::new(web_time::Duration::MAX),
             inner: NetworkPeerResolver::new(
                 Arc::new(mistlib_core::storage::resolver::FixedTransportSource(
                     Vec::new(),

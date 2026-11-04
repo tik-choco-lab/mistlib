@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use mistlib_core::config::NostrSignalingConfig;
+use mistlib_core::signaling::nostr::measurement::{signaling_label, NostrMeasurements};
 use mistlib_core::signaling::nostr::{
     random_subscription_id, DedupeCache, DiscoveryTable, InvitePskCrypto, NostrCodecConfig,
     TemporarySignalingIdentity,
@@ -7,7 +8,7 @@ use mistlib_core::signaling::nostr::{
 use mistlib_core::signaling::nostr::{
     DiscoveryBootstrap, DiscoveryExchanges, DiscoveryOutbox, DiscoveryPriority, TARGET_PEERS,
 };
-use mistlib_core::signaling::{MessageContent, Signaler};
+use mistlib_core::signaling::{MessageContent, Signaler, SignalingType};
 use mistlib_core::types::NodeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -50,8 +51,12 @@ impl RoomSubscriptionIds {
 
 #[derive(Clone)]
 pub struct NostrSignaler {
+    governor: Arc<std::sync::Mutex<mistlib_core::signaling::nostr::governor::PublishGovernor>>,
+    identity_recovery: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::IdentityRecovery>>,
+    measurements: Arc<std::sync::Mutex<NostrMeasurements>>,
     relays: Vec<String>,
     relay_list_url: Option<String>,
+    retry_incoming: Arc<Mutex<Option<mpsc::Sender<MessageContent>>>>,
     local_node_id: NodeId,
     identity: TemporarySignalingIdentity,
     rotated_identity: Arc<Mutex<Option<TemporarySignalingIdentity>>>,
@@ -74,6 +79,7 @@ pub struct NostrSignaler {
     /// per node (acceptable: tens of messages/sec, ~100us of crypto each).
     /// Discovery (broadcast) publishes carry no sequence and do not take it.
     send_order: Arc<Mutex<()>>,
+    governor_notify: Arc<tokio::sync::Notify>,
     senders: Arc<Mutex<Vec<mpsc::Sender<String>>>>,
     room_id: Arc<Mutex<Option<String>>>,
     discovery_table: Arc<Mutex<DiscoveryTable>>,
@@ -103,8 +109,12 @@ impl NostrSignaler {
         let dedupe_ttl = Duration::from_secs(config.ttl_seconds.saturating_mul(2).max(1));
         let relay_list_url = config.effective_relay_list_url().map(str::to_owned);
         Self {
+            governor: Default::default(),
+            identity_recovery: Default::default(),
+            measurements: Default::default(),
             relays: config.relays,
             relay_list_url,
+            retry_incoming: Default::default(),
             local_node_id,
             identity: TemporarySignalingIdentity::generate(),
             rotated_identity: Arc::new(Mutex::new(None)),
@@ -113,6 +123,7 @@ impl NostrSignaler {
             codec_config,
             crypto,
             send_order: Arc::new(Mutex::new(())),
+            governor_notify: Default::default(),
             senders: Arc::new(Mutex::new(Vec::new())),
             room_id: Arc::new(Mutex::new(None)),
             discovery_table: Arc::new(Mutex::new(DiscoveryTable::default())),
@@ -247,6 +258,11 @@ impl NostrSignaler {
     }
 
     async fn clear_session_state(&self) {
+        self.reset_session_state(false).await;
+    }
+
+    async fn reset_session_state(&self, preserve_bindings: bool) {
+        self.governor.lock().unwrap().reset_session();
         tracing::info!("Nostr discovery retries stopped reason=session change");
         self.connected_peers.store(0, Ordering::SeqCst);
         {
@@ -255,8 +271,12 @@ impl NostrSignaler {
             *cancel = CancellationToken::new();
         }
         *self.outbox.lock().await = DiscoveryOutbox::default();
-        *self.exchanges.lock().await = DiscoveryExchanges::default();
-        self.discovery_table.lock().await.clear();
+        if preserve_bindings {
+            self.exchanges.lock().await.cancel_queued();
+        } else {
+            *self.exchanges.lock().await = DiscoveryExchanges::default();
+            self.discovery_table.lock().await.clear();
+        }
         *self.bootstrap.lock().await = DiscoveryBootstrap::default();
         self.dedupe.lock().await.clear();
         self.message_dedupe.lock().await.clear();
@@ -275,6 +295,14 @@ impl Signaler for NostrSignaler {
     /// lapses after `ttl_seconds`, and the next relay fallback (ICE restart,
     /// reconnect after a blip) is rejected in one direction only. See
     /// `Signaler::note_peer_alive`.
+    fn note_peer_connected(&self, _peer: &NodeId) {
+        self.identity_recovery.lock().unwrap().connected();
+    }
+
+    fn end_connection_attempt(&self, peer: &NodeId) {
+        self.governor.lock().unwrap().end_peer_attempt(&peer.0);
+    }
+
     async fn note_peer_alive(&self, peer: &NodeId) {
         let pubkey = self.discovery_table.lock().await.pubkey_for_node(peer);
         if let Some(pubkey) = pubkey {
@@ -287,6 +315,32 @@ impl Signaler for NostrSignaler {
             .lock()
             .await
             .touch_node(peer, self.codec_config.ttl_seconds);
+    }
+
+    async fn peer_retry_token(&self, peer: &NodeId) -> Option<String> {
+        self.discovery_table.lock().await.retry_token(peer)
+    }
+
+    async fn retry_peer(&self, peer: &NodeId) -> mistlib_core::error::Result<()> {
+        if self.peer_retry_token(peer).await.is_none() {
+            return Err(mistlib_core::error::MistError::Signaling(
+                "binding expired".into(),
+            ));
+        }
+        let room_id = self.current_room_id().await.unwrap_or_default();
+        let tx = self.retry_incoming.lock().await.clone().ok_or_else(|| {
+            mistlib_core::error::MistError::Signaling("local dispatcher unavailable".into())
+        })?;
+        let message = MessageContent::Data(mistlib_core::signaling::SignalingData {
+            sender_id: peer.clone(),
+            receiver_id: self.local_node_id.clone(),
+            room_id,
+            data: String::new(),
+            signaling_type: SignalingType::Request,
+        });
+        tx.try_send(message).map_err(|e| {
+            mistlib_core::error::MistError::Signaling(format!("local retry enqueue: {e}"))
+        })
     }
 
     async fn send_signaling(
@@ -329,7 +383,20 @@ impl Signaler for NostrSignaler {
     }
 
     async fn maintain_bootstrap(&self, connected_peers: usize) {
+        self.measurements.lock().unwrap().report(
+            &self.local_node_id.0,
+            web_time::Instant::now(),
+            false,
+        );
         let previous_connected = self.connected_peers.swap(connected_peers, Ordering::SeqCst);
+        if self
+            .governor
+            .lock()
+            .unwrap()
+            .suspended(web_time::Instant::now())
+        {
+            return;
+        }
         let Some(room_id) = self.current_room_id().await else {
             return;
         };
@@ -414,14 +481,32 @@ impl Signaler for NostrSignaler {
     }
 
     async fn reset_session(&self) -> mistlib_core::error::Result<()> {
+        self.reset_session_with_reason("other").await
+    }
+
+    async fn reset_session_with_reason(&self, reason: &str) -> mistlib_core::error::Result<()> {
         let Some(room_id) = self.current_room_id().await else {
             return Ok(());
         };
+        let had_connection = self.identity_recovery.lock().unwrap().take_rotation();
+        let rotate = reason != "isolation_recovery" || had_connection;
+        tracing::info!(
+            "[IdentityRecovery] action={} reason={reason}",
+            if rotate { "rotate" } else { "skip" }
+        );
+        if !rotate {
+            return self.publish_discovery(&room_id).await;
+        }
+        tracing::info!("[NostrReset] node={} reason={reason}", self.local_node_id.0);
+        self.measurements.lock().unwrap().reset();
         self.cancel_discovery_refresh();
         self.session_epoch.fetch_add(1, Ordering::SeqCst);
         *self.rotated_identity.lock().await = Some(TemporarySignalingIdentity::generate());
-        self.clear_session_state().await;
-        *self.local_joined_at.lock().await = Some(current_unix_millis());
+        self.reset_session_state(true).await;
+        {
+            let mut joined = self.local_joined_at.lock().await;
+            *joined = Some(current_unix_millis().max(joined.unwrap_or(0).saturating_add(1)));
+        }
         // `message_filter` contains the current identity pubkey in `#p`.
         // Replace the relay-side REQ immediately after rotation; otherwise
         // broadcast Requests still arrive while direct Answers/Candidates
@@ -429,10 +514,30 @@ impl Signaler for NostrSignaler {
         // ids are reused, so NIP-01 replaces the filters in place.
         self.subscribe_room(&room_id).await?;
         self.spawn_discovery_refresh(room_id.clone());
-        self.publish_discovery(&room_id).await
+        self.publish_discovery(&room_id).await?;
+        let bindings = self.discovery_table.lock().await.bindings();
+        for (node, pubkey) in bindings {
+            let request = mistlib_core::signaling::SignalingData {
+                sender_id: self.local_node_id.clone(),
+                receiver_id: node.clone(),
+                room_id: room_id.clone(),
+                data: String::new(),
+                signaling_type: SignalingType::Request,
+            };
+            if let Err(err) = self.publish_message_to_pubkey(&pubkey, &request).await {
+                tracing::info!("[PairBackoff] action=send_failed node={node} reason=rotation_request error={err}");
+            }
+        }
+        Ok(())
     }
 
     async fn close(&self) -> mistlib_core::error::Result<()> {
+        self.retry_incoming.lock().await.take();
+        self.measurements.lock().unwrap().report(
+            &self.local_node_id.0,
+            web_time::Instant::now(),
+            true,
+        );
         self.cancel_discovery_refresh();
         self.cancel_room_resubscribe();
         self.session_epoch.fetch_add(1, Ordering::SeqCst);

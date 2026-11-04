@@ -1,8 +1,7 @@
 //! Exponential backoff schedule shared by every bounded retry loop in the
 //! WebRTC transport that used to sleep a fixed interval between attempts:
-//! `signaling::spawn_connect_request_retry` (the higher-ID side's
-//! `CONNECT_REQUEST` nudge to the lower-ID/initiator peer) and
 //! `peer::PeerSharedHandles::try_ice_restart` (the ICE-restart retry).
+//! CONNECT_REQUEST now uses the core SPEC-23 per-pair failure policy.
 //!
 //! A fixed short interval repeated many times turns a burst of simultaneous
 //! reconnects (e.g. a "cluster disconnect" where several peers drop within
@@ -97,24 +96,13 @@ mod tests {
 
     #[test]
     fn connect_request_default_schedule_totals_within_the_intended_ballpark() {
-        // Mirrors `WebRtcTransport`'s CONNECT_REQUEST_RETRY_* constants and
-        // `DEFAULT_CONNECT_REQUEST_RETRIES` (10 sends == 9 waited intervals).
-        //
-        // The cap was originally 10s (total ~50.8s), then lowered to 4s
-        // (total ~28.1s) after a load-test A/B showed the 10s cap improved
-        // the typical-case recovery time but *worsened* the worst case (max
-        // recovery 198s -> 316s) and the unrelated first-connect `attempt_ms`
-        // tail, while the timeout count/retry-chain-length distribution were
-        // unchanged between the two runs -- i.e. the longer cap bought no
-        // extra success probability, only a longer tail. See the doc comment
-        // on `CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS` (`webrtc.rs`) for the
-        // full writeup.
-        let total = total_backoff_ms(9, 1000, 1.5, 4_000);
-        assert_eq!(total, 28_125, "exact schedule: 1000+1500+2250+3375+4000*5");
-        assert!(
-            (25_000..=35_000).contains(&total),
-            "expected total backoff within [25s, 35s] (~30s ballpark), got {total}ms"
-        );
+        // SPEC-23 replaces the old ~28s total nudge schedule with the
+        // shared pair policy; do not reset it when a nudge loop is replaced.
+        let mut policy = mistlib_core::signaling::courtesy::RecoveryBackoff::default();
+        let total: u64 = (1..mistlib_core::signaling::courtesy::CONNECT_REQUEST_SEND_LIMIT)
+            .map(|_| policy.next_delay(0.5).as_secs())
+            .sum();
+        assert_eq!(total, 333, "3+6+12+24+48+60*4 seconds without jitter");
     }
 
     #[test]

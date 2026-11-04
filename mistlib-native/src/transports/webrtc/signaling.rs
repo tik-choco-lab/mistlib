@@ -1,14 +1,9 @@
-use super::{
-    backoff::exponential_backoff_ms, rollback_to_stable_on_failure, Peer, WebRtcTransport,
-    CONNECT_REQUEST_RETRY_INITIAL_MS, CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS,
-    CONNECT_REQUEST_RETRY_MULTIPLIER, DEFAULT_CONNECT_REQUEST_RETRIES,
-};
+use super::{rollback_to_stable_on_failure, Peer, WebRtcTransport};
 use async_trait::async_trait;
 use mistlib_core::signaling::{
     CandidateAck, CandidateEnvelope, MessageContent, NegotiationAck, NegotiationEnvelope,
     SignalingData, SignalingHandler, SignalingType,
 };
-use mistlib_core::transport::Transport;
 use mistlib_core::types::{ConnectionState, NodeId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -50,14 +45,6 @@ impl WebRtcTransport {
         }
     }
 
-    fn connect_request_retry_limit() -> u32 {
-        std::env::var("MIST_WEBRTC_CONNECT_REQUEST_RETRIES")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CONNECT_REQUEST_RETRIES)
-    }
-
     fn reserve_connect_request_attempt(&self, node: &NodeId) -> Option<u32> {
         let mut attempts = self.connect_request_attempt_ids.write().unwrap();
         if attempts.contains_key(node) {
@@ -92,6 +79,14 @@ impl WebRtcTransport {
             return Ok(());
         }
 
+        if !self.pair_backoff.lock().unwrap().can_initiate(
+            node,
+            web_time::Instant::now(),
+            self.signaler.has_overlay_route(node),
+            false,
+        ) {
+            return Ok(());
+        }
         let Some(attempt_id) = self.reserve_connect_request_attempt(node) else {
             return Ok(());
         };
@@ -104,7 +99,21 @@ impl WebRtcTransport {
                 err
             );
         }
-        self.spawn_connect_request_retry(node.clone(), attempt_id);
+        {
+            let mut attempts = self.connect_request_attempt_ids.write().unwrap();
+            // An offer may already have arrived while send_signaling awaited.
+            // It clears this reservation before creating the PC; never re-arm
+            // a failed nudge after that real attempt has started.
+            if attempts.get(node) == Some(&attempt_id) {
+                self.pair_backoff.lock().unwrap().failed(
+                    node,
+                    web_time::Instant::now(),
+                    rand::random(),
+                );
+                attempts.remove(node);
+            }
+        }
+        self.ensure_session_sweeper();
         Ok(())
     }
 
@@ -124,121 +133,6 @@ impl WebRtcTransport {
                 }),
             )
             .await
-    }
-
-    /// Spawns the background retry loop for a `CONNECT_REQUEST` nudge
-    /// previously reserved (and already sent once) by
-    /// `request_lower_id_offer`. Retries follow an exponential backoff
-    /// (`CONNECT_REQUEST_RETRY_INITIAL_MS`, growing by
-    /// `CONNECT_REQUEST_RETRY_MULTIPLIER` each time, capped at
-    /// `CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS`) instead of a fixed interval,
-    /// so a burst of simultaneously-disconnected peers doesn't resynchronize
-    /// into a retry storm hitting the signaling layer and
-    /// `handshake_semaphore` at the same cadence.
-    ///
-    /// Once every retry is exhausted (or immediately, if `retry_limit <= 1`
-    /// leaves nothing to retry) this clears `node`'s entry from
-    /// `connect_request_attempt_ids` -- the *only* thing standing between a
-    /// future `connect()`/`request_lower_id_offer` call for the same `node`
-    /// and a fresh retry cycle is `reserve_connect_request_attempt`'s
-    /// "already pending" check against that same map. Leaving a stale entry
-    /// behind here (the `retry_limit <= 1` path used to do exactly that --
-    /// returning before ever spawning the task that would otherwise clear
-    /// it) would silently and permanently swallow every later
-    /// `request_lower_id_offer` call for `node` as a no-op, with no log line
-    /// to explain why: `reserve_connect_request_attempt` returns `None` the
-    /// moment the map already contains the key.
-    fn spawn_connect_request_retry(&self, node: NodeId, attempt_id: u32) {
-        let retry_limit = Self::connect_request_retry_limit();
-        if retry_limit <= 1 {
-            let mut attempts = self.connect_request_attempt_ids.write().unwrap();
-            if matches!(attempts.get(&node), Some(id) if *id == attempt_id) {
-                attempts.remove(&node);
-            }
-            return;
-        }
-
-        let signaler = self.signaler.clone();
-        let local_node_id = self.local_node_id.clone();
-        let room_id = self.get_room_id();
-        let pending_attempts = self.connect_request_attempt_ids.clone();
-        let peers = self.peers.clone();
-        let states = self.connection_states.clone();
-
-        tokio::spawn(async move {
-            for retry in 2..=retry_limit {
-                // `retry` is the send this delay precedes (2 == the 2nd
-                // send overall), so it maps to backoff attempt number
-                // `retry - 1` (the 1st waited interval, `attempt_number ==
-                // 1`, is `CONNECT_REQUEST_RETRY_INITIAL_MS` unchanged).
-                let delay_ms = exponential_backoff_ms(
-                    retry - 1,
-                    CONNECT_REQUEST_RETRY_INITIAL_MS,
-                    CONNECT_REQUEST_RETRY_MULTIPLIER,
-                    CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS,
-                );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-                let is_current_attempt = {
-                    let attempts = pending_attempts.read().unwrap();
-                    matches!(attempts.get(&node), Some(id) if *id == attempt_id)
-                };
-                if !is_current_attempt {
-                    return;
-                }
-
-                let has_peer = {
-                    let peers = peers.read().await;
-                    peers.contains_key(&node)
-                };
-                let has_state = {
-                    let states = states.read().unwrap();
-                    states.contains_key(&node)
-                };
-                if has_peer || has_state {
-                    pending_attempts.write().unwrap().remove(&node);
-                    return;
-                }
-
-                let result = signaler
-                    .send_signaling(
-                        &node,
-                        MessageContent::Data(SignalingData {
-                            sender_id: local_node_id.clone(),
-                            receiver_id: node.clone(),
-                            room_id: room_id.clone(),
-                            data: String::new(),
-                            signaling_type: SignalingType::Request,
-                        }),
-                    )
-                    .await;
-                if let Err(err) = result {
-                    tracing::warn!(
-                        "[WebRTC Request] send_failed node={} attempt={} retry={} error={:?}",
-                        node,
-                        attempt_id,
-                        retry,
-                        err
-                    );
-                }
-            }
-
-            let still_pending = {
-                let mut attempts = pending_attempts.write().unwrap();
-                matches!(attempts.get(&node), Some(id) if *id == attempt_id)
-                    .then(|| attempts.remove(&node))
-                    .flatten()
-                    .is_some()
-            };
-            if still_pending {
-                tracing::warn!(
-                    "[WebRTC Request] retry_exhausted node={} attempt={} retries={}",
-                    node,
-                    attempt_id,
-                    retry_limit
-                );
-            }
-        });
     }
 }
 
@@ -856,7 +750,10 @@ impl WebRtcTransport {
             for cand_json in cands {
                 match serde_json::from_str::<RTCIceCandidateInit>(&cand_json) {
                     Ok(candidate) => {
-                        if let Err(err) = peer.pc.add_ice_candidate(candidate).await {
+                        if let Err(err) = peer
+                            .apply_candidate_observed(&remote_id, candidate, "buffer")
+                            .await
+                        {
                             tracing::warn!(
                                 "failed to apply buffered ICE candidate for {}: {}",
                                 remote_id.0,
@@ -956,7 +853,10 @@ impl WebRtcTransport {
                             };
                             // Use the same ICE API as handle_candidate, on
                             // this locked peer even if cleanup replaces it.
-                            if let Err(err) = peer.pc.add_ice_candidate(candidate).await {
+                            if let Err(err) = peer
+                                .apply_candidate_observed(&remote_id, candidate, "answer_replay")
+                                .await
+                            {
                                 tracing::warn!(
                                     "failed to apply re-delivered answer candidate for {}: {}",
                                     remote_id.0,
@@ -1001,7 +901,10 @@ impl WebRtcTransport {
                 for cand_json in cands {
                     match serde_json::from_str::<RTCIceCandidateInit>(&cand_json) {
                         Ok(candidate) => {
-                            if let Err(err) = peer.pc.add_ice_candidate(candidate).await {
+                            if let Err(err) = peer
+                                .apply_candidate_observed(&remote_id, candidate, "buffer")
+                                .await
+                            {
                                 tracing::warn!(
                                     "failed to apply buffered ICE candidate for {}: {}",
                                     remote_id.0,
@@ -1057,10 +960,21 @@ impl WebRtcTransport {
             peers.get(&remote_id).cloned()
         };
 
-        if let Some(peer) = peer {
+        let pc_id = peer.as_ref().map_or(0, |peer| peer.ice_measurements.id);
+        tracing::debug!(
+            "[IceCandidate] peer={} pc_id={} action=receive type={}",
+            remote_id.0,
+            pc_id,
+            super::ice_measurement::json_candidate_type(&cand_json)
+        );
+        if let Some(peer) = &peer {
+            peer.ice_measurements
+                .received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if peer.pc.remote_description().await.is_some() {
                 let candidate = serde_json::from_str::<RTCIceCandidateInit>(&cand_json)?;
-                peer.pc.add_ice_candidate(candidate).await?;
+                peer.apply_candidate_observed(&remote_id, candidate, "direct")
+                    .await?;
                 return Ok(());
             }
         }
@@ -1079,6 +993,18 @@ impl WebRtcTransport {
             return Ok(());
         }
         let list = pc_lock.entry(remote_id.clone()).or_default();
+        if let Some(peer) = &peer {
+            peer.ice_measurements
+                .buffered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::debug!(
+            "[IceCandidate] peer={} pc_id={} action=buffer count={} type={}",
+            node_str,
+            pc_id,
+            list.len() + 1,
+            super::ice_measurement::json_candidate_type(&cand_json)
+        );
         let dropped_oldest = super::push_pending_candidate(list, cand_json);
         drop(pc_lock);
 
@@ -1218,7 +1144,7 @@ impl SignalingHandler for WebRtcTransport {
                     // every other case behaves exactly as before.
                     self.maybe_takeover_for_connect_request(&data.sender_id)
                         .await;
-                    let _ = self.connect(&data.sender_id).await;
+                    let _ = self.connect_with_policy(&data.sender_id, true).await;
                 }
                 Ok(())
             }

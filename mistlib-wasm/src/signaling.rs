@@ -39,6 +39,36 @@ impl Signaler for WasmBootstrapSignaler {
         }
     }
 
+    fn note_peer_connected(&self, peer: &mistlib_core::types::NodeId) {
+        match self {
+            Self::WebSocket(s) => s.note_peer_connected(peer),
+            Self::Nostr(s) => s.note_peer_connected(peer),
+        }
+    }
+
+    async fn peer_retry_token(&self, peer: &mistlib_core::types::NodeId) -> Option<String> {
+        match self {
+            Self::WebSocket(s) => s.peer_retry_token(peer).await,
+            Self::Nostr(s) => s.peer_retry_token(peer).await,
+        }
+    }
+    async fn retry_peer(
+        &self,
+        peer: &mistlib_core::types::NodeId,
+    ) -> mistlib_core::error::Result<()> {
+        match self {
+            Self::WebSocket(s) => s.retry_peer(peer).await,
+            Self::Nostr(s) => s.retry_peer(peer).await,
+        }
+    }
+
+    fn end_connection_attempt(&self, peer: &mistlib_core::types::NodeId) {
+        match self {
+            Self::WebSocket(s) => s.end_connection_attempt(peer),
+            Self::Nostr(s) => s.end_connection_attempt(peer),
+        }
+    }
+
     async fn note_peer_alive(&self, peer: &mistlib_core::types::NodeId) {
         match self {
             Self::WebSocket(signaler) => signaler.note_peer_alive(peer).await,
@@ -50,6 +80,13 @@ impl Signaler for WasmBootstrapSignaler {
         match self {
             Self::WebSocket(signaler) => signaler.maintain_bootstrap(connected_peers).await,
             Self::Nostr(signaler) => signaler.maintain_bootstrap(connected_peers).await,
+        }
+    }
+
+    async fn reset_session_with_reason(&self, reason: &str) -> mistlib_core::error::Result<()> {
+        match self {
+            Self::WebSocket(signaler) => signaler.reset_session_with_reason(reason).await,
+            Self::Nostr(signaler) => signaler.reset_session_with_reason(reason).await,
         }
     }
 

@@ -142,6 +142,10 @@ impl NostrSignaler {
             {
                 return Ok(());
             }
+            self.measurements
+                .lock()
+                .unwrap()
+                .discovery(&decoded.signaling_pubkey, web_time::Instant::now());
             {
                 let mut dedupe = self.dedupe.lock().await;
                 if !dedupe.check_and_insert(&event.id) {
@@ -164,6 +168,18 @@ impl NostrSignaler {
             // keyed by `NodeId`, not by the very pubkey that rotates -- in
             // the message-processing branch below via
             // `DiscoveryTable::bind_node_with_epoch`'s `BindOutcome::Rebound`.
+            if self
+                .discovery_table
+                .lock()
+                .await
+                .is_superseded(&decoded.signaling_pubkey)
+            {
+                tracing::debug!(
+                    "[DiscoveryRetired] action=drop reason=replay pubkey={}",
+                    decoded.signaling_pubkey
+                );
+                return Ok(());
+            }
             self.bootstrap.lock().await.observe(
                 &decoded.signaling_pubkey,
                 event.created_at,
@@ -334,13 +350,15 @@ impl NostrSignaler {
                 // Request` escape hatch, unchanged below) doesn't apply. See
                 // `DiscoveryTable::bind_node_with_epoch`'s doc comment for the
                 // acceptance rule and its security trade-off.
-                let outcome = table.bind_node_with_epoch(
+                let outcome = table.bind_node_with_stamp(
                     incoming.sender_id.clone(),
                     decoded.sender_pubkey.clone(),
                     decoded.expires_at,
                     sender_rank,
                     decoded.sender_joined_at,
+                    event.created_at,
                     sender_was_requested && incoming.signaling_type == SignalingType::Request,
+                    super::current_unix_millis() / 1000,
                 )?;
                 // A signaling message from this sender just passed validation,
                 // dedupe, and ordering checks, so it is proof of life right now.
@@ -358,6 +376,16 @@ impl NostrSignaler {
                 };
                 (reply_pubkey, outcome.rebound_from().map(str::to_string))
             };
+            self.measurements
+                .lock()
+                .unwrap()
+                .response(&decoded.sender_pubkey, web_time::Instant::now());
+            tracing::debug!(
+                "[NostrBinding] node={} pubkey={} joined_at={}",
+                incoming.sender_id.0,
+                decoded.sender_pubkey,
+                decoded.sender_joined_at.unwrap_or(0)
+            );
             self.exchanges
                 .lock()
                 .await
@@ -377,6 +405,11 @@ impl NostrSignaler {
                     .progress(&decoded.sender_pubkey, web_time::Instant::now());
             }
             if let Some(previous_pubkey) = rebound_from {
+                self.governor.lock().unwrap().retire(&previous_pubkey);
+                self.exchanges
+                    .lock()
+                    .await
+                    .retire(&previous_pubkey, web_time::Instant::now());
                 tracing::info!(
                     "NostrSignaler: node {} rebound from pubkey {} to {} -- peer restarted \
                      (rejoin); purging stale per-peer state and notifying the transport",

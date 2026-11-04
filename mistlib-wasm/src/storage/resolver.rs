@@ -30,11 +30,13 @@ impl TransportSource for WasmSessionTransports {
 
 pub struct WasmPeerResolver {
     inner: NetworkPeerResolver,
+    budget: super::cooperative::PollBudget,
 }
 
 impl WasmPeerResolver {
     pub fn new(registry: WantRegistry) -> Self {
         Self {
+            budget: super::cooperative::PollBudget::new(web_time::Duration::from_millis(2)),
             inner: NetworkPeerResolver::new_with_transfer(
                 Arc::new(WasmSessionTransports),
                 Arc::new(crate::runtime::WasmRuntime),
@@ -53,14 +55,18 @@ impl PeerResolver for WasmPeerResolver {
         &self,
         cid: &str,
     ) -> mistlib_core::error::Result<Option<Vec<u8>>> {
-        self.inner.resolve_block_result(cid).await
+        self.budget
+            .run(async { self.inner.resolve_block_result(cid).await })
+            .await
     }
 
     async fn prefetch_providers(&self, cids: &[String]) {
-        self.inner.prefetch_providers(cids).await;
+        self.budget
+            .run(async { self.inner.prefetch_providers(cids).await })
+            .await;
     }
 
     async fn resolve_block(&self, cid: &str) -> Option<Vec<u8>> {
-        self.inner.resolve_block(cid).await
+        self.resolve_block_result(cid).await.ok().flatten()
     }
 }

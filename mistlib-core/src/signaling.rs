@@ -1,3 +1,4 @@
+pub mod courtesy;
 pub mod message;
 pub mod nostr;
 pub mod reconnect;

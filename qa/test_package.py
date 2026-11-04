@@ -1,8 +1,37 @@
 """Pure release arithmetic and precedence shared by release entry points."""
 
 import unittest
+from unittest.mock import patch
+from argparse import Namespace
+from pathlib import Path
+import json
+import os
+import tarfile
+import tempfile
 
-from package import next_version, npm_dist_tag, semver_key
+from package import build, next_version, npm_dist_tag, semver_key
+
+
+class WasmPackageTest(unittest.TestCase):
+    def test_npm_archive_contains_imported_runtime_snippets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pkg = root / "pkg"
+            pkg.mkdir()
+            files = ["mistlib_wasm.js", "mistlib_wasm_bg.wasm", "mistlib_wasm.d.ts"]
+            for name in files:
+                (pkg / name).write_text("fixture")
+            (pkg / "package.json").write_text(json.dumps({"name": "fixture", "version": "0.7.3-beta.2", "files": files}))
+            snippet = pkg / "snippets" / "fixture" / "src" / "hash_worker.js"
+            snippet.parent.mkdir(parents=True)
+            snippet.write_text("export function hashBlock() {}")
+            out = root / "out"
+            with patch("package.version", return_value="0.7.3-beta.2"), patch.dict(os.environ, {
+                "GITHUB_SHA": "a" * 40, "npm_config_cache": str(root / "cache")
+            }):
+                build(Namespace(kind="wasm", pkg=pkg, out=out))
+            with tarfile.open(next(out.glob("*.tgz"))) as archive:
+                self.assertIn("package/snippets/fixture/src/hash_worker.js", archive.getnames())
 
 
 class VersionTest(unittest.TestCase):

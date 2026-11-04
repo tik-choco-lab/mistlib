@@ -703,3 +703,166 @@ async fn cleanup_session_if_current_ignores_a_stale_peer_already_superseded_by_a
     assert!(!t.peers.read().await.contains_key(&node));
     assert_eq!(t.get_connection_state(&node), ConnectionState::Disconnected);
 }
+
+#[tokio::test]
+async fn failed_pair_is_nudged_after_backoff_without_rotating_identity() {
+    use async_trait::async_trait;
+    use mistlib_core::error::Result as MistResult;
+    use mistlib_core::signaling::{MessageContent, Signaler, SignalingType};
+    use std::sync::{Arc, Mutex};
+    struct RecordingSignaler(Mutex<Vec<MessageContent>>);
+    #[async_trait]
+    impl Signaler for RecordingSignaler {
+        async fn send_signaling(&self, _to: &NodeId, msg: MessageContent) -> MistResult<()> {
+            self.0.lock().unwrap().push(msg);
+            Ok(())
+        }
+        async fn close(&self) -> MistResult<()> {
+            Ok(())
+        }
+    }
+    let signaler = Arc::new(RecordingSignaler(Mutex::new(Vec::new())));
+    let t = WebRtcTransport::new(signaler.clone(), NodeId("z".into()));
+    let node = NodeId("a".into());
+    // Supply a past clock to make the shared three-second deadline due;
+    // core tests verify all real intervals without wall-clock waits.
+    t.pair_backoff.lock().unwrap().failed(
+        &node,
+        web_time::Instant::now() - web_time::Duration::from_secs(4),
+        0.5,
+    );
+    t.ensure_session_sweeper();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if !signaler.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stable identity must retain an autonomous retry trigger");
+    assert!(
+        matches!(&signaler.0.lock().unwrap()[0], MessageContent::Data(data)
+        if data.receiver_id == node && data.signaling_type == SignalingType::Request)
+    );
+    // Explicitly removing a peer must not keep a retry intention armed.
+    t.disconnect(&node).await.unwrap();
+    assert!(t
+        .pair_backoff
+        .lock()
+        .unwrap()
+        .poll_nudges(
+            &t.local_node_id,
+            web_time::Instant::now() + web_time::Duration::from_secs(100),
+            0.5,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .is_empty());
+    t.close_all_peer_connections().await;
+}
+
+#[tokio::test]
+async fn pair_cooldown_does_not_block_the_signaling_dispatcher() {
+    let t = make_transport();
+    let node = NodeId("zzzz".into()); // local < node: the active offer path
+    t.pair_backoff
+        .lock()
+        .unwrap()
+        .failed(&node, web_time::Instant::now(), 0.5);
+    tokio::time::timeout(std::time::Duration::from_millis(100), t.connect(&node))
+        .await
+        .expect("cooldown must not hold the inbound signaling dispatcher")
+        .unwrap();
+    assert!(!t.connection_states.read().unwrap().contains_key(&node));
+}
+
+#[tokio::test]
+async fn incoming_request_bypasses_failed_pair_admission_and_cooldown() {
+    use mistlib_core::signaling::{MessageContent, SignalingData, SignalingHandler, SignalingType};
+    let t = make_transport();
+    let node = NodeId("zzzz".into());
+    t.pair_backoff
+        .lock()
+        .unwrap()
+        .failed(&node, web_time::Instant::now(), 0.5);
+    t.connect(&node).await.unwrap();
+    assert!(!t.connection_states.read().unwrap().contains_key(&node));
+    t.handle_message(MessageContent::Data(SignalingData {
+        sender_id: node.clone(),
+        receiver_id: t.local_node_id.clone(),
+        room_id: t.get_room_id(),
+        data: String::new(),
+        signaling_type: SignalingType::Request,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(t.get_connection_state(&node), ConnectionState::Connecting);
+    t.close_all_peer_connections().await;
+}
+
+#[tokio::test]
+async fn first_connection_after_isolation_rearms_others_but_further_connected_does_not() {
+    let t = make_transport();
+    let first = NodeId("first".into());
+    let other = NodeId("other".into());
+    let failed = NodeId("failed".into());
+    let now = web_time::Instant::now();
+    for _ in 0..8 {
+        t.pair_backoff.lock().unwrap().failed(&failed, now, 0.5);
+    }
+    t.connection_states
+        .write()
+        .unwrap()
+        .insert(first.clone(), ConnectionState::Connecting);
+    assert!(t
+        .peer_handles()
+        .mark_connection_state(&first, ConnectionState::Connected));
+    assert!(
+        t.pair_backoff.lock().unwrap().remaining(&failed, now) <= web_time::Duration::from_secs(2)
+    );
+    t.pair_backoff.lock().unwrap().failed(&failed, now, 0.5);
+    let before = t.pair_backoff.lock().unwrap().remaining(&failed, now);
+    assert_eq!(before, web_time::Duration::from_secs(3));
+    t.connection_states
+        .write()
+        .unwrap()
+        .insert(other.clone(), ConnectionState::Connecting);
+    assert!(t
+        .peer_handles()
+        .mark_connection_state(&other, ConnectionState::Connected));
+    assert!(t
+        .peer_handles()
+        .mark_connection_state(&first, ConnectionState::Connected));
+    assert_eq!(
+        t.pair_backoff.lock().unwrap().remaining(&failed, now),
+        before
+    );
+}
+
+#[tokio::test]
+async fn repeated_failures_do_not_postpone_reserved_isolation_timer() {
+    let t = make_transport();
+    let handles = t.peer_handles();
+    handles.schedule_isolation_recovery();
+    let first = handles
+        .isolation_recovery_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..20 {
+        handles.schedule_isolation_recovery();
+    }
+    assert_eq!(
+        handles
+            .isolation_recovery_epoch
+            .load(std::sync::atomic::Ordering::SeqCst),
+        first
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        handles
+            .isolation_recovery_epoch
+            .load(std::sync::atomic::Ordering::SeqCst),
+        first + 1
+    );
+}

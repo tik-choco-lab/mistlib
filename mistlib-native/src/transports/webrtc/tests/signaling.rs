@@ -607,23 +607,14 @@ async fn higher_id_connect_deduplicates_pending_request_retries() {
     assert!(t.connect(&lower).await.is_ok());
 
     assert_eq!(signaler.0.lock().unwrap().len(), 1);
-    assert_eq!(t.connect_request_attempt_ids.read().unwrap().len(), 1);
+    assert!(t.connect_request_attempt_ids.read().unwrap().is_empty());
+    assert!(t.pair_backoff.lock().unwrap().nodes().contains(&lower));
 }
 
-/// Regression test for the CONNECT_REQUEST "permanent silence" investigation:
-/// once a peer's `connect_request_attempt_ids` bookkeeping is cleared --
-/// which is exactly what happens both when `spawn_connect_request_retry`'s
-/// backoff schedule exhausts and (after the `retry_limit <= 1` leak fix) when
-/// there are no retries configured at all -- a later `connect()` call for the
-/// same still-unconnected node must be able to start a brand-new request
-/// cycle (fresh attempt id, an actual signaling send), not be silently
-/// swallowed forever by `reserve_connect_request_attempt`'s "already
-/// pending" guard. Exercised by clearing the bookkeeping directly rather
-/// than waiting out a real retry schedule, so this stays fast and
-/// deterministic instead of depending on `spawn_connect_request_retry`'s
-/// background timing.
+/// Clearing transient send bookkeeping must not bypass B6. The common sweeper
+/// owns subsequent retries and must still emit a Request once admitted.
 #[tokio::test]
-async fn higher_id_connect_request_restarts_after_bookkeeping_is_cleared() {
+async fn higher_id_connect_request_uses_common_admission_after_bookkeeping_is_cleared() {
     use async_trait::async_trait;
     use mistlib_core::error::Result as MistResult;
     use mistlib_core::signaling::Signaler;
@@ -653,42 +644,26 @@ async fn higher_id_connect_request_restarts_after_bookkeeping_is_cleared() {
         1,
         "first Request must be sent"
     );
-    let first_attempt_id = *t
-        .connect_request_attempt_ids
-        .read()
-        .unwrap()
-        .get(&lower)
-        .expect("an attempt must be reserved after the first connect()");
-
-    // Simulate the bookkeeping state left behind once a retry cycle is over
-    // (backoff exhausted, or -- after the leak fix -- `retry_limit <= 1`):
-    // `connect_request_attempt_ids` no longer has an entry for `lower`.
-    t.connect_request_attempt_ids
-        .write()
-        .unwrap()
-        .remove(&lower);
-
-    assert!(
-        t.connect(&lower).await.is_ok(),
-        "connect() must succeed once the peer is still unconnected"
+    assert!(t.connect_request_attempt_ids.read().unwrap().is_empty());
+    t.clear_connect_request_attempt(&lower);
+    // Even an expired pair is not an autonomous-connect bypass of admission.
+    t.pair_backoff.lock().unwrap().failed(
+        &lower,
+        web_time::Instant::now() - web_time::Duration::from_secs(10),
+        0.5,
     );
-
-    assert_eq!(
-        signaler.0.lock().unwrap().len(),
-        2,
-        "a fresh connect() after the bookkeeping was cleared must send a new Request, \
-         not be silently swallowed"
-    );
-    let second_attempt_id = *t
-        .connect_request_attempt_ids
-        .read()
-        .unwrap()
-        .get(&lower)
-        .expect("a fresh attempt must be reserved for the restarted cycle");
-    assert_ne!(
-        first_attempt_id, second_attempt_id,
-        "the restarted cycle must reserve a brand-new attempt id"
-    );
+    t.connect(&lower).await.unwrap();
+    assert_eq!(signaler.0.lock().unwrap().len(), 1);
+    t.ensure_session_sweeper();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while signaler.0.lock().unwrap().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("common queue must send an admitted Request");
+    assert_eq!(signaler.0.lock().unwrap().len(), 2);
+    t.close_all_peer_connections().await;
 }
 
 #[tokio::test]
@@ -720,12 +695,10 @@ async fn higher_id_connect_keeps_pending_request_after_route_not_found() {
         ConnectionState::Disconnected
     );
     assert!(
-        t.connect_request_attempt_ids
-            .read()
-            .unwrap()
-            .contains_key(&lower),
-        "failed direct Request must remain pending so the retry task can resend"
+        t.pair_backoff.lock().unwrap().nodes().contains(&lower),
+        "failed direct Request must remain in the common retry queue"
     );
+    assert!(t.connect_request_attempt_ids.read().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -754,6 +727,10 @@ async fn incoming_offer_clears_pending_lower_id_request_retry() {
     let lower = NodeId("aaa".to_string());
 
     assert!(t.connect(&lower).await.is_ok());
+    t.connect_request_attempt_ids
+        .write()
+        .unwrap()
+        .insert(lower.clone(), 42);
     assert!(t
         .connect_request_attempt_ids
         .read()

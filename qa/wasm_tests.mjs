@@ -23,7 +23,7 @@ assert(installed.stdout.trim().endsWith(version), 'runner must match Cargo.lock'
 const browser = await chromium.launch({ headless: true });
 const results = [];
 try {
-  for (const [filter, minimum] of [['transport::webrtc', 7], ['app::tests', 12], ['signaling::nostr::tests', 22]]) {
+  for (const [filter, minimum] of [['transport::webrtc', 7], ['app::tests', 12], ['signaling::nostr::tests', 22], ['storage::tests', 9]]) {
     const child = spawn(runner, [artifacts[0].executable, filter, '--skip', 'nostr_live_'], {
       env: { ...process.env, NO_HEADLESS: '1', WASM_BINDGEN_TEST_ADDRESS: '127.0.0.1:0' },
       stdio: ['ignore', 'pipe', 'pipe'],

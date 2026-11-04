@@ -126,6 +126,8 @@ fn newer_epoch(stored: Option<u64>, incoming: Option<u64>) -> Option<u64> {
 pub struct DiscoveryTable {
     by_pubkey: HashMap<String, DiscoveryEntry>,
     node_to_pubkey: HashMap<NodeId, NodeBinding>,
+    superseded: HashMap<String, u64>,
+    binding_stamps: HashMap<NodeId, (u64, u64)>,
 }
 
 impl DiscoveryTable {
@@ -140,7 +142,25 @@ impl DiscoveryTable {
         expires_at: u64,
         topology_rank: String,
     ) {
-        self.sweep_expired(now_unix_seconds());
+        self.insert_pubkey_with_rank_at(
+            signaling_pubkey,
+            expires_at,
+            topology_rank,
+            now_unix_seconds(),
+        );
+    }
+
+    fn insert_pubkey_with_rank_at(
+        &mut self,
+        signaling_pubkey: String,
+        expires_at: u64,
+        topology_rank: String,
+        now: u64,
+    ) {
+        self.sweep_expired(now);
+        if self.is_superseded(&signaling_pubkey) {
+            return;
+        }
         let expires_at = self
             .by_pubkey
             .get(&signaling_pubkey)
@@ -250,8 +270,33 @@ impl DiscoveryTable {
         sender_epoch: Option<u64>,
         allow_rebind: bool,
     ) -> Result<BindOutcome> {
-        self.sweep_expired(now_unix_seconds());
+        self.bind_node_with_epoch_at(
+            node_id,
+            signaling_pubkey,
+            expires_at,
+            topology_rank,
+            sender_epoch,
+            allow_rebind,
+            now_unix_seconds(),
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn bind_node_with_epoch_at(
+        &mut self,
+        node_id: NodeId,
+        signaling_pubkey: String,
+        expires_at: u64,
+        topology_rank: String,
+        sender_epoch: Option<u64>,
+        allow_rebind: bool,
+        now: u64,
+    ) -> Result<BindOutcome> {
+        self.sweep_expired(now);
+
+        if self.is_superseded(&signaling_pubkey) {
+            return Err(MistError::Signaling("Nostr superseded pubkey".into()));
+        }
         let (outcome, epoch) = match self.node_to_pubkey.get(&node_id) {
             None => (BindOutcome::New, sender_epoch),
             Some(existing) if existing.pubkey == signaling_pubkey => (
@@ -266,6 +311,16 @@ impl DiscoveryTable {
                     Some(candidate) if stored_epoch.is_none_or(|stored| candidate > stored)
                 );
                 if epoch_is_newer || allow_rebind {
+                    let until = self
+                        .by_pubkey
+                        .get(&previous_pubkey)
+                        .map_or(expires_at, |e| e.expires_at.max(expires_at));
+                    self.superseded.insert(previous_pubkey.clone(), until);
+                    tracing::info!(
+                        "[DiscoveryRetired] action=retire pubkey={} replacement={}",
+                        previous_pubkey,
+                        signaling_pubkey
+                    );
                     self.by_pubkey.remove(&previous_pubkey);
                     (BindOutcome::Rebound { previous_pubkey }, sender_epoch)
                 } else {
@@ -276,7 +331,7 @@ impl DiscoveryTable {
             }
         };
 
-        self.insert_pubkey_with_rank(signaling_pubkey.clone(), expires_at, topology_rank);
+        self.insert_pubkey_with_rank_at(signaling_pubkey.clone(), expires_at, topology_rank, now);
         self.node_to_pubkey.insert(
             node_id,
             NodeBinding {
@@ -285,6 +340,79 @@ impl DiscoveryTable {
             },
         );
         Ok(outcome)
+    }
+
+    /// Existing 0.7 events already carry these clocks; no wire extension.
+    /// Anonymous discovery cannot identify a node until its first Request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_node_with_stamp(
+        &mut self,
+        node: NodeId,
+        pubkey: String,
+        expires: u64,
+        rank: String,
+        joined: Option<u64>,
+        created: u64,
+        allow_legacy_rebind: bool,
+        now: u64,
+    ) -> Result<BindOutcome> {
+        self.sweep_expired(now);
+        let stamp = (joined.unwrap_or(0), created);
+        if self.is_superseded(&pubkey)
+            || (!allow_legacy_rebind
+                && self.binding_stamps.get(&node).is_some_and(|old| {
+                    self.node_to_pubkey
+                        .get(&node)
+                        .is_some_and(|b| b.pubkey != pubkey)
+                        && stamp <= *old
+                }))
+        {
+            tracing::debug!(
+                "[DiscoveryRetired] action=drop reason=older_binding pubkey={}",
+                pubkey
+            );
+            return Err(MistError::Signaling("Nostr stale binding".into()));
+        }
+        let tie_newer = self
+            .binding_stamps
+            .get(&node)
+            .is_some_and(|old| stamp > *old);
+        let outcome = self.bind_node_with_epoch_at(
+            node.clone(),
+            pubkey,
+            expires,
+            rank,
+            joined,
+            tie_newer || allow_legacy_rebind,
+            now,
+        )?;
+        self.binding_stamps
+            .entry(node)
+            .and_modify(|old| *old = (*old).max(stamp))
+            .or_insert(stamp);
+        Ok(outcome)
+    }
+
+    pub fn retry_token(&mut self, node: &NodeId) -> Option<String> {
+        let pubkey = self.pubkey_for_node(node)?;
+        Some(format!(
+            "{}:{:?}:{:?}",
+            pubkey,
+            self.binding_stamps.get(node),
+            self.expires_at_for_pubkey(&pubkey)
+        ))
+    }
+
+    pub fn bindings(&mut self) -> Vec<(NodeId, String)> {
+        self.sweep_expired(now_unix_seconds());
+        self.node_to_pubkey
+            .iter()
+            .map(|(node, b)| (node.clone(), b.pubkey.clone()))
+            .collect()
+    }
+
+    pub fn is_superseded(&self, pubkey: &str) -> bool {
+        self.superseded.contains_key(pubkey)
     }
 
     pub fn pubkey_for_node(&mut self, node_id: &NodeId) -> Option<String> {
@@ -410,14 +538,19 @@ impl DiscoveryTable {
     }
 
     pub fn sweep_expired(&mut self, now: u64) {
+        self.superseded.retain(|_, expires| *expires > now);
         self.by_pubkey.retain(|_, entry| entry.expires_at > now);
         self.node_to_pubkey
             .retain(|_, binding| self.by_pubkey.contains_key(&binding.pubkey));
+        self.binding_stamps
+            .retain(|node, _| self.node_to_pubkey.contains_key(node));
     }
 
     pub fn clear(&mut self) {
         self.by_pubkey.clear();
         self.node_to_pubkey.clear();
+        self.superseded.clear();
+        self.binding_stamps.clear();
     }
 }
 
@@ -693,5 +826,131 @@ mod tests {
         assert_eq!(removed, Some("pk-leaving".to_string()));
         assert_eq!(table.pubkey_for_node(&node), None);
         assert!(!table.active_pubkeys().contains(&"pk-leaving".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod courtesy_tests {
+    use super::*;
+    #[test]
+    fn latest_binding_wins_and_retired_discovery_cannot_reappear() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("node".into());
+        let bind = |table: &mut DiscoveryTable, key: &str, epoch, created| {
+            table.bind_node_with_stamp(
+                node.clone(),
+                key.into(),
+                1000,
+                key.into(),
+                epoch,
+                created,
+                false,
+                100,
+            )
+        };
+        assert_eq!(
+            bind(&mut table, "old", Some(10), 101).unwrap(),
+            BindOutcome::New
+        );
+        assert!(matches!(
+            bind(&mut table, "new", Some(10), 102).unwrap(),
+            BindOutcome::Rebound { .. }
+        ));
+        assert!(bind(&mut table, "old", Some(10), 103).is_err());
+        assert!(bind(&mut table, "stale", Some(9), 999).is_err());
+        table.insert_pubkey_with_rank_at("old".into(), 1000, "old".into(), 100);
+        assert!(!table.by_pubkey.contains_key("old"));
+        // The old identity's replay window has elapsed; no permanent denylist.
+        table.sweep_expired(1001);
+        assert!(!table.is_superseded("old"));
+    }
+    #[test]
+    fn legacy_events_use_created_at_when_joined_at_is_absent() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("legacy".into());
+        table
+            .bind_node_with_stamp(
+                node.clone(),
+                "a".into(),
+                1000,
+                "a".into(),
+                None,
+                101,
+                false,
+                100,
+            )
+            .unwrap();
+        assert!(table
+            .bind_node_with_stamp(
+                node.clone(),
+                "b".into(),
+                1000,
+                "b".into(),
+                None,
+                101,
+                false,
+                100
+            )
+            .is_err());
+        assert!(table
+            .bind_node_with_stamp(node, "b".into(), 1000, "b".into(), None, 102, false, 100)
+            .is_ok());
+    }
+    #[test]
+    fn authenticated_requested_response_rebinds_even_with_clock_rollback_or_no_joined_at() {
+        for joined in [None, Some(50), Some(100)] {
+            let mut t = DiscoveryTable::default();
+            let node = NodeId("legacy".into());
+            t.bind_node_with_stamp(
+                node.clone(),
+                "old".into(),
+                1000,
+                "r".into(),
+                Some(100),
+                200,
+                false,
+                100,
+            )
+            .unwrap();
+            assert!(t
+                .bind_node_with_stamp(
+                    node.clone(),
+                    "new".into(),
+                    1000,
+                    "r".into(),
+                    joined,
+                    100,
+                    false,
+                    100
+                )
+                .is_err());
+            assert!(matches!(
+                t.bind_node_with_stamp(
+                    node.clone(),
+                    "new".into(),
+                    1000,
+                    "r".into(),
+                    joined,
+                    100,
+                    true,
+                    100
+                )
+                .unwrap(),
+                BindOutcome::Rebound { .. }
+            ));
+            assert_eq!(t.node_to_pubkey[&node].pubkey, "new");
+            assert!(t
+                .bind_node_with_stamp(
+                    node,
+                    "old".into(),
+                    1000,
+                    "r".into(),
+                    Some(100),
+                    200,
+                    false,
+                    100
+                )
+                .is_err());
+        }
     }
 }

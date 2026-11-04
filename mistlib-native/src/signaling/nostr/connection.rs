@@ -59,6 +59,7 @@ impl NostrSignaler {
         &self,
         incoming_tx: mpsc::Sender<MessageContent>,
     ) -> crate::error::Result<()> {
+        *self.retry_incoming.lock().await = Some(incoming_tx.clone());
         let cancel = CancellationToken::new();
         {
             let mut lock = self.reconnect_cancel.lock().await;
@@ -208,21 +209,68 @@ impl NostrSignaler {
         let writer_cancel_on_exit = writer_cancel.clone();
         let writer_disconnected = disconnected_tx.clone();
         let writer_last_activity = last_activity.clone();
+        let writer_governor = self.governor.clone();
+        writer_governor
+            .lock()
+            .unwrap()
+            .open(relay, web_time::Instant::now());
+        let writer_notify = self.governor_notify.clone();
+        let writer_measurements = self.measurements.clone();
+        let writer_relay = relay.to_owned();
         tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(RELAY_PING_INTERVAL);
             ping_interval.tick().await; // first tick fires immediately; skip it
-            loop {
+            'writer: loop {
+                let notified = writer_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let wakeup = writer_governor
+                    .lock()
+                    .unwrap()
+                    .next_wakeup(&writer_relay, web_time::Instant::now());
+                let wait_for_work = async {
+                    match wakeup {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     _ = writer_cancel.cancelled() => break,
                     maybe_frame = rx.recv() => {
                         let Some(frame) = maybe_frame else { break };
-                        let result = tokio::select! {
-                            _ = writer_cancel.cancelled() => break,
-                            result = write.send(Message::Text(frame.into())) => result,
-                        };
-                        if let Err(err) = result {
-                            tracing::warn!("NostrSignaler: relay write failed: {}", err);
-                            break;
+                        let control = writer_governor.lock().unwrap().enqueue(&writer_relay, frame, web_time::Instant::now());
+                        if let Some(frame) = control {
+                            let result = tokio::select! {
+                                _ = writer_cancel.cancelled() => break 'writer,
+                                result = write.send(Message::Text(frame.clone().into())) => result,
+                            };
+                            if let Err(err) = result { tracing::warn!("NostrSignaler: relay write failed: {err}"); break 'writer; }
+                            writer_measurements.lock().unwrap().sent(&frame, &writer_relay, web_time::Instant::now());
+                        }
+                    }
+                    _ = &mut notified => {}
+                    _ = wait_for_work => {
+                        // Drain all available priorities before choosing the next EVENT.
+                        while let Ok(frame) = rx.try_recv() {
+                            let control = writer_governor.lock().unwrap().enqueue(&writer_relay, frame, web_time::Instant::now());
+                            if let Some(frame) = control {
+                                let result = tokio::select! {
+                                    _ = writer_cancel.cancelled() => break 'writer,
+                                    result = write.send(Message::Text(frame.clone().into())) => result,
+                                };
+                                if result.is_err() { break 'writer; }
+                                writer_measurements.lock().unwrap().sent(&frame, &writer_relay, web_time::Instant::now());
+                            }
+                        }
+                        loop {
+                            let frame = writer_governor.lock().unwrap().poll(&writer_relay, web_time::Instant::now());
+                            let Some(frame) = frame else { break; };
+                            let result = tokio::select! {
+                                _ = writer_cancel.cancelled() => break 'writer,
+                                result = write.send(Message::Text(frame.clone().into())) => result,
+                            };
+                            if let Err(err) = result { tracing::warn!("NostrSignaler: relay write failed: {err}"); break 'writer; }
+                            writer_measurements.lock().unwrap().sent(&frame, &writer_relay, web_time::Instant::now());
                         }
                     }
                     _ = ping_interval.tick() => {
@@ -245,6 +293,7 @@ impl NostrSignaler {
                     }
                 }
             }
+            writer_governor.lock().unwrap().disconnected(&writer_relay);
             writer_cancel_on_exit.cancel();
             if let Some(tx) = writer_disconnected.lock().unwrap().take() {
                 let _ = tx.send(());
@@ -256,6 +305,7 @@ impl NostrSignaler {
         let reader_cancel_on_exit = reader_cancel.clone();
         let reader_disconnected = disconnected_tx.clone();
         let reader_last_activity = last_activity.clone();
+        let reader_relay = relay.to_owned();
         tokio::spawn(async move {
             let mut retries = HashMap::new();
             loop {
@@ -295,6 +345,7 @@ impl NostrSignaler {
                                 continue;
                             }
                         };
+                        signaler.observe_relay_message(&parsed, &reader_relay);
                         tokio::select! {
                             _ = reader_cancel.cancelled() => break,
                             _ = signaler.handle_relay_message(
@@ -311,6 +362,39 @@ impl NostrSignaler {
         });
 
         Ok(disconnected_rx)
+    }
+
+    fn observe_relay_message(&self, message: &RelayMessage, relay: &str) {
+        self.governor
+            .lock()
+            .unwrap()
+            .observe(relay, message, web_time::Instant::now());
+        self.governor_notify.notify_waiters();
+        let mut stats = self.measurements.lock().unwrap();
+        match message {
+            RelayMessage::Ok {
+                event_id,
+                accepted,
+                message,
+            } => stats.status(
+                event_id,
+                *accepted,
+                message,
+                relay,
+                web_time::Instant::now(),
+            ),
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } => {
+                stats.received();
+                tracing::debug!("[NostrReceive] relay={relay} subscription={} event_id={} kind={} pubkey={} created_at={}", subscription_id, event.id, event.kind, event.pubkey, event.created_at);
+            }
+            RelayMessage::Eose { subscription_id } => {
+                tracing::debug!("[NostrEOSE] relay={relay} subscription={subscription_id}")
+            }
+            _ => {}
+        }
     }
 
     async fn handle_relay_message(
@@ -466,24 +550,13 @@ impl NostrSignaler {
 fn log_relay_status(message: RelayMessage) {
     match message {
         RelayMessage::Ok {
+            accepted: false,
             event_id,
-            accepted,
             message,
-        } => {
-            if !accepted {
-                tracing::warn!(
-                    "NostrSignaler: relay rejected event {}: {}",
-                    event_id,
-                    message
-                );
-            } else if !message.is_empty() {
-                tracing::debug!(
-                    "NostrSignaler: relay accepted event {}: {}",
-                    event_id,
-                    message
-                );
-            }
+        } if !mistlib_core::signaling::nostr::governor::rate_limited(&message) => {
+            tracing::warn!("NostrSignaler: relay rejected event {event_id}: {message}");
         }
+        RelayMessage::Ok { .. } => {}
         RelayMessage::Notice(message) => {
             tracing::warn!("NostrSignaler: relay notice: {}", message);
         }

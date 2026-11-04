@@ -2,11 +2,17 @@ use async_trait::async_trait;
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use mistlib_core::error::{MistError, Result};
 use mistlib_core::storage::BlockStore;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{prelude::wasm_bindgen, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::FileSystemDirectoryHandle;
 
 const STORAGE_DIR: &str = "mistlib-blocks";
+
+#[wasm_bindgen(module = "/src/storage/hash_worker.js")]
+extern "C" {
+    #[wasm_bindgen(catch, js_name = hashBlock)]
+    fn worker_digest(data: &[u8]) -> std::result::Result<Promise, JsValue>;
+}
 
 fn make_opts(create: bool) -> Object {
     let obj = Object::new();
@@ -146,6 +152,39 @@ pub struct WasmBlockStore;
 
 #[async_trait(?Send)]
 impl BlockStore for WasmBlockStore {
+    async fn compute_cid(&self, data: &[u8], codec: u64) -> Result<String> {
+        // Small manifests do not justify a browser round trip. Bulk hashing is
+        // delegated to a worker. CSP/worker failures fall back to WebCrypto;
+        // the Rust slice remains valid even if an old JS wasm view detached.
+        if data.len() < 4096 {
+            return Ok(mistlib_core::storage::compute_cid(data, codec));
+        }
+        let worker_result = match worker_digest(data) {
+            Ok(promise) => JsFuture::from(promise).await,
+            Err(error) => Err(error),
+        };
+        let digest = match worker_result {
+            Ok(digest) => digest,
+            Err(_) => async {
+                let window = web_sys::window().ok_or_else(|| JsValue::from_str("No window"))?;
+                let promise = window
+                    .crypto()?
+                    .subtle()
+                    .digest_with_str_and_u8_array("SHA-256", data)?;
+                JsFuture::from(promise).await
+            }
+            .await
+            .map_err(|e| MistError::Internal(format!("SHA-256: {:?}", e)))?,
+        };
+        let bytes = Uint8Array::new(&digest);
+        if bytes.length() != 32 {
+            return Err(MistError::Internal("Invalid SHA-256 digest length".into()));
+        }
+        let mut hash = [0; 32];
+        bytes.copy_to(&mut hash);
+        Ok(mistlib_core::storage::cid::cid_from_sha256(&hash, codec))
+    }
+
     async fn store_block(&self, cid: &str, data: &[u8]) -> Result<()> {
         let dir = get_block_dir().await?;
         write_file(&dir, cid, data).await

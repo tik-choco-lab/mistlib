@@ -140,12 +140,12 @@ async fn reset_session_rotates_identity_resubscribes_and_republishes_discovery()
 
     let new_pubkey = signaler.current_identity().await.public_key;
     assert_ne!(old_pubkey, new_pubkey);
-    assert!(signaler
-        .discovery_table
-        .lock()
-        .await
-        .active_pubkeys()
-        .is_empty());
+    // SPEC-23: rotation retains discovery bindings/tombstones so replay
+    // cannot revive old destinations or restart discovery budgets.
+    assert_eq!(
+        signaler.discovery_table.lock().await.active_pubkeys(),
+        vec!["peer-pubkey".to_owned()]
+    );
     assert!(signaler.dedupe.lock().await.check_and_insert("event-id"));
 
     let discovery_req = relay_rx
@@ -238,20 +238,24 @@ async fn isolated_peers_can_rejoin_with_same_node_ids_and_rotated_pubkeys() {
     assert_ne!(old_alice.public_key, new_alice.public_key);
     assert_ne!(old_bob.public_key, new_bob.public_key);
 
-    let rejoin_request = build_message_event_with_sequence(
-        &bob.codec_config,
-        &bob.crypto,
-        &new_bob,
-        &new_alice.public_key,
-        &data(
-            &bob_id,
-            &NodeId::broadcast(),
-            room_id,
-            SignalingType::Request,
-        ),
-        1,
-    )
-    .unwrap();
+    // SPEC-23 B3: make the newer session explicit instead of relying on
+    // allow_rebind accepting two legacy events with identical created_at.
+    let rejoin_request =
+        mistlib_core::signaling::nostr::build_message_event_with_sequence_and_joined_at(
+            &bob.codec_config,
+            &bob.crypto,
+            &new_bob,
+            &new_alice.public_key,
+            &data(
+                &bob_id,
+                &NodeId::broadcast(),
+                room_id,
+                SignalingType::Request,
+            ),
+            1,
+            Some(1),
+        )
+        .unwrap();
     alice
         .process_event(rejoin_request, mpsc::channel(4).0)
         .await
@@ -309,20 +313,24 @@ async fn requested_rejoin_request_rebinds_same_node_id_to_new_pubkey() {
         .lock()
         .await
         .insert(new_bob_identity.public_key.clone());
-    let rejoin_request = build_message_event_with_sequence(
-        &new_bob.codec_config,
-        &new_bob.crypto,
-        &new_bob_identity,
-        &alice_identity.public_key,
-        &data(
-            &bob_id,
-            &NodeId::broadcast(),
-            room_id,
-            SignalingType::Request,
-        ),
-        1,
-    )
-    .unwrap();
+    // Authenticated response to our own Request must rebind legacy peers
+    // even when joined_at is absent and created_at ties the old binding.
+    let rejoin_request =
+        mistlib_core::signaling::nostr::build_message_event_with_sequence_and_joined_at(
+            &new_bob.codec_config,
+            &new_bob.crypto,
+            &new_bob_identity,
+            &alice_identity.public_key,
+            &data(
+                &bob_id,
+                &NodeId::broadcast(),
+                room_id,
+                SignalingType::Request,
+            ),
+            1,
+            None,
+        )
+        .unwrap();
     alice
         .process_event(rejoin_request, mpsc::channel(4).0)
         .await
@@ -622,7 +630,7 @@ async fn reconnect_survives_failed_handshakes_and_restores_subscriptions() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         let mut frames = Vec::new();
-        for _ in 0..3 {
+        loop {
             frames.push(
                 ws.next()
                     .await
@@ -632,6 +640,12 @@ async fn reconnect_survives_failed_handshakes_and_restores_subscriptions() {
                     .unwrap()
                     .to_string(),
             );
+            // Scope-refresh REQs can overtake the paced discovery EVENT.
+            // Verify subscription restoration and eventual publication rather
+            // than assuming discovery is the third websocket frame.
+            if frames.last().unwrap().starts_with("[\"EVENT\"") {
+                break;
+            }
         }
         frames
     });
@@ -648,7 +662,7 @@ async fn reconnect_survives_failed_handshakes_and_restores_subscriptions() {
         .unwrap();
     assert!(frames[0].starts_with("[\"REQ\""));
     assert!(frames[1].starts_with("[\"REQ\""));
-    assert!(frames[2].starts_with("[\"EVENT\""));
+    assert!(frames.last().unwrap().starts_with("[\"EVENT\""));
 }
 
 /// Extracts the subscription id (second array element) from a raw
@@ -1612,4 +1626,225 @@ async fn cancelled_publish_preserves_all_relay_senders() {
     for rx in [&mut first_rx, &mut stalled_rx, &mut last_rx] {
         assert_eq!(rx.try_recv().unwrap(), "next frame");
     }
+}
+
+#[tokio::test]
+async fn failed_handshake_recovery_keeps_identity_and_req_until_actual_connected() {
+    let signaler = NostrSignaler::new(NodeId("alice".into()), config());
+    let (tx, mut rx) = mpsc::channel(32);
+    signaler.senders.lock().await.push(tx);
+    signaler.set_room_id("room-courtesy").await.unwrap();
+    while rx.try_recv().is_ok() {}
+    let original = signaler.current_identity().await.public_key;
+    // Signaling ingress reports liveness before WebRTC connects. It must
+    // not arm rotation (Phase A's failed-handshake loop did so every 9s).
+    signaler.note_peer_alive(&NodeId("bob".into())).await;
+    signaler
+        .reset_session_with_reason("isolation_recovery")
+        .await
+        .unwrap();
+    assert_eq!(signaler.current_identity().await.public_key, original);
+    let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&frames[0]).unwrap()[0],
+        "EVENT"
+    );
+
+    signaler.note_peer_connected(&NodeId("bob".into()));
+    signaler
+        .reset_session_with_reason("isolation_recovery")
+        .await
+        .unwrap();
+    let rotated = signaler.current_identity().await.public_key;
+    assert_ne!(rotated, original);
+    let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(frames.len(), 3); // two replacement REQs, one discovery
+    signaler
+        .reset_session_with_reason("isolation_recovery")
+        .await
+        .unwrap();
+    assert_eq!(signaler.current_identity().await.public_key, rotated);
+    let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(frames.len(), 1);
+    // An explicit reset also consumes the previous Connected epoch. Its
+    // next failed-handshake recovery must not rotate a second time.
+    signaler.note_peer_connected(&NodeId("bob".into()));
+    signaler.reset_session().await.unwrap();
+    let explicit = signaler.current_identity().await.public_key;
+    while rx.try_recv().is_ok() {}
+    signaler
+        .reset_session_with_reason("isolation_recovery")
+        .await
+        .unwrap();
+    assert_eq!(signaler.current_identity().await.public_key, explicit);
+    signaler.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn s5_due_pair_produces_request_or_offer_after_second_nonrotating_recovery() {
+    use mistlib_core::overlay::{ActionHandler, OverlayRouter, OverlayTransport};
+    use mistlib_core::signaling::{
+        RoutedSignaler, RoutedSignalingHandler, SignalingHandler, SignalingRoute,
+    };
+    use mistlib_core::transport::{NetworkEvent, NetworkEventHandler, Transport};
+    use std::sync::{Arc, Mutex};
+    struct Noop;
+    impl ActionHandler for Noop {
+        fn handle_action(&self, _: mistlib_core::action::OverlayAction) {}
+    }
+    impl NetworkEventHandler for Noop {
+        fn on_event(&self, _: NetworkEvent) {}
+    }
+    // Exercise both the high-ID nudge and the low-ID local connect path.
+    for (local_id, peer_id, expected) in [
+        ("z", "a", SignalingType::Request),
+        ("a", "z", SignalingType::Offer),
+    ] {
+        let local = Arc::new(NostrSignaler::new(NodeId(local_id.into()), config()));
+        let peer = NostrSignaler::new(NodeId(peer_id.into()), config());
+        let room = "s5-two-recoveries";
+        let (relay_tx, mut relay_rx) = mpsc::channel(128);
+        local.senders.lock().await.push(relay_tx);
+        local.set_room_id(room).await.unwrap();
+        local.discovery_table.lock().await.bind_node(
+            peer.local_node_id.clone(),
+            peer.identity.public_key.clone(),
+            u64::MAX,
+        );
+        local
+            .exchanges
+            .lock()
+            .await
+            .progress(&peer.identity.public_key, web_time::Instant::now());
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
+        *local.retry_incoming.lock().await = Some(incoming_tx);
+        let router = Arc::new(OverlayRouter::new(
+            &mistlib_core::config::Config::new_default(),
+            Arc::new(Mutex::new(
+                mistlib_core::overlay::node_store::NodeStore::new(),
+            )),
+            local.local_node_id.clone(),
+        ));
+        let routes = Arc::new(RoutedSignaler::new(
+            local.clone(),
+            Arc::new(OverlayTransport {
+                router,
+                action_handler: Arc::new(Noop),
+            }),
+        ));
+        let transport = Arc::new(crate::transports::webrtc::WebRtcTransport::new(
+            routes.clone(),
+            local.local_node_id.clone(),
+        ));
+        transport.set_room_id(room.into());
+        routes.remember_route(&peer.local_node_id, SignalingRoute::WebSocket);
+        local.note_peer_connected(&peer.local_node_id);
+        routes
+            .reset_session_with_reason("isolation_recovery")
+            .await
+            .unwrap();
+        let identity = local.current_identity().await;
+        // Rotation itself must send a Request even though discovery progressed.
+        let frames: Vec<_> = std::iter::from_fn(|| relay_rx.try_recv().ok()).collect();
+        assert!(frames.iter().any(|frame| {
+            let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+            if v[0] != "EVENT" {
+                return false;
+            }
+            let e: NostrEvent = serde_json::from_value(v[1].clone()).unwrap();
+            decode_message_event(
+                &peer.codec_config,
+                &peer.crypto,
+                &peer.identity,
+                &peer.local_node_id,
+                &e,
+                room,
+            )
+            .is_ok_and(|d| d.data.signaling_type == SignalingType::Request)
+        }));
+        // As in S5, failed offers follow rotation and then recovery fires again.
+        routes.remember_route(&peer.local_node_id, SignalingRoute::WebSocket);
+        for _ in 0..3 {
+            transport
+                .pair_backoff
+                .lock()
+                .unwrap()
+                .started(&peer.local_node_id);
+            transport.pair_backoff.lock().unwrap().failed(
+                &peer.local_node_id,
+                web_time::Instant::now() - Duration::from_secs(60),
+                0.5,
+            );
+        }
+        routes
+            .reset_session_with_reason("isolation_recovery")
+            .await
+            .unwrap();
+        assert_eq!(
+            local.current_identity().await.public_key,
+            identity.public_key
+        );
+        while relay_rx.try_recv().is_ok() {}
+        let handler =
+            RoutedSignalingHandler::new(routes, transport.clone(), SignalingRoute::WebSocket);
+        transport.start(Arc::new(Noop)).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    Some(msg) = incoming_rx.recv() => handler.handle_message(msg).await.unwrap(),
+                    Some(frame) = relay_rx.recv() => {
+                        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                        if v[0] != "EVENT" { continue; }
+                        let e: NostrEvent = serde_json::from_value(v[1].clone()).unwrap();
+                        if decode_message_event(&peer.codec_config, &peer.crypto, &peer.identity, &peer.local_node_id, &e, room)
+                            .is_ok_and(|d| d.data.signaling_type == expected) { break; }
+                    }
+                }
+            }
+        }).await.expect("backoff must produce an actual encrypted Request/offer after the second recovery");
+        transport.close_all_peer_connections().await;
+        local.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rotation_updates_exchanges_in_place_while_receivers_are_running() {
+    use std::sync::Arc;
+    let signaler = Arc::new(NostrSignaler::new(NodeId("local".into()), config()));
+    let (tx, _rx) = mpsc::channel(128);
+    signaler.senders.lock().await.push(tx);
+    signaler.set_room_id("rotation-in-place").await.unwrap();
+    // Hold a lock acquired late in reset_session_state. A received binding
+    // inserted during that await must not be overwritten by table restoration.
+    let dedupe = signaler.dedupe.lock().await;
+    let task = {
+        let s = signaler.clone();
+        tokio::spawn(async move { s.reset_session().await })
+    };
+    tokio::task::yield_now().await;
+    let peer = NodeId("arrived-during-reset".into());
+    signaler
+        .discovery_table
+        .lock()
+        .await
+        .bind_node(peer.clone(), "fresh".into(), u64::MAX);
+    signaler
+        .exchanges
+        .lock()
+        .await
+        .request("fresh", web_time::Instant::now());
+    drop(dedupe);
+    task.await.unwrap().unwrap();
+    assert_eq!(
+        signaler
+            .discovery_table
+            .lock()
+            .await
+            .pubkey_for_node(&peer)
+            .as_deref(),
+        Some("fresh")
+    );
+    assert!(signaler.exchanges.lock().await.pending("fresh"));
+    signaler.close().await.unwrap();
 }

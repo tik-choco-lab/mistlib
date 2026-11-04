@@ -74,6 +74,9 @@ pub fn record_discovery_and_should_request(
     local_pubkey: &str,
     max_responders: usize,
 ) -> bool {
+    if discovery_table.is_superseded(&decoded.signaling_pubkey) {
+        return false;
+    }
     let local_rank = config.topology_rank(room_id, local_pubkey);
     discovery_table.insert_pubkey_with_rank(
         decoded.signaling_pubkey.clone(),

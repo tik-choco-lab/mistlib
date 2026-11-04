@@ -311,35 +311,6 @@ const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 5000;
 /// construction (see `WebRtcTransport::new`).
 const RECONNECT_COOLDOWN_MS: u64 = 3000;
 const DEFAULT_MAX_CONCURRENT_HANDSHAKES: usize = 6;
-/// `CONNECT_REQUEST` retry schedule (the higher-ID side's periodic nudge
-/// asking the lower-ID/initiator peer to send a fresh offer -- see
-/// `signaling::spawn_connect_request_retry`): starts at
-/// `CONNECT_REQUEST_RETRY_INITIAL_MS`, grows by `CONNECT_REQUEST_RETRY_MULTIPLIER`
-/// each retry, capped at `CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS` (see
-/// `backoff::exponential_backoff_ms`). Replaces the old fixed 1s interval --
-/// a fixed short interval repeated by every peer in a "cluster disconnect"
-/// resynchronizes into a retry storm instead of spreading load out.
-///
-/// The cap was originally 10s, then lowered to 4s based on a load-test A/B
-/// (fixed 1s baseline vs. 10s-cap backoff): the 10s cap improved the
-/// typical case (p50/p90 recovery time, >60s rate) but *worsened* the worst
-/// case (max recovery time 198s -> 316s) and the unrelated first-connect
-/// `attempt_ms` tail (p90 1054ms -> 1394ms, p99 3938ms -> 4834ms), while the
-/// timeout count and retry-chain-length distribution were unchanged between
-/// the two runs -- i.e. the longer cap did not change whether a retry
-/// eventually succeeds, only how long individual retries (and the
-/// signaling-channel traffic they generate) get stretched out for a peer
-/// that needs many of them. A lower cap keeps retries denser (closer to the
-/// old cadence) for the rare, hard-to-recover peers without giving up the
-/// spreading benefit that helped the common case.
-const CONNECT_REQUEST_RETRY_INITIAL_MS: u64 = 1000;
-const CONNECT_REQUEST_RETRY_MULTIPLIER: f64 = 1.5;
-const CONNECT_REQUEST_RETRY_MAX_INTERVAL_MS: u64 = 4_000;
-/// 10 sends (9 waited intervals) against the schedule above totals roughly
-/// 28s -- in the same ~30s ballpark the old `30 x 1s` fixed schedule
-/// occupied (see `backoff::tests::connect_request_default_schedule_totals_within_the_intended_ballpark`),
-/// while sending far less often at the start of a cluster disconnect.
-const DEFAULT_CONNECT_REQUEST_RETRIES: u32 = 10;
 /// Default maximum inbound silence during reconnect grace before reaping.
 /// Overridable via `MIST_WEBRTC_DISCONNECTED_GRACE_MS`, read once at
 /// construction (see `WebRtcTransport::new`). Traffic can extend grace beyond
@@ -656,6 +627,7 @@ pub(crate) mod backoff;
 pub(crate) mod conn_timing;
 pub mod connection;
 mod disconnect_grace;
+mod ice_measurement;
 mod pacing;
 pub mod peer;
 pub mod publish;
@@ -974,6 +946,8 @@ pub struct WebRtcTransport {
     /// and the full-clear path (`close_all_peer_connections`).
     pub(crate) pending_candidates_first_seen: Arc<tokio::sync::RwLock<HashMap<NodeId, Instant>>>,
     pub next_connection_attempt_id: AtomicU32,
+    pub recovery_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::RecoveryBackoff>>,
+    pub pair_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::PairBackoff>>,
     pub isolation_recovery_epoch: Arc<std::sync::atomic::AtomicU64>,
     pub sweeper_started: AtomicBool,
     pub(crate) sweeper_cancel: Mutex<Option<CancellationToken>>,
@@ -1154,6 +1128,8 @@ impl WebRtcTransport {
             disconnect_observed_at: Arc::new(StdRwLock::new(HashMap::new())),
             pending_candidates_first_seen: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             next_connection_attempt_id: AtomicU32::new(1),
+            recovery_backoff: Default::default(),
+            pair_backoff: Default::default(),
             isolation_recovery_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sweeper_started: AtomicBool::new(false),
             sweeper_cancel: Mutex::new(None),
@@ -1243,6 +1219,8 @@ impl WebRtcTransport {
             disconnect_observed_at: self.disconnect_observed_at.clone(),
             pending_candidates_first_seen: self.pending_candidates_first_seen.clone(),
             signaler: self.signaler.clone(),
+            recovery_backoff: self.recovery_backoff.clone(),
+            pair_backoff: self.pair_backoff.clone(),
             isolation_recovery_epoch: self.isolation_recovery_epoch.clone(),
             room_id: self.get_room_id(),
             local_node_id: self.local_node_id.clone(),
@@ -1819,6 +1797,73 @@ impl Transport for WebRtcTransport {
     }
 
     async fn connect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
+        self.connect_with_policy(node, false).await
+    }
+
+    async fn disconnect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
+        self.cleanup_session_with_reason(node, false, "explicit_disconnect")
+            .await;
+        self.pair_backoff.lock().unwrap().connected(node);
+        Ok(())
+    }
+
+    async fn suspect_disconnected(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
+        if !self.peer_handles().mark_suspect_disconnected(node) {
+            tracing::debug!(
+                "[CS] ignored suspect-disconnected for {} (not Connected, or already in grace)",
+                node
+            );
+        }
+        Ok(())
+    }
+
+    async fn clear_suspect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
+        if !self.peer_handles().clear_suspect(node) {
+            tracing::debug!(
+                "[CS] ignored clear-suspect for {} (no liveness-suspect grace active)",
+                node
+            );
+        }
+        Ok(())
+    }
+
+    fn get_connected_nodes(&self) -> Vec<NodeId> {
+        let states = self.connection_states.read().unwrap();
+        states
+            .iter()
+            .filter(|(_, &s)| s == ConnectionState::Connected)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+impl WebRtcTransport {
+    pub fn get_active_connection_states(&self) -> Vec<(NodeId, ConnectionState)> {
+        let states = self.connection_states.read().unwrap();
+        states
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    **s,
+                    ConnectionState::Connected
+                        | ConnectionState::Connecting
+                        | ConnectionState::Reconnecting
+                )
+            })
+            .map(|(id, s)| (id.clone(), *s))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+impl WebRtcTransport {
+    async fn connect_with_policy(
+        &self,
+        node: &NodeId,
+        response: bool,
+    ) -> mistlib_core::error::Result<()> {
         {
             let peers = self.peers.read().await;
             if peers.contains_key(node) {
@@ -1834,6 +1879,15 @@ impl Transport for WebRtcTransport {
             return self.request_lower_id_offer(node).await;
         }
 
+        if !self.pair_backoff.lock().unwrap().can_initiate(
+            node,
+            web_time::Instant::now(),
+            self.signaler.has_overlay_route(node),
+            response,
+        ) {
+            tracing::debug!("[PairBackoff] action=wait node={node} reason=admission");
+            return Ok(());
+        }
         let wait_duration = {
             let last_disconnect = self.last_disconnect_at.read().unwrap();
             last_disconnect.get(node).copied().and_then(|at| {
@@ -1895,60 +1949,4 @@ impl Transport for WebRtcTransport {
         }
         result
     }
-
-    async fn disconnect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
-        self.cleanup_session_with_reason(node, false, "explicit_disconnect")
-            .await;
-        Ok(())
-    }
-
-    async fn suspect_disconnected(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
-        if !self.peer_handles().mark_suspect_disconnected(node) {
-            tracing::debug!(
-                "[CS] ignored suspect-disconnected for {} (not Connected, or already in grace)",
-                node
-            );
-        }
-        Ok(())
-    }
-
-    async fn clear_suspect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
-        if !self.peer_handles().clear_suspect(node) {
-            tracing::debug!(
-                "[CS] ignored clear-suspect for {} (no liveness-suspect grace active)",
-                node
-            );
-        }
-        Ok(())
-    }
-
-    fn get_connected_nodes(&self) -> Vec<NodeId> {
-        let states = self.connection_states.read().unwrap();
-        states
-            .iter()
-            .filter(|(_, &s)| s == ConnectionState::Connected)
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
 }
-
-impl WebRtcTransport {
-    pub fn get_active_connection_states(&self) -> Vec<(NodeId, ConnectionState)> {
-        let states = self.connection_states.read().unwrap();
-        states
-            .iter()
-            .filter(|(_, s)| {
-                matches!(
-                    **s,
-                    ConnectionState::Connected
-                        | ConnectionState::Connecting
-                        | ConnectionState::Reconnecting
-                )
-            })
-            .map(|(id, s)| (id.clone(), *s))
-            .collect()
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod tests;

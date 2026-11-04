@@ -124,10 +124,15 @@ def build(args):
             metadata.update({"name": "@tik-choco/mistlib", "version": release_version,
                              "repository": {"type": "git", "url": "git+https://github.com/tik-choco-lab/mistlib.git"},
                              "homepage": "https://github.com/tik-choco-lab/mistlib"})
+            # wasm-pack's generated whitelist may omit imported JS modules.
+            # These snippets are runtime dependencies, not optional debug files.
+            if (pkg / "snippets").exists() and "files" in metadata:
+                metadata["files"] = sorted(set(metadata["files"]) | {"snippets"})
             (pkg / "package.json").write_text(json.dumps(metadata, indent=2) + "\n")
             result = subprocess.check_output(["npm", "pack", "--json", "--ignore-scripts", "--pack-destination", str(out)], cwd=pkg, text=True)
             packed = json.loads(result)[0]
             required = {"mistlib_wasm.js", "mistlib_wasm_bg.wasm", "mistlib_wasm.d.ts", "README.md", "LICENSE", "package.json"}
+            required.update(file.relative_to(pkg).as_posix() for file in (pkg / "snippets").rglob("*") if file.is_file())
             if not required.issubset({file["path"] for file in packed["files"]}):
                 raise ValueError("npm archive omits required files")
             tarball = out / packed["filename"]

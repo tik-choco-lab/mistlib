@@ -11,6 +11,7 @@ pub struct DiscoveryExchanges {
     peers: BTreeMap<String, Exchange>,
     retries: usize,
     sent_retries: usize,
+    budget_started: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -22,12 +23,25 @@ struct Exchange {
     evidence: (bool, u64),
     first_advertisement: Option<u64>,
     cap_logged: bool,
+    retry_window: Option<Instant>,
 }
 
 impl DiscoveryExchanges {
     /// Reserve an initial publish or a due retry before enqueueing/scheduling.
     /// Failed local enqueues still consume the budget, just like lost events.
+    fn refresh_budget(&mut self, now: Instant) {
+        let started = *self.budget_started.get_or_insert(now);
+        if now.saturating_duration_since(started)
+            >= crate::signaling::courtesy::DISCOVERY_BUDGET_WINDOW
+        {
+            self.retries = 0;
+            self.sent_retries = 0;
+            self.budget_started = Some(now);
+        }
+    }
+
     pub fn request(&mut self, pubkey: &str, now: Instant) -> bool {
+        self.refresh_budget(now);
         if let Some(peer) = self.peers.get_mut(pubkey) {
             if peer.queued || peer.progressed || now < peer.next {
                 return false;
@@ -42,6 +56,7 @@ impl DiscoveryExchanges {
                 }
                 return false;
             }
+            peer.retry_window = self.budget_started;
             peer.retries += 1;
             self.retries += 1;
             peer.next = now + retry_delay(peer.retries);
@@ -57,6 +72,7 @@ impl DiscoveryExchanges {
                 evidence: (false, 0),
                 first_advertisement: None,
                 cap_logged: false,
+                retry_window: None,
             },
         );
         true
@@ -72,6 +88,7 @@ impl DiscoveryExchanges {
         now: Instant,
         evidence: impl Fn(&str) -> (bool, u64),
     ) -> Vec<String> {
+        self.refresh_budget(now);
         let mut keys: Vec<_> = self.peers.keys().cloned().collect();
         keys.sort_by_key(|key| {
             let peer = &self.peers[key];
@@ -186,7 +203,9 @@ impl DiscoveryExchanges {
                 peer.queued = false;
                 if peer.retries > 0 {
                     peer.retries -= 1;
-                    self.retries -= 1;
+                    if peer.retry_window == self.budget_started {
+                        self.retries = self.retries.saturating_sub(1);
+                    }
                 }
                 peer.next = Instant::now();
             }
@@ -206,6 +225,7 @@ impl DiscoveryExchanges {
                     evidence: (false, 0),
                     first_advertisement: None,
                     cap_logged: false,
+                    retry_window: None,
                 },
             );
         }
@@ -217,6 +237,20 @@ impl DiscoveryExchanges {
                 );
             }
             peer.progressed = true;
+        }
+    }
+
+    pub fn cancel_queued(&mut self) {
+        for peer in self.peers.values_mut() {
+            peer.queued = false;
+        }
+    }
+
+    /// A retired identity must never regain a reservation via release/replay.
+    pub fn retire(&mut self, pubkey: &str, now: Instant) {
+        self.progress(pubkey, now);
+        if let Some(peer) = self.peers.get_mut(pubkey) {
+            peer.queued = false;
         }
     }
 
@@ -358,5 +392,28 @@ mod retry_ranking {
             !state.request(&live, now + Duration::from_secs(100)),
             "session cap remains twelve"
         );
+    }
+}
+
+#[cfg(test)]
+mod courtesy_tests {
+    use super::*;
+    #[test]
+    fn rotation_cannot_revive_node_retry_budget_but_elapsed_window_can() {
+        let now = Instant::now();
+        let mut exchanges = DiscoveryExchanges::default();
+        for i in 0..12 {
+            exchanges.request(&i.to_string(), now);
+        }
+        assert_eq!(exchanges.poll(now + Duration::from_secs(2)).len(), 12);
+        exchanges.cancel_queued();
+        exchanges.request("new-identity", now + Duration::from_secs(3));
+        assert!(exchanges.poll(now + Duration::from_secs(10)).is_empty());
+        assert!(!exchanges
+            .poll(now + crate::signaling::courtesy::DISCOVERY_BUDGET_WINDOW)
+            .is_empty());
+        exchanges.retire("new-identity", now);
+        exchanges.release("new-identity");
+        assert!(!exchanges.request("new-identity", now + Duration::from_secs(1200)));
     }
 }

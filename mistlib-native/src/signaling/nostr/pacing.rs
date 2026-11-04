@@ -75,12 +75,7 @@ impl NostrSignaler {
                     continue;
                 }
                 let result = signaler
-                    .publish_reserved_request(
-                        &item.pubkey,
-                        &room,
-                        epoch,
-                        item.priority == DiscoveryPriority::Probe,
-                    )
+                    .publish_reserved_request(&item.pubkey, &room, epoch, item.priority)
                     .await;
                 match result {
                     Ok(true) => signaler.exchanges.lock().await.log_sent(&item.pubkey),

@@ -7,8 +7,39 @@ use async_trait::async_trait;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait Signaler: HostSendSync {
     async fn send_signaling(&self, to: &NodeId, msg: MessageContent) -> Result<()>;
+    /// Called only after a transport reaches Connected, never for signaling traffic.
+    fn note_peer_connected(&self, _peer: &NodeId) {}
+
+    /// True only when this send currently has an overlay next hop. A remembered
+    /// ingress or merely having some connected peer does not suffice.
+    fn has_overlay_route(&self, _peer: &NodeId) -> bool {
+        false
+    }
+
+    /// A live binding token changes when fresh discovery/Request evidence arrives.
+    /// Legacy signalers have no expiring binding table.
+    async fn peer_retry_token(&self, _peer: &NodeId) -> Option<String> {
+        Some(String::new())
+    }
+
+    /// Ask the local transport dispatcher to call connect for a known peer.
+    /// This is local-only; it never synthesizes a relay event.
+    async fn retry_peer(&self, _peer: &NodeId) -> Result<()> {
+        Err(crate::error::MistError::Signaling(
+            "local retry unavailable".into(),
+        ))
+    }
+
+    /// Local transport teardown invalidates queued negotiation retries.
+    fn end_connection_attempt(&self, _peer: &NodeId) {}
+
     async fn reset_session(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Adds diagnostic context without changing the reset operation.
+    async fn reset_session_with_reason(&self, _reason: &str) -> Result<()> {
+        self.reset_session().await
     }
 
     /// Registers a hook called when the signaling session is reestablished.

@@ -1,5 +1,5 @@
 use super::backend::{BlockStore, MetaStore, PeerResolver, SelfPositionSource};
-use super::cid::{compute_cid, verify_cid, MULTICODEC_DAG_CBOR, MULTICODEC_RAW};
+use super::cid::{MULTICODEC_DAG_CBOR, MULTICODEC_RAW};
 use super::pin::{PinRegistry, PIN_REGISTRY_META_KEY};
 use super::types::{FileManifest, StorageManager, CHUNK_SIZE};
 use crate::config::{StorageConfig, StorageTransferConfig};
@@ -183,7 +183,7 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         let mut writes = FuturesUnordered::new();
 
         for chunk in data.chunks(CHUNK_SIZE) {
-            let cid = compute_cid(chunk, MULTICODEC_RAW);
+            let cid = self.store.compute_cid(chunk, MULTICODEC_RAW).await?;
             chunk_cids.push(cid.clone());
 
             writes.push(async move {
@@ -222,7 +222,10 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         };
         let manifest_bytes =
             serde_cbor::to_vec(&manifest).map_err(|e| MistError::Serialization(e.to_string()))?;
-        let root_cid = compute_cid(&manifest_bytes, MULTICODEC_DAG_CBOR);
+        let root_cid = self
+            .store
+            .compute_cid(&manifest_bytes, MULTICODEC_DAG_CBOR)
+            .await?;
 
         self.store.store_block(&root_cid, &manifest_bytes).await?;
         {
@@ -596,7 +599,7 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
                     cid
                 ))
             })?;
-        if !verify_cid(cid, &data, codec) {
+        if self.store.compute_cid(&data, codec).await? != cid {
             warn!("StorageEngine: Hash mismatch for {}", cid);
             return Err(MistError::Internal("Hash mismatch".into()));
         }

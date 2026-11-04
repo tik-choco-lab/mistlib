@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use mistlib_core::config::NostrSignalingConfig;
+use mistlib_core::signaling::nostr::measurement::{signaling_label, NostrMeasurements};
 use mistlib_core::signaling::nostr::{
     build_discovery_event_with_joined_at, build_message_event_with_sequence_and_joined_at,
     event_frame_json, next_outgoing_sequence as next_nostr_sequence, random_subscription_id,
@@ -54,8 +55,13 @@ pub(super) const RELAY_IDLE_THRESHOLD_MS: u32 = 400;
 
 #[derive(Clone)]
 pub struct WasmNostrSignaler {
+    governor_worker: Arc<std::sync::atomic::AtomicBool>,
+    governor: Arc<std::sync::Mutex<mistlib_core::signaling::nostr::governor::PublishGovernor>>,
+    identity_recovery: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::IdentityRecovery>>,
+    measurements: Arc<std::sync::Mutex<NostrMeasurements>>,
     relays: Vec<String>,
     relay_list_url: Option<String>,
+    retry_incoming: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MessageContent>>>>,
     local_node_id: NodeId,
     identity: TemporarySignalingIdentity,
     rotated_identity: Arc<Mutex<Option<TemporarySignalingIdentity>>>,
@@ -98,8 +104,13 @@ impl WasmNostrSignaler {
         let dedupe_ttl = Duration::from_secs(config.ttl_seconds.saturating_mul(2).max(1));
         let relay_list_url = config.effective_relay_list_url().map(str::to_owned);
         Self {
+            governor_worker: Default::default(),
+            governor: Default::default(),
+            identity_recovery: Default::default(),
+            measurements: Default::default(),
             relays: config.relays,
             relay_list_url,
+            retry_incoming: Default::default(),
             local_node_id,
             identity: TemporarySignalingIdentity::generate(),
             rotated_identity: Arc::new(Mutex::new(None)),
@@ -140,6 +151,11 @@ impl WasmNostrSignaler {
     }
 
     fn clear_session_state(&self) {
+        self.reset_session_state(false);
+    }
+
+    fn reset_session_state(&self, preserve_bindings: bool) {
+        self.governor.lock().unwrap().reset_session();
         *self.session_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         *self
             .connected_peers
@@ -147,12 +163,14 @@ impl WasmNostrSignaler {
             .unwrap_or_else(|e| e.into_inner()) = 0;
         *self.outbox.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryOutbox::default();
         tracing::info!("Nostr discovery retries stopped reason=session change");
-        *self.exchanges.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryExchanges::default();
+        if preserve_bindings {
+            self.exchanges.lock().unwrap().cancel_queued();
+        } else {
+            *self.exchanges.lock().unwrap() = DiscoveryExchanges::default();
+            self.discovery_table.lock().unwrap().clear();
+        }
         *self.bootstrap.lock().unwrap_or_else(|e| e.into_inner()) = DiscoveryBootstrap::default();
-        self.discovery_table
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+
         self.dedupe
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -220,10 +238,11 @@ impl WasmNostrSignaler {
     }
 
     fn mark_local_joined(&self) {
-        *self
+        let mut joined = self
             .local_joined_at
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(current_unix_millis());
+            .unwrap_or_else(|e| e.into_inner());
+        *joined = Some(current_unix_millis().max(joined.unwrap_or(0).saturating_add(1)));
     }
 
     fn publish_frame(&self, frame: String) -> mistlib_core::error::Result<()> {
@@ -238,17 +257,28 @@ impl WasmNostrSignaler {
             ));
         }
         let mut sent = false;
-        for ws in sockets.iter() {
+        for ws in &sockets {
             if ws.ready_state() == WebSocket::OPEN {
-                ws.send_with_str(&frame).map_err(|e| {
-                    mistlib_core::error::MistError::Network(format!(
-                        "WasmNostrSignaler: relay send failed: {:?}",
-                        e
-                    ))
-                })?;
+                let relay = self.relay_key(ws)?;
+                let control = self.governor.lock().unwrap().enqueue(
+                    &relay,
+                    frame.clone(),
+                    web_time::Instant::now(),
+                );
+                if let Some(frame) = control {
+                    ws.send_with_str(&frame).map_err(|e| {
+                        mistlib_core::error::MistError::Network(format!("relay send failed: {e:?}"))
+                    })?;
+                    self.measurements.lock().unwrap().sent(
+                        &frame,
+                        &relay,
+                        web_time::Instant::now(),
+                    );
+                }
                 sent = true;
             }
         }
+        self.ensure_governor_worker();
         if !sent {
             return Err(mistlib_core::error::MistError::Signaling(
                 "WasmNostrSignaler: relay websocket is not open".to_string(),
@@ -256,6 +286,50 @@ impl WasmNostrSignaler {
         }
         STATS.add_send(frame.len() as u64);
         Ok(())
+    }
+
+    fn ensure_governor_worker(&self) {
+        use std::sync::atomic::Ordering;
+        if self.governor_worker.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let signaler = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(25).await;
+                let sockets = signaler.sockets.lock().unwrap().clone();
+                if sockets.is_empty() && !signaler.governor.lock().unwrap().has_pending() {
+                    signaler.governor_worker.store(false, Ordering::SeqCst);
+                    return;
+                }
+                for ws in sockets {
+                    let Ok(relay) = signaler.relay_key(&ws) else {
+                        continue;
+                    };
+                    if ws.ready_state() != WebSocket::OPEN {
+                        continue;
+                    }
+                    loop {
+                        let frame = signaler
+                            .governor
+                            .lock()
+                            .unwrap()
+                            .poll(&relay, web_time::Instant::now());
+                        let Some(frame) = frame else {
+                            break;
+                        };
+                        if ws.send_with_str(&frame).is_err() {
+                            break;
+                        }
+                        signaler.measurements.lock().unwrap().sent(
+                            &frame,
+                            &relay,
+                            web_time::Instant::now(),
+                        );
+                    }
+                }
+            }
+        });
     }
 
     fn publish_event(
@@ -274,6 +348,18 @@ impl WasmNostrSignaler {
             room_id,
             self.local_joined_at(),
         )?;
+        self.measurements.lock().unwrap().register(
+            &event,
+            "discovery",
+            "broadcast",
+            web_time::Instant::now(),
+        );
+        tracing::debug!(
+            "[NostrIdentity] node={} pubkey={} joined_at={}",
+            self.local_node_id.0,
+            identity.public_key,
+            self.local_joined_at().unwrap_or(0)
+        );
         self.publish_event(&event)
     }
 
@@ -281,6 +367,15 @@ impl WasmNostrSignaler {
         &self,
         receiver_pubkey: &str,
         data: &SignalingData,
+    ) -> mistlib_core::error::Result<()> {
+        self.publish_message_observed(receiver_pubkey, data, None)
+    }
+
+    fn publish_message_observed(
+        &self,
+        receiver_pubkey: &str,
+        data: &SignalingData,
+        priority: Option<DiscoveryPriority>,
     ) -> mistlib_core::error::Result<()> {
         // Locally-synthesized signals (currently only `Rejoin`) must never
         // reach a relay: they exist purely to notify our own transport layer
@@ -290,6 +385,27 @@ impl WasmNostrSignaler {
         // (including the internal `Request` re-announce path) funnels
         // through.
         if data.signaling_type.is_local_only() {
+            return Ok(());
+        }
+        if self
+            .discovery_table
+            .lock()
+            .unwrap()
+            .is_superseded(receiver_pubkey)
+        {
+            if data.signaling_type == SignalingType::Request && priority.is_none() {
+                tracing::info!(
+                    "[PairBackoff] action=skip node={} reason=binding_retired",
+                    data.receiver_id
+                );
+                return Err(mistlib_core::error::MistError::Signaling(
+                    "request binding retired".into(),
+                ));
+            }
+            tracing::debug!(
+                "[DiscoveryRetired] action=drop reason=outbound pubkey={}",
+                receiver_pubkey
+            );
             return Ok(());
         }
         let sequence = self.next_outgoing_sequence(receiver_pubkey);
@@ -303,6 +419,29 @@ impl WasmNostrSignaler {
             sequence,
             self.local_joined_at(),
         )?;
+        let label = match priority {
+            Some(DiscoveryPriority::Reply) => "request_reply",
+            Some(DiscoveryPriority::Probe) => "request_probe",
+            Some(DiscoveryPriority::Ordinary) => "request_ordinary",
+            None => signaling_label(&data.signaling_type),
+        };
+        self.measurements.lock().unwrap().register(
+            &event,
+            label,
+            receiver_pubkey,
+            web_time::Instant::now(),
+        );
+        {
+            let mut governor = self.governor.lock().unwrap();
+            governor.bind_peer(&data.receiver_id.0, receiver_pubkey);
+            governor.register(
+                &event.id,
+                event_frame_json(&event)?,
+                label,
+                receiver_pubkey,
+                web_time::Instant::now(),
+            );
+        }
         self.publish_event(&event)
     }
 
@@ -335,6 +474,7 @@ impl WasmNostrSignaler {
         &self,
         receiver_pubkey: &str,
         room_id: &str,
+        priority: DiscoveryPriority,
     ) -> mistlib_core::error::Result<()> {
         let request = SignalingData {
             sender_id: self.local_node_id.clone(),
@@ -343,7 +483,7 @@ impl WasmNostrSignaler {
             data: String::new(),
             signaling_type: SignalingType::Request,
         };
-        self.publish_message_to_pubkey(receiver_pubkey, &request)
+        self.publish_message_observed(receiver_pubkey, &request, Some(priority))
     }
 
     fn set_room_id(&self, room_id: &str) -> mistlib_core::error::Result<()> {
@@ -478,6 +618,14 @@ impl Signaler for WasmNostrSignaler {
     /// lapses after `ttl_seconds`, and the next relay fallback (ICE restart,
     /// reconnect after a blip) is rejected in one direction only. See
     /// `Signaler::note_peer_alive`.
+    fn note_peer_connected(&self, _peer: &NodeId) {
+        self.identity_recovery.lock().unwrap().connected();
+    }
+
+    fn end_connection_attempt(&self, peer: &NodeId) {
+        self.governor.lock().unwrap().end_peer_attempt(&peer.0);
+    }
+
     async fn note_peer_alive(&self, peer: &NodeId) {
         let pubkey = self
             .discovery_table
@@ -494,6 +642,32 @@ impl Signaler for WasmNostrSignaler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .touch_node(peer, self.codec_config.ttl_seconds);
+    }
+
+    async fn peer_retry_token(&self, peer: &NodeId) -> Option<String> {
+        self.discovery_table.lock().unwrap().retry_token(peer)
+    }
+
+    async fn retry_peer(&self, peer: &NodeId) -> mistlib_core::error::Result<()> {
+        if self.peer_retry_token(peer).await.is_none() {
+            return Err(mistlib_core::error::MistError::Signaling(
+                "binding expired".into(),
+            ));
+        }
+        let room_id = self.room_id().unwrap_or_default();
+        let tx = self.retry_incoming.lock().unwrap().clone().ok_or_else(|| {
+            mistlib_core::error::MistError::Signaling("local dispatcher unavailable".into())
+        })?;
+        let message = MessageContent::Data(mistlib_core::signaling::SignalingData {
+            sender_id: peer.clone(),
+            receiver_id: self.local_node_id.clone(),
+            room_id,
+            data: String::new(),
+            signaling_type: SignalingType::Request,
+        });
+        tx.send(message).map_err(|e| {
+            mistlib_core::error::MistError::Signaling(format!("local retry enqueue: {e}"))
+        })
     }
 
     async fn send_signaling(
@@ -537,6 +711,11 @@ impl Signaler for WasmNostrSignaler {
     }
 
     async fn maintain_bootstrap(&self, connected_peers: usize) {
+        self.measurements.lock().unwrap().report(
+            &self.local_node_id.0,
+            web_time::Instant::now(),
+            false,
+        );
         let previous_connected = {
             let mut count = self
                 .connected_peers
@@ -544,6 +723,14 @@ impl Signaler for WasmNostrSignaler {
                 .unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *count, connected_peers)
         };
+        if self
+            .governor
+            .lock()
+            .unwrap()
+            .suspended(web_time::Instant::now())
+        {
+            return;
+        }
         let Some(room_id) = self.room_id() else {
             return;
         };
@@ -622,6 +809,10 @@ impl Signaler for WasmNostrSignaler {
     }
 
     async fn reset_session(&self) -> mistlib_core::error::Result<()> {
+        self.reset_session_with_reason("other").await
+    }
+
+    async fn reset_session_with_reason(&self, reason: &str) -> mistlib_core::error::Result<()> {
         let Some(room_id) = self
             .room_id
             .lock()
@@ -630,21 +821,52 @@ impl Signaler for WasmNostrSignaler {
         else {
             return Ok(());
         };
+        let had_connection = self.identity_recovery.lock().unwrap().take_rotation();
+        let rotate = reason != "isolation_recovery" || had_connection;
+        tracing::info!(
+            "[IdentityRecovery] action={} reason={reason}",
+            if rotate { "rotate" } else { "skip" }
+        );
+        if !rotate {
+            return self.publish_discovery(&room_id);
+        }
+        tracing::info!("[NostrReset] node={} reason={reason}", self.local_node_id.0);
+        self.measurements.lock().unwrap().reset();
         self.cancel_discovery_refresh();
         *self
             .rotated_identity
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(TemporarySignalingIdentity::generate());
-        self.clear_session_state();
+        self.reset_session_state(true);
         self.mark_local_joined();
         // Replace the `#p`-filtered relay subscription immediately after
         // identity rotation so direct signaling to the new pubkey is visible.
         self.subscribe_room(&room_id)?;
         self.spawn_discovery_refresh(room_id.clone());
-        self.publish_discovery(&room_id)
+        self.publish_discovery(&room_id)?;
+        let bindings = self.discovery_table.lock().unwrap().bindings();
+        for (node, pubkey) in bindings {
+            let request = mistlib_core::signaling::SignalingData {
+                sender_id: self.local_node_id.clone(),
+                receiver_id: node.clone(),
+                room_id: room_id.clone(),
+                data: String::new(),
+                signaling_type: SignalingType::Request,
+            };
+            if let Err(err) = self.publish_message_to_pubkey(&pubkey, &request) {
+                tracing::info!("[PairBackoff] action=send_failed node={node} reason=rotation_request error={err}");
+            }
+        }
+        Ok(())
     }
 
     async fn close(&self) -> mistlib_core::error::Result<()> {
+        self.retry_incoming.lock().unwrap().take();
+        self.measurements.lock().unwrap().report(
+            &self.local_node_id.0,
+            web_time::Instant::now(),
+            true,
+        );
         self.cancel_discovery_refresh();
         self.cancel_relay_keepalive();
         self.next_reconnect_epoch();

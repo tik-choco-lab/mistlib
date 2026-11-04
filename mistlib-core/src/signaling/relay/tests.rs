@@ -111,6 +111,30 @@ fn make_relay(
 }
 
 #[test]
+fn retry_exception_requires_a_live_next_hop_not_a_remembered_ingress() {
+    let (relay, router) = make_relay(
+        Arc::new(RecordingActionHandler::default()),
+        Arc::new(RecordingSignaler::default()),
+    );
+    let target = NodeId("target".into());
+    let hop = NodeId("hop".into());
+    relay.remember_route(&target, SignalingRoute::Overlay);
+    assert!(!relay.has_overlay_route(&target));
+    let mut table = router.routing_table.lock().unwrap();
+    table.on_connected(hop.clone());
+    drop(table);
+    assert!(!relay.has_overlay_route(&target));
+    router
+        .routing_table
+        .lock()
+        .unwrap()
+        .add_route(target.clone(), hop.clone());
+    assert!(relay.has_overlay_route(&target));
+    router.routing_table.lock().unwrap().on_disconnected(&hop);
+    assert!(!relay.has_overlay_route(&target));
+}
+
+#[test]
 fn server_signaling_uses_bootstrap_route() {
     let handler = Arc::new(RecordingActionHandler::default());
     let bootstrap = Arc::new(RecordingSignaler::default());
@@ -381,4 +405,50 @@ fn liveness_is_not_reported_for_messages_without_a_sender() {
         .unwrap();
 
     assert!(bootstrap.alive.lock().unwrap().is_empty());
+}
+
+#[test]
+fn s5_pair_retry_survives_second_isolation_recovery_without_new_ingress() {
+    use crate::signaling::courtesy::{IdentityRecovery, PairBackoff};
+    use web_time::{Duration, Instant};
+    let bootstrap = Arc::new(RecordingSignaler::default());
+    let (relay, _) = make_relay(
+        Arc::new(RecordingActionHandler::default()),
+        bootstrap.clone(),
+    );
+    let local = NodeId("z".into());
+    let peer = NodeId("a".into());
+    relay.remember_route(&peer, SignalingRoute::WebSocket);
+    let mut identity = IdentityRecovery::default();
+    identity.connected();
+    assert!(identity.take_rotation());
+    futures::executor::block_on(relay.reset_session_with_reason("isolation_recovery")).unwrap();
+    // Rotation traffic re-establishes ingress, as in the measured t=18/34s attempts.
+    relay.remember_route(&peer, SignalingRoute::WebSocket);
+    let now = Instant::now();
+    let mut pairs = PairBackoff::default();
+    for seconds in [0, 6, 12] {
+        pairs.started(&peer);
+        pairs.failed(&peer, now + Duration::from_secs(seconds), 0.5);
+    }
+    assert!(!identity.take_rotation());
+    futures::executor::block_on(relay.reset_session_with_reason("isolation_recovery")).unwrap();
+    // No new Request/discovery ingress follows the second recovery.
+    for seconds in [24, 84, 144, 204] {
+        let due = pairs.poll_nudges(
+            &local,
+            now + Duration::from_secs(seconds),
+            0.5,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(due, vec![peer.clone()]);
+        let MessageContent::Data(mut data) = signaling_msg("z", "a") else {
+            unreachable!()
+        };
+        data.signaling_type = SignalingType::Request;
+        futures::executor::block_on(relay.send_signaling(&peer, MessageContent::Data(data)))
+            .expect("due CONNECT_REQUEST must reach bootstrap after no-rotation recovery");
+    }
+    assert_eq!(bootstrap.sent.lock().unwrap().len(), 4);
 }

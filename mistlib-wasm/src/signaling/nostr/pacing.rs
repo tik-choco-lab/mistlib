@@ -94,7 +94,7 @@ impl WasmNostrSignaler {
                 {
                     continue;
                 }
-                match signaler.publish_reserved_request(&item.pubkey, &room) {
+                match signaler.publish_reserved_request(&item.pubkey, &room, item.priority) {
                     Ok(()) => signaler
                         .exchanges
                         .lock()

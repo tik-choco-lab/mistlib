@@ -770,7 +770,7 @@ async fn second_takeover_within_the_rate_limit_window_is_refused() {
 /// to `sender` ("zzz") -- a young `connect_started_at` entry, exactly what
 /// `connect_inner` records right after acquiring its handshake permit -- when
 /// a `CONNECT_REQUEST` from `sender` arrives (the higher-ID side's
-/// `CONNECT_REQUEST_RETRY_INITIAL_MS` 1s nudge landing squarely inside the
+/// first nudge landing squarely inside the
 /// dial, since fresh cross-host handshakes take >1s at p90 under load). This
 /// must NOT tear the in-flight attempt down: with the guard, the request is
 /// just a harmless no-op nudge (mirroring `Transport::connect`'s own

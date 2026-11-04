@@ -27,8 +27,6 @@ use webrtc::track::track_remote::TrackRemote;
 
 #[cfg(test)]
 const ISOLATION_RECOVERY_DELAY_MS: u64 = 10;
-#[cfg(not(test))]
-const ISOLATION_RECOVERY_DELAY_MS: u64 = 3000;
 
 /// Upper bound on not-yet-sent messages buffered per peer in its
 /// [`Peer::spawn_send_queue`] drainer -- both while waiting for an in-order
@@ -216,6 +214,7 @@ pub struct MediaTrackEvent {
 }
 
 pub struct Peer {
+    pub(crate) ice_measurements: Arc<super::ice_measurement::IceMeasurements>,
     pub(super) pacing: Option<Arc<super::pacing::NativePacing>>,
     pub(crate) unordered_capability:
         mistlib_core::transport::reliable_unordered::ReliableUnorderedCapability,
@@ -346,6 +345,8 @@ pub struct PeerSharedHandles {
     /// `WebRtcTransport::pending_candidates_first_seen`'s doc comment.
     pub pending_candidates_first_seen: Arc<RwLock<HashMap<NodeId, Instant>>>,
     pub signaler: Arc<dyn Signaler>,
+    pub recovery_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::RecoveryBackoff>>,
+    pub pair_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::PairBackoff>>,
     pub isolation_recovery_epoch: Arc<AtomicU64>,
     /// The room this transport belongs to (SPEC-15): each session owns its
     /// own `WebRtcTransport`, so this never changes over these handles'
@@ -614,8 +615,17 @@ impl PeerSharedHandles {
         if !states.contains_key(node) {
             return false;
         }
+        let isolated_before = !states.values().any(|s| *s == ConnectionState::Connected);
         states.insert(node.clone(), state);
         if state == ConnectionState::Connected {
+            self.signaler.note_peer_connected(node);
+            self.recovery_backoff.lock().unwrap().connected();
+            self.pair_backoff.lock().unwrap().connection_established(
+                node,
+                isolated_before,
+                web_time::Instant::now(),
+                rand::random(),
+            );
             let recovered = self
                 .disconnected_since
                 .write()
@@ -1154,6 +1164,22 @@ impl PeerSharedHandles {
         let had_session_state =
             had_attempt || had_request || had_state || had_peer || had_pending_candidates;
         if had_session_state {
+            self.signaler.end_connection_attempt(node);
+            // A deliberate replacement is not a new failed ICE attempt.
+            // Preserve any earlier failure budget, but do not manufacture
+            // a cooldown that would block the cooperating Request/Offer.
+            if !matches!(
+                reason,
+                "remote_connect_request_takeover"
+                    | "remote_new_offer_takeover"
+                    | "explicit_disconnect"
+            ) {
+                self.pair_backoff.lock().unwrap().failed(
+                    node,
+                    web_time::Instant::now(),
+                    rand::random(),
+                );
+            }
             let now = std::time::Instant::now();
             let mut last_disconnect = self.last_disconnect_at.write().unwrap();
             last_disconnect.insert(node.clone(), now);
@@ -1207,20 +1233,50 @@ impl PeerSharedHandles {
         true
     }
 
-    fn schedule_isolation_recovery(&self) {
-        let expected_epoch = self
-            .isolation_recovery_epoch
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
+    pub(super) fn schedule_isolation_recovery(&self) {
+        let delay = self.recovery_backoff.lock().unwrap().delay(rand::random());
+        #[cfg(not(test))]
+        let delay_ms = delay.as_millis() as u64;
+        // Keep adapter scheduling tests short; core tests verify real elapsed time.
+        #[cfg(test)]
+        let delay_ms = {
+            let _ = delay;
+            ISOLATION_RECOVERY_DELAY_MS
+        };
+
+        let epoch = self.isolation_recovery_epoch.load(Ordering::SeqCst);
+        if epoch % 2 == 1
+            || self
+                .isolation_recovery_epoch
+                .compare_exchange(
+                    epoch,
+                    epoch.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+        {
+            tracing::info!("[IsolationRecovery] action=skip reason=already_scheduled");
+            return;
+        }
+        let expected_epoch = epoch.wrapping_add(1);
+        tracing::info!("[IsolationRecovery] action=scheduled delay_ms={delay_ms}");
         let recovery_epoch = self.isolation_recovery_epoch.clone();
         let connection_states = self.connection_states.clone();
         let signaler = self.signaler.clone();
+        let backoff = self.recovery_backoff.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                ISOLATION_RECOVERY_DELAY_MS,
-            ))
-            .await;
-            if recovery_epoch.load(Ordering::SeqCst) != expected_epoch {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if recovery_epoch
+                .compare_exchange(
+                    expected_epoch,
+                    expected_epoch.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                tracing::info!("[IsolationRecovery] action=skip reason=superseded");
                 return;
             }
             let isolated = connection_states.read().unwrap().values().all(|state| {
@@ -1232,9 +1288,19 @@ impl PeerSharedHandles {
                 )
             });
             if !isolated {
+                tracing::info!("[IsolationRecovery] action=skip reason=active_peer");
                 return;
             }
-            if let Err(err) = signaler.reset_session().await {
+            backoff.lock().unwrap().fired();
+            tracing::info!(
+                "[IsolationRecovery] action=backoff_extend delay_ms={}",
+                backoff.lock().unwrap().delay(0.5).as_millis()
+            );
+            tracing::info!("[IsolationRecovery] action=fire reason=isolation_recovery");
+            if let Err(err) = signaler
+                .reset_session_with_reason("isolation_recovery")
+                .await
+            {
                 tracing::warn!("isolated signaling session reset failed: {:?}", err);
             }
         });
@@ -1491,6 +1557,12 @@ impl Peer {
 
     fn detach_peer_handlers(&self) {
         self.pc.on_ice_candidate(Box::new(|_| Box::pin(async {})));
+        self.pc
+            .on_ice_connection_state_change(Box::new(|_| Box::pin(async {})));
+        self.pc
+            .on_ice_gathering_state_change(Box::new(|_| Box::pin(async {})));
+        self.pc
+            .on_signaling_state_change(Box::new(|_| Box::pin(async {})));
         self.pc.on_data_channel(Box::new(|_| Box::pin(async {})));
         self.pc
             .on_peer_connection_state_change(Box::new(|_| Box::pin(async {})));
@@ -1536,6 +1608,7 @@ impl Peer {
         handles: PeerSharedHandles,
         media_tx: Option<mpsc::UnboundedSender<MediaTrackEvent>>,
     ) -> crate::error::Result<()> {
+        self.setup_ice_state_observers(remote_id.clone());
         self.setup_ice_candidate_handler(remote_id.clone(), signaler, local_id, room_id);
         self.setup_data_channel_handler(remote_id.clone(), event_tx, handles.clone());
         self.setup_track_handler(remote_id.clone(), media_tx);
@@ -1573,6 +1646,59 @@ impl Peer {
             }));
     }
 
+    fn setup_ice_state_observers(&self, remote: NodeId) {
+        let id = self.ice_measurements.id;
+        tracing::debug!("[IceState] peer={} pc_id={id} kind=created", remote.0);
+        let peer = remote.clone();
+        self.pc
+            .on_ice_connection_state_change(Box::new(move |state| {
+                tracing::info!(
+                    "[IceState] peer={} pc_id={id} kind=connection state={state:?}",
+                    peer.0
+                );
+                Box::pin(async {})
+            }));
+        let peer = remote.clone();
+        self.pc
+            .on_ice_gathering_state_change(Box::new(move |state| {
+                tracing::info!(
+                    "[IceState] peer={} pc_id={id} kind=gathering state={state:?}",
+                    peer.0
+                );
+                Box::pin(async {})
+            }));
+        self.pc.on_signaling_state_change(Box::new(move |state| {
+            tracing::info!(
+                "[IceState] peer={} pc_id={id} kind=signaling state={state:?}",
+                remote.0
+            );
+            Box::pin(async {})
+        }));
+    }
+
+    pub(crate) async fn apply_candidate_observed(
+        &self,
+        remote: &NodeId,
+        candidate: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit,
+        source: &str,
+    ) -> webrtc::error::Result<()> {
+        let kind = super::ice_measurement::candidate_type(&candidate.candidate).to_owned();
+        let result = self.pc.add_ice_candidate(candidate).await;
+        let count = if result.is_ok() {
+            &self.ice_measurements.applied
+        } else {
+            &self.ice_measurements.apply_failed
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            "[IceCandidate] peer={} pc_id={} action=apply source={source} type={kind} success={}",
+            remote.0,
+            self.ice_measurements.id,
+            result.is_ok()
+        );
+        result
+    }
+
     fn setup_ice_candidate_handler(
         self: &Arc<Self>,
         remote_id: NodeId,
@@ -1580,9 +1706,11 @@ impl Peer {
         local_id: NodeId,
         room_id: String,
     ) {
+        let metrics = self.ice_measurements.clone();
         let pc_weak = Arc::downgrade(&self.pc);
         self.pc.on_ice_candidate(Box::new(
             move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
+                let metrics = metrics.clone();
                 let signaler = signaler.clone();
                 let local_id = local_id.clone();
                 let remote_id = remote_id.clone();
@@ -1597,6 +1725,13 @@ impl Peer {
                     let Some(cand) = candidate else { return };
                     let Ok(json) = cand.to_json() else { return };
 
+                    metrics.generated.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        "[IceCandidate] peer={} pc_id={} action=generated type={}",
+                        remote_id.0,
+                        metrics.id,
+                        super::ice_measurement::candidate_type(&json.candidate)
+                    );
                     let data = serde_json::to_string(&json).unwrap_or_default();
                     let msg = MessageContent::Data(SignalingData {
                         sender_id: local_id,
@@ -1605,8 +1740,15 @@ impl Peer {
                         data,
                         signaling_type: SignalingType::Candidate,
                     });
-                    let _ = send_signaling_with_retry(&signaler, &remote_id, &msg, "IceCandidate")
-                        .await;
+                    let result =
+                        send_signaling_with_retry(&signaler, &remote_id, &msg, "IceCandidate")
+                            .await;
+                    tracing::debug!(
+                        "[IceCandidate] peer={} pc_id={} action=send success={}",
+                        remote_id.0,
+                        metrics.id,
+                        result.is_ok()
+                    );
                 })
             },
         ));
@@ -1880,6 +2022,8 @@ impl Peer {
                             crate::mem::record_peer_cleaned();
 
                             if had_state {
+                                handles_cb.signaler.end_connection_attempt(&remote_id_cb_2);
+                                handles_cb.pair_backoff.lock().unwrap().failed(&remote_id_cb_2, web_time::Instant::now(), rand::random());
                                 // `[ConnTiming]` instrumentation: this path
                                 // bypasses `cleanup_session_impl` entirely
                                 // (see the comment there), so it emits its
@@ -1939,6 +2083,7 @@ impl Peer {
             handles.handshake_permits.clone(),
             handles.connect_started_at.clone(),
             handles.disconnect_observed_at.clone(),
+            handles.clone(),
             cancel_token.clone(),
             room_id,
         );
@@ -1987,10 +2132,12 @@ impl Peer {
         handshake_permits: Arc<StdRwLock<HashMap<NodeId, OwnedSemaphorePermit>>>,
         connect_started_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
         disconnect_observed_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+        handles: PeerSharedHandles,
         cancel_token: CancellationToken,
         room_id: String,
     ) {
         dc.on_open(Box::new(move || {
+            let handles = handles.clone();
             let remote_id = remote_id.clone();
             let states = states.clone();
             let disconnected_since = disconnected_since.clone();
@@ -2021,7 +2168,11 @@ impl Peer {
                     return;
                 }
                 let already_connected = matches!(lock.get(&remote_id), Some(ConnectionState::Connected));
+                let isolated_before = !lock.values().any(|s| *s == ConnectionState::Connected);
                 lock.insert(remote_id.clone(), ConnectionState::Connected);
+                handles.signaler.note_peer_connected(&remote_id);
+                handles.recovery_backoff.lock().unwrap().connected();
+                handles.pair_backoff.lock().unwrap().connection_established(&remote_id, isolated_before, web_time::Instant::now(), rand::random());
                 let total = lock.len();
                 drop(lock);
                 disconnected_since.write().unwrap().remove(&remote_id);
@@ -2115,6 +2266,7 @@ impl Peer {
             if !cancel_token.is_cancelled() {
                 handles.schedule_isolation_recovery();
             }
+            let handles = handles.clone();
             Box::pin(async move {
                 if cancel.is_cancelled() {
                     return;
@@ -2131,6 +2283,12 @@ impl Peer {
                 let peer =
                     remove_peer_if_current(&peers, &send_queues, &remote_id, &peer_weak).await;
                 let Some(peer) = peer else { return };
+                handles.signaler.end_connection_attempt(&remote_id);
+                handles.pair_backoff.lock().unwrap().failed(
+                    &remote_id,
+                    web_time::Instant::now(),
+                    rand::random(),
+                );
                 {
                     let mut lock = attempts.write().unwrap();
                     lock.remove(&remote_id);

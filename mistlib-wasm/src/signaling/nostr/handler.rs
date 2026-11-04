@@ -34,9 +34,25 @@ impl WasmNostrSignaler {
             if !self.mark_seen_if_current(&event.id, &room_id) {
                 return Ok(());
             }
+            if self
+                .discovery_table
+                .lock()
+                .unwrap()
+                .is_superseded(&decoded.signaling_pubkey)
+            {
+                tracing::debug!(
+                    "[DiscoveryRetired] action=drop reason=replay pubkey={}",
+                    decoded.signaling_pubkey
+                );
+                return Ok(());
+            }
             // A peer that disconnected and rejoined advertises a newer joined_at.
             // Forget our prior request for it so we re-request the fresh session
             // instead of silently suppressing the duplicate.
+            self.measurements
+                .lock()
+                .unwrap()
+                .discovery(&decoded.signaling_pubkey, web_time::Instant::now());
             if let Some(joined_at) = decoded.joined_at {
                 let rejoined = {
                     let mut sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -212,13 +228,15 @@ impl WasmNostrSignaler {
             let sender_rank = self
                 .codec_config
                 .topology_rank(&room_id, &decoded.sender_pubkey);
-            let outcome = table.bind_node_with_epoch(
+            let outcome = table.bind_node_with_stamp(
                 incoming.sender_id.clone(),
                 decoded.sender_pubkey.clone(),
                 decoded.expires_at,
                 sender_rank,
                 decoded.sender_joined_at,
+                event.created_at,
                 sender_was_requested && incoming.signaling_type == SignalingType::Request,
+                super::current_unix_millis() / 1000,
             )?;
             // A signaling message from this sender just passed validation,
             // dedupe, and ordering checks, so it is proof of life right now.
@@ -246,6 +264,16 @@ impl WasmNostrSignaler {
         // layer via a synthetic `Rejoin` BEFORE the triggering message
         // itself is forwarded, so it tears down the stale peer connection
         // first.
+        self.measurements
+            .lock()
+            .unwrap()
+            .response(&decoded.sender_pubkey, web_time::Instant::now());
+        tracing::debug!(
+            "[NostrBinding] node={} pubkey={} joined_at={}",
+            incoming.sender_id.0,
+            decoded.sender_pubkey,
+            decoded.sender_joined_at.unwrap_or(0)
+        );
         self.exchanges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -265,6 +293,11 @@ impl WasmNostrSignaler {
                 .progress(&decoded.sender_pubkey, web_time::Instant::now());
         }
         if let Some(previous_pubkey) = rebound_from {
+            self.governor.lock().unwrap().retire(&previous_pubkey);
+            self.exchanges
+                .lock()
+                .unwrap()
+                .retire(&previous_pubkey, web_time::Instant::now());
             self.purge_peer_state(&previous_pubkey);
             if self.room_is_current(&room_id) {
                 let new_epoch = decoded.sender_joined_at.unwrap_or(0);

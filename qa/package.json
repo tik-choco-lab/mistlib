@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test *.test.mjs"
+    "test": "node --test *.test.mjs storage_mainthread/*.test.mjs"
   },
   "dependencies": {
     "playwright": "1.64.0",

@@ -158,6 +158,24 @@ impl WebRtcTransport {
             };
 
             if still_connecting && !has_required_data_channel {
+                if let Some(peer) = &peer_opt {
+                    let local = peer.pc.local_description().await.is_some();
+                    let remote = peer.pc.remote_description().await.is_some();
+                    let buffered = handles
+                        .pending_candidates
+                        .read()
+                        .await
+                        .get(&node)
+                        .map_or(0, Vec::len);
+                    let metrics = &peer.ice_measurements;
+                    tracing::info!("[IceWatchdog] peer={} attempt={} pc_id={} connection={:?} ice={:?} gathering={:?} signaling={:?} local_description={} remote_description={} generated={} received={} buffered_total={} applied={} apply_failed={} buffered={}", node.0, attempt_id, metrics.id, peer.pc.connection_state(), peer.pc.ice_connection_state(), peer.pc.ice_gathering_state(), peer.pc.signaling_state(), local, remote, metrics.generated.load(Ordering::Relaxed), metrics.received.load(Ordering::Relaxed), metrics.buffered.load(Ordering::Relaxed), metrics.applied.load(Ordering::Relaxed), metrics.apply_failed.load(Ordering::Relaxed), buffered);
+                } else {
+                    tracing::info!(
+                        "[IceWatchdog] peer={} attempt={} connection=missing",
+                        node.0,
+                        attempt_id
+                    );
+                }
                 // `[ConnTiming]` instrumentation: this is the one-shot
                 // connection watchdog force-cleaning a still-`Connecting`
                 // session -- report the elapsed time as a timeout and remove
@@ -361,6 +379,95 @@ impl WebRtcTransport {
                         BOOTSTRAP_MAINTENANCE_BUDGET,
                         handles.signaler.maintain_bootstrap(connected),
                     ) => {}
+                }
+                let mut busy: std::collections::HashSet<_> = handles
+                    .connection_states
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, state)| {
+                        matches!(
+                            state,
+                            ConnectionState::Connected
+                                | ConnectionState::Connecting
+                                | ConnectionState::Reconnecting
+                        )
+                    })
+                    .map(|(node, _)| node.clone())
+                    .collect();
+                busy.extend(
+                    handles
+                        .connect_request_attempt_ids
+                        .read()
+                        .unwrap()
+                        .keys()
+                        .cloned(),
+                );
+                let retry_nodes = handles.pair_backoff.lock().unwrap().nodes();
+                for node in retry_nodes {
+                    let token = handles.signaler.peer_retry_token(&node).await;
+                    handles.pair_backoff.lock().unwrap().refresh_binding(
+                        &node,
+                        token,
+                        web_time::Instant::now(),
+                    );
+                }
+                let overlay = handles
+                    .pair_backoff
+                    .lock()
+                    .unwrap()
+                    .nodes()
+                    .into_iter()
+                    .filter(|node| handles.signaler.has_overlay_route(node))
+                    .collect();
+                let nudges = handles.pair_backoff.lock().unwrap().poll_nudges(
+                    &handles.local_node_id,
+                    web_time::Instant::now(),
+                    rand::random(),
+                    &busy,
+                    &overlay,
+                );
+                for node in nudges {
+                    let handles = handles.clone();
+                    let cancel = cancel_for_task.clone();
+                    tokio::spawn(async move {
+                        let retry = async {
+                            if handles.local_node_id.0 < node.0 {
+                                handles.signaler.retry_peer(&node).await
+                            } else {
+                                handles
+                                    .signaler
+                                    .send_signaling(
+                                        &node,
+                                        MessageContent::Data(SignalingData {
+                                            sender_id: handles.local_node_id.clone(),
+                                            receiver_id: node.clone(),
+                                            room_id: handles.room_id.clone(),
+                                            data: String::new(),
+                                            signaling_type: SignalingType::Request,
+                                        }),
+                                    )
+                                    .await
+                            }
+                        };
+                        let result = tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            result = tokio::time::timeout(BOOTSTRAP_MAINTENANCE_BUDGET, retry) => result,
+                        };
+                        match result {
+                            Ok(Ok(())) => tracing::info!("[PairBackoff] action=sent node={node}"),
+                            result => {
+                                tracing::info!("[PairBackoff] action=send_failed node={node} reason={result:?}");
+                                if handles.local_node_id.0 < node.0 {
+                                    handles.pair_backoff.lock().unwrap().failed(
+                                        &node,
+                                        web_time::Instant::now(),
+                                        rand::random(),
+                                    );
+                                }
+                            }
+                        }
+                    });
                 }
                 // Bootstrap polls every second; keep the existing cleanup cadence.
                 if last_sweep.elapsed() < Duration::from_millis(SWEEPER_INTERVAL_MS) {

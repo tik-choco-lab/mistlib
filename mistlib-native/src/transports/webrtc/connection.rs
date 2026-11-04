@@ -22,6 +22,7 @@ impl WebRtcTransport {
             ..Default::default()
         };
 
+        self.pair_backoff.lock().unwrap().started(&remote_id);
         let cancel_token = CancellationToken::new();
         let pc = Arc::new(self.api.new_peer_connection(config).await?);
         let channels: Arc<
@@ -54,6 +55,7 @@ impl WebRtcTransport {
                 .push((send_tx.downgrade(), pacing.budget.clone()));
         }
         let peer = Arc::new(Peer {
+            ice_measurements: Default::default(),
             pacing,
             unordered_capability: Default::default(),
             unordered_channel,

@@ -36,12 +36,17 @@ fn base32lower_encode(data: &[u8]) -> String {
 
 pub fn compute_cid(data: &[u8], codec: u64) -> String {
     let hash = Sha256::digest(data);
+    cid_from_sha256(&hash.into(), codec)
+}
+
+/// Encode an already computed SHA-256 digest using the canonical storage CID.
+pub fn cid_from_sha256(hash: &[u8; 32], codec: u64) -> String {
     let mut cid = Vec::with_capacity(4 + 32);
     encode_varint(CID_VERSION, &mut cid);
     encode_varint(codec, &mut cid);
     encode_varint(MULTIHASH_SHA2_256, &mut cid);
     cid.push(MULTIHASH_SHA2_256_LEN);
-    cid.extend_from_slice(&hash);
+    cid.extend_from_slice(hash);
     format!("b{}", base32lower_encode(&cid))
 }
 
@@ -122,6 +127,15 @@ pub fn is_valid_cid(cid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_encoding_preserves_known_raw_cid() {
+        let hash: [u8; 32] = Sha256::digest(b"abc").into();
+        assert_eq!(
+            cid_from_sha256(&hash, MULTICODEC_RAW),
+            "bafkreif2pall7dybz7vecqka3zo24irdwabwdi4wc55jznaq75q7eaavvu"
+        );
+    }
 
     #[test]
     fn embedded_codec_requires_supported_hash_and_valid_cid_envelope() {

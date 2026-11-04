@@ -697,7 +697,13 @@ impl NetworkPeerResolver {
                     continue;
                 }
                 debug!("PeerResolver: targeted WANT for {} to {}", cid, peer.0);
-                let result = self.attempt(cid, &peer).await;
+                let attempt = self.attempt(cid, &peer);
+                // Keep the browser's cold wasm compilation in smaller poll
+                // functions. Inlining both discovery and the full retry state
+                // machine here makes the first resolve an indivisible long task.
+                #[cfg(target_arch = "wasm32")]
+                let attempt = attempt.boxed_local();
+                let result = attempt.await;
                 self.registry.cancel_closed();
                 if result.is_some() {
                     return Ok(result);
@@ -720,8 +726,10 @@ impl NetworkPeerResolver {
                 }
                 continue;
             }
-            peers = self
-                .discover(cid, &tried)
+            let discovery = self.discover(cid, &tried);
+            #[cfg(target_arch = "wasm32")]
+            let discovery = discovery.boxed_local();
+            peers = discovery
                 .await
                 .map_err(|reason| format!("{}: {}", reason.message(), cid))?;
             debug!(

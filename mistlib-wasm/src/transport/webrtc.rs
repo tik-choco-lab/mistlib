@@ -124,7 +124,6 @@ async fn send_negotiation_reliably(
     });
 }
 
-const ISOLATION_RECOVERY_DELAY_MS: u32 = 3000;
 #[cfg(test)]
 const DISCONNECTED_GRACE_MS: u64 = 50;
 #[cfg(not(test))]
@@ -299,6 +298,8 @@ pub struct WasmWebRtcTransport {
     pub next_candidate_generation: AtomicU32,
     pub sweeper_started: AtomicBool,
     pub sweeper_generation: Arc<AtomicU32>,
+    pub recovery_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::RecoveryBackoff>>,
+    pub pair_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::PairBackoff>>,
     pub isolation_recovery_epoch: Arc<AtomicU32>,
     pub local_tracks: Arc<RwLock<HashMap<String, LocalTrack>>>,
     pub peer_senders: Arc<RwLock<HashMap<NodeId, HashMap<String, RtcRtpSender>>>>,
@@ -375,6 +376,8 @@ impl WasmWebRtcTransport {
             next_candidate_generation: AtomicU32::new(rand::random()),
             sweeper_started: AtomicBool::new(false),
             sweeper_generation: Arc::new(AtomicU32::new(0)),
+            recovery_backoff: Default::default(),
+            pair_backoff: Default::default(),
             isolation_recovery_epoch: Arc::new(AtomicU32::new(0)),
             local_tracks: Arc::new(RwLock::new(HashMap::new())),
             peer_senders: Arc::new(RwLock::new(HashMap::new())),
@@ -404,13 +407,22 @@ impl WasmWebRtcTransport {
         let peer_epochs = self.peer_epochs.clone();
         let sweeper_generation = self.sweeper_generation.clone();
         let signaler = self.signaler.clone();
+        let pair_backoff = self.pair_backoff.clone();
+        let recovery_backoff = self.recovery_backoff.clone();
         let isolation_recovery_epoch = self.isolation_recovery_epoch.clone();
         let room_id = self.room_id.clone();
+        let local_node_id = self.local_node_id.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let mut cleanup_tick = false;
             loop {
                 gloo_timers::future::TimeoutFuture::new(1000).await;
+                for (node, state) in states.read().unwrap().iter() {
+                    if *state == ConnectionState::Connected {
+                        recovery_backoff.lock().unwrap().connected();
+                        pair_backoff.lock().unwrap().connected(node);
+                    }
+                }
                 if sweeper_generation.load(Ordering::Relaxed) != generation {
                     break;
                 }
@@ -421,6 +433,82 @@ impl WasmWebRtcTransport {
                     .filter(|state| **state == ConnectionState::Connected)
                     .count();
                 signaler.maintain_bootstrap(connected).await;
+                let busy: std::collections::HashSet<_> = states
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, state)| {
+                        matches!(
+                            state,
+                            ConnectionState::Connected
+                                | ConnectionState::Connecting
+                                | ConnectionState::Reconnecting
+                        )
+                    })
+                    .map(|(node, _)| node.clone())
+                    .collect();
+                let retry_nodes = pair_backoff.lock().unwrap().nodes();
+                for node in retry_nodes {
+                    let token = signaler.peer_retry_token(&node).await;
+                    pair_backoff.lock().unwrap().refresh_binding(
+                        &node,
+                        token,
+                        web_time::Instant::now(),
+                    );
+                }
+                let overlay = pair_backoff
+                    .lock()
+                    .unwrap()
+                    .nodes()
+                    .into_iter()
+                    .filter(|node| signaler.has_overlay_route(node))
+                    .collect();
+                let nudges = pair_backoff.lock().unwrap().poll_nudges(
+                    &local_node_id,
+                    web_time::Instant::now(),
+                    js_sys::Math::random(),
+                    &busy,
+                    &overlay,
+                );
+                for node in nudges {
+                    let room = room_id.read().unwrap().clone();
+                    let signaler = signaler.clone();
+                    let local = local_node_id.clone();
+                    let pair_backoff = pair_backoff.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let result = if local.0 < node.0 {
+                            signaler.retry_peer(&node).await
+                        } else {
+                            signaler
+                                .send_signaling(
+                                    &node,
+                                    MessageContent::Data(SignalingData {
+                                        sender_id: local.clone(),
+                                        receiver_id: node.clone(),
+                                        room_id: room,
+                                        data: String::new(),
+                                        signaling_type: SignalingType::Request,
+                                    }),
+                                )
+                                .await
+                        };
+                        match result {
+                            Ok(()) => tracing::info!("[PairBackoff] action=sent node={node}"),
+                            Err(err) => {
+                                tracing::info!(
+                                    "[PairBackoff] action=send_failed node={node} reason={err}"
+                                );
+                                if local.0 < node.0 {
+                                    pair_backoff.lock().unwrap().failed(
+                                        &node,
+                                        web_time::Instant::now(),
+                                        js_sys::Math::random(),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
                 // Preserve the two-second cleanup cadence.
                 cleanup_tick = !cleanup_tick;
                 if cleanup_tick {
@@ -491,7 +579,12 @@ impl WasmWebRtcTransport {
                         if peer.inbound_activity.record_transport_bytes(&id, bytes)
                             && mistlib_core::stats::STATS.note_inbound_activity(&node)
                         {
-                            cancel_suspect_grace(&node, &states, &disconnected_since);
+                            cancel_suspect_grace(
+                                &node,
+                                &states,
+                                &disconnected_since,
+                                &pair_backoff,
+                            );
                         }
                     }
                 }
@@ -636,6 +729,7 @@ impl WasmWebRtcTransport {
                             let mut lock = peer_epochs.write().unwrap_or_else(|e| e.into_inner());
                             lock.remove(&node);
                         }
+                        peer.record_failure(&node);
                         peer.close_all(&node);
                         // close_all detaches the browser callbacks. In particular,
                         // grace expiry cannot rely on DataChannel.onclose to tell
@@ -649,6 +743,7 @@ impl WasmWebRtcTransport {
                                 states.clone(),
                                 attempts.clone(),
                                 isolation_recovery_epoch.clone(),
+                                recovery_backoff.clone(),
                             );
                         }
                         tracing::warn!("[Sweeper] Force cleaned session for {}", node.0);
@@ -739,6 +834,7 @@ impl WasmWebRtcTransport {
             self.connection_states.clone(),
             self.connection_attempt_ids.clone(),
             self.isolation_recovery_epoch.clone(),
+            self.recovery_backoff.clone(),
         );
     }
 
@@ -1036,7 +1132,12 @@ impl WasmWebRtcTransport {
         config.set_ice_servers(&ice_server_plans_to_js(&plans));
 
         let pc = RtcPeerConnection::new_with_configuration(&config)?;
-        let peer = Arc::new(Peer::new(pc));
+        self.pair_backoff.lock().unwrap().started(&remote_id);
+        let mut peer = Peer::new(pc);
+        peer.recovery_backoff = self.recovery_backoff.clone();
+        peer.pair_backoff = self.pair_backoff.clone();
+        peer.signaler = Some(self.signaler.clone());
+        let peer = Arc::new(peer);
         peer.configure_bulk_pacing(&self.storage_transfer.read().unwrap());
         peer.unordered_capability.set_local(true);
         let candidate_generation = self
@@ -1110,6 +1211,11 @@ impl WasmWebRtcTransport {
             peers.remove(node)
         };
 
+        if isolation_recovery == IsolationRecovery::Schedule {
+            if let Some(peer) = &removed_peer {
+                peer.record_failure(node);
+            }
+        }
         if removed_peer.is_some() {
             let room = self
                 .room_id
@@ -1332,6 +1438,7 @@ impl WasmWebRtcTransport {
         let candidate_delivery = self.candidate_delivery.clone();
         let negotiation_delivery = self.negotiation_delivery.clone();
         let signaler = self.signaler.clone();
+        let recovery_backoff = self.recovery_backoff.clone();
         let isolation_recovery_epoch = self.isolation_recovery_epoch.clone();
         let timeout_ms = self.connection_timeout_ms.load(Ordering::Relaxed);
         let room_id = self.room_id.clone();
@@ -1444,6 +1551,7 @@ impl WasmWebRtcTransport {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove_node(&node);
+            peer.record_failure(&node);
             let pc_state = peer.pc.connection_state();
             peer.close_all(&node);
             // A connectivity watchdog can race with liveness grace after the
@@ -1458,6 +1566,7 @@ impl WasmWebRtcTransport {
                     conn_states,
                     attempt_ids,
                     isolation_recovery_epoch,
+                    recovery_backoff,
                 );
             }
             tracing::warn!(
@@ -1478,7 +1587,10 @@ impl WasmWebRtcTransport {
     pub fn close_all_peer_connections(&self) {
         self.stop_session_sweeper();
         self.isolation_recovery_epoch
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                Some((epoch | 1).wrapping_add(1))
+            })
+            .unwrap();
 
         let peers = {
             let mut lock = self.peers.write().unwrap_or_else(|e| e.into_inner());
@@ -2137,6 +2249,7 @@ fn cancel_suspect_grace(
     node: &NodeId,
     connection_states: &RwLock<HashMap<NodeId, ConnectionState>>,
     disconnected_since: &RwLock<HashMap<NodeId, DisconnectGrace>>,
+    pair_backoff: &std::sync::Mutex<mistlib_core::signaling::courtesy::PairBackoff>,
 ) -> bool {
     let is_suspect_origin = {
         let disconnected = disconnected_since.read().unwrap_or_else(|e| e.into_inner());
@@ -2157,6 +2270,13 @@ fn cancel_suspect_grace(
         if !states.contains_key(node) {
             return false;
         }
+        let isolated_before = !states.values().any(|s| *s == ConnectionState::Connected);
+        pair_backoff.lock().unwrap().connection_established(
+            node,
+            isolated_before,
+            web_time::Instant::now(),
+            js_sys::Math::random(),
+        );
         states.insert(node.clone(), ConnectionState::Connected);
     }
     disconnected_since
@@ -2216,7 +2336,12 @@ impl WasmWebRtcTransport {
     /// period started by ICE `Disconnected` is left alone -- only ICE's own
     /// recovery signal is allowed to end that one.
     pub(crate) fn cancel_suspect_grace(&self, node: &NodeId) -> bool {
-        cancel_suspect_grace(node, &self.connection_states, &self.disconnected_since)
+        cancel_suspect_grace(
+            node,
+            &self.connection_states,
+            &self.disconnected_since,
+            &self.pair_backoff,
+        )
     }
 
     pub fn get_active_connection_states(&self) -> Vec<(NodeId, ConnectionState)> {
@@ -2252,13 +2377,41 @@ fn schedule_isolation_recovery(
     connection_states: Arc<RwLock<HashMap<NodeId, ConnectionState>>>,
     connection_attempt_ids: Arc<RwLock<HashMap<NodeId, u32>>>,
     recovery_epoch: Arc<AtomicU32>,
+    recovery_backoff: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::RecoveryBackoff>>,
 ) {
-    let expected_epoch = recovery_epoch
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
+    let delay_ms = recovery_backoff
+        .lock()
+        .unwrap()
+        .delay(js_sys::Math::random())
+        .as_millis() as u32;
+    let epoch = recovery_epoch.load(Ordering::SeqCst);
+    if epoch % 2 == 1
+        || recovery_epoch
+            .compare_exchange(
+                epoch,
+                epoch.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+    {
+        tracing::info!("[IsolationRecovery] action=skip reason=already_scheduled");
+        return;
+    }
+    let expected_epoch = epoch.wrapping_add(1);
+    tracing::info!("[IsolationRecovery] action=scheduled delay_ms={delay_ms}");
     wasm_bindgen_futures::spawn_local(async move {
-        gloo_timers::future::TimeoutFuture::new(ISOLATION_RECOVERY_DELAY_MS).await;
-        if recovery_epoch.load(Ordering::SeqCst) != expected_epoch {
+        gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+        if recovery_epoch
+            .compare_exchange(
+                expected_epoch,
+                expected_epoch.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            tracing::info!("[IsolationRecovery] action=skip reason=superseded");
             return;
         }
         let states: Vec<ConnectionState> = connection_states
@@ -2272,9 +2425,20 @@ fn schedule_isolation_recovery(
             .unwrap_or_else(|e| e.into_inner())
             .len();
         if is_isolated(states, in_flight_attempts) {
-            if let Err(err) = signaler.reset_session().await {
+            recovery_backoff.lock().unwrap().fired();
+            tracing::info!(
+                "[IsolationRecovery] action=backoff_extend delay_ms={}",
+                recovery_backoff.lock().unwrap().delay(0.5).as_millis()
+            );
+            tracing::info!("[IsolationRecovery] action=fire reason=isolation_recovery");
+            if let Err(err) = signaler
+                .reset_session_with_reason("isolation_recovery")
+                .await
+            {
                 tracing::warn!("isolated signaling session reset failed: {:?}", err);
             }
+        } else {
+            tracing::info!("[IsolationRecovery] action=skip reason=active_peer");
         }
     });
 }
@@ -2802,188 +2966,12 @@ impl Transport for WasmWebRtcTransport {
     }
 
     async fn connect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
-        tracing::info!("Connecting to peer: {}", node.0);
-
-        {
-            let states = self
-                .connection_states
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(state) = states.get(node) {
-                if matches!(
-                    *state,
-                    ConnectionState::Connecting
-                        | ConnectionState::Connected
-                        | ConnectionState::Reconnecting
-                ) {
-                    return Ok(());
-                }
-            }
-
-            let max = self.max_connections.load(Ordering::Relaxed) as usize;
-            let current = states
-                .values()
-                .filter(|&&s| {
-                    matches!(
-                        s,
-                        ConnectionState::Connected
-                            | ConnectionState::Connecting
-                            | ConnectionState::Reconnecting
-                    )
-                })
-                .count();
-            if current >= max {
-                return Ok(());
-            }
-        }
-
-        {
-            let mut states = self
-                .connection_states
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            states.insert(node.clone(), ConnectionState::Connecting);
-        }
-
-        let attempt_id = self
-            .next_connection_attempt_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        {
-            let mut attempts = self
-                .connection_attempt_ids
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            attempts.insert(node.clone(), attempt_id);
-        }
-
-        let peer = self
-            .create_pc(node.clone())
-            .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
-
-        peer.unordered_capability.set_initial_offerer();
-        let dc_init = RtcDataChannelInit::new();
-        dc_init.set_ordered(true);
-        let reliable = peer
-            .pc
-            .create_data_channel_with_data_channel_dict("reliable", &dc_init);
-        {
-            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
-            channels.insert(DeliveryMethod::ReliableOrdered, reliable.clone());
-        }
-        let unreliable_ordered_init = RtcDataChannelInit::new();
-        unreliable_ordered_init.set_ordered(true);
-        unreliable_ordered_init.set_max_retransmits(0);
-        let unreliable_ordered = peer.pc.create_data_channel_with_data_channel_dict(
-            "unreliable-ordered",
-            &unreliable_ordered_init,
-        );
-        {
-            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
-            channels.insert(
-                DeliveryMethod::UnreliableOrdered,
-                unreliable_ordered.clone(),
-            );
-        }
-
-        let unreliable_init = RtcDataChannelInit::new();
-        unreliable_init.set_ordered(false);
-        unreliable_init.set_max_retransmits(0);
-        let unreliable = peer
-            .pc
-            .create_data_channel_with_data_channel_dict("unreliable", &unreliable_init);
-        {
-            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
-            channels.insert(DeliveryMethod::Unreliable, unreliable.clone());
-        }
-        let room_id = self
-            .room_id
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-
-        Peer::setup_dc_handlers(
-            reliable,
-            DeliveryMethod::ReliableOrdered,
-            peer.clone(),
-            self.event_handler.clone(),
-            node.clone(),
-            room_id.clone(),
-            self.connection_states.clone(),
-            self.disconnected_since.clone(),
-            self.peers.clone(),
-            self.peer_senders.clone(),
-            self.pending_candidates.clone(),
-            self.max_message_bytes.load(Ordering::Relaxed),
-        );
-
-        Peer::setup_dc_handlers(
-            unreliable_ordered,
-            DeliveryMethod::UnreliableOrdered,
-            peer.clone(),
-            self.event_handler.clone(),
-            node.clone(),
-            room_id.clone(),
-            self.connection_states.clone(),
-            self.disconnected_since.clone(),
-            self.peers.clone(),
-            self.peer_senders.clone(),
-            self.pending_candidates.clone(),
-            self.max_message_bytes.load(Ordering::Relaxed),
-        );
-
-        Peer::setup_dc_handlers(
-            unreliable,
-            DeliveryMethod::Unreliable,
-            peer.clone(),
-            self.event_handler.clone(),
-            node.clone(),
-            room_id,
-            self.connection_states.clone(),
-            self.disconnected_since.clone(),
-            self.peers.clone(),
-            self.peer_senders.clone(),
-            self.pending_candidates.clone(),
-            self.max_message_bytes.load(Ordering::Relaxed),
-        );
-
-        // Close any peer this displaces, same as `handle_offer` does at its
-        // own `peers.insert` -- without this, an orphaned old
-        // `RTCPeerConnection` is simply dropped from the map while its
-        // handlers (installed via `Peer::setup_handlers`, which uses
-        // `Closure::forget()` and so is never actually detached just because
-        // the `Arc<Peer>` is no longer referenced here) are still live. If
-        // that old connection's `oniceconnectionstatechange` fires later
-        // (e.g. it was already failing when this `connect()` call started),
-        // its handler does `peers.remove(&remote_id)` unconditionally -- which
-        // would silently delete the *new*, working connection just inserted
-        // below, not the dead one that fired the event.
-        let old_peer = {
-            let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
-            peers.insert(node.clone(), peer.clone())
-        };
-        if let Some(old_peer) = old_peer {
-            let room = self
-                .room_id
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            crate::app::reset_storage_senders(&room, node);
-            old_peer.close_all(node);
-        }
-
-        self.spawn_initial_connection_watchdog(node.clone(), attempt_id, peer.clone());
-
-        if let Err(e) = self.renegotiate_peer(node, &peer).await {
-            self.cleanup_peer_connection(node, true, IsolationRecovery::Schedule);
-            return Err(e);
-        }
-
-        Ok(())
+        self.connect_with_policy(node, false).await
     }
 
     async fn disconnect(&self, node: &NodeId) -> mistlib_core::error::Result<()> {
         self.cleanup_peer_connection(node, true, IsolationRecovery::Schedule);
+        self.pair_backoff.lock().unwrap().connected(node);
         Ok(())
     }
 
@@ -3336,7 +3324,10 @@ impl SignalingHandler for WasmWebRtcTransport {
                     }
 
                     tracing::info!("Initiating connect to: {}", data.sender_id.0);
-                    let connected = self.connect(&data.sender_id).await.is_ok();
+                    let connected = self
+                        .connect_with_policy(&data.sender_id, true)
+                        .await
+                        .is_ok();
                     // If this reconnect was restart-driven, stamp the epoch
                     // it was built for once the connection actually succeeds
                     // -- see `peer_epochs`' field doc.
@@ -3435,6 +3426,272 @@ impl SignalingHandler for WasmWebRtcTransport {
                 // peer's actual Offer/Request, arriving next, does that.
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod courtesy_failure_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+    use web_time::Duration;
+
+    #[wasm_bindgen_test]
+    fn grace_recovery_resets_other_pairs_only_when_isolated() {
+        let first = NodeId("first".into());
+        let other = NodeId("other".into());
+        let failed = NodeId("failed".into());
+        let states = RwLock::new(HashMap::from([(
+            first.clone(),
+            ConnectionState::Reconnecting,
+        )]));
+        let grace = RwLock::new(HashMap::from([(
+            first.clone(),
+            DisconnectGrace {
+                started_at: Instant::now(),
+                origin: GraceOrigin::LivenessSuspect,
+            },
+        )]));
+        let policy = Mutex::new(mistlib_core::signaling::courtesy::PairBackoff::default());
+        let now = Instant::now();
+        for _ in 0..8 {
+            policy.lock().unwrap().failed(&failed, now, 0.5);
+        }
+        assert!(cancel_suspect_grace(&first, &states, &grace, &policy));
+        assert!(policy.lock().unwrap().remaining(&failed, now) <= Duration::from_secs(2));
+        policy.lock().unwrap().failed(&failed, now, 0.5);
+        let before = policy.lock().unwrap().remaining(&failed, now);
+        assert_eq!(before, Duration::from_secs(3));
+        states
+            .write()
+            .unwrap()
+            .insert(other.clone(), ConnectionState::Reconnecting);
+        grace.write().unwrap().insert(
+            other.clone(),
+            DisconnectGrace {
+                started_at: Instant::now(),
+                origin: GraceOrigin::LivenessSuspect,
+            },
+        );
+        assert!(cancel_suspect_grace(&other, &states, &grace, &policy));
+        assert!(!cancel_suspect_grace(&first, &states, &grace, &policy));
+        assert_eq!(policy.lock().unwrap().remaining(&failed, now), before);
+    }
+
+    #[wasm_bindgen_test]
+    fn pc_generation_counts_failure_once_and_intentional_close_suppresses_it() {
+        let node = NodeId("peer".into());
+        let mut peer = Peer::new(RtcPeerConnection::new().unwrap());
+        let policy = Arc::new(Mutex::new(
+            mistlib_core::signaling::courtesy::PairBackoff::default(),
+        ));
+        peer.pair_backoff = policy.clone();
+        peer.record_failure(&node); // ICE Failed
+        peer.record_failure(&node); // cleanup/DC onclose for the same PC
+        let remaining = policy.lock().unwrap().remaining(&node, Instant::now());
+        assert!(remaining <= std::time::Duration::from_millis(3600));
+        assert!(remaining >= std::time::Duration::from_secs(2));
+        peer.close_all(&node);
+        peer.record_failure(&node);
+        let intentional = Peer::new(RtcPeerConnection::new().unwrap());
+        intentional.close_all(&node); // takeover/replacement/explicit disconnect
+        intentional.record_failure(&node);
+        assert!(intentional.pair_backoff.lock().unwrap().nodes().is_empty());
+    }
+}
+
+impl WasmWebRtcTransport {
+    async fn connect_with_policy(
+        &self,
+        node: &NodeId,
+        response: bool,
+    ) -> mistlib_core::error::Result<()> {
+        if !self.pair_backoff.lock().unwrap().can_initiate(
+            node,
+            web_time::Instant::now(),
+            self.signaler.has_overlay_route(node),
+            response,
+        ) {
+            tracing::debug!("[PairBackoff] action=wait node={node} reason=admission");
+            return Ok(());
+        }
+        tracing::info!("Connecting to peer: {}", node.0);
+
+        {
+            let states = self
+                .connection_states
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = states.get(node) {
+                if matches!(
+                    *state,
+                    ConnectionState::Connecting
+                        | ConnectionState::Connected
+                        | ConnectionState::Reconnecting
+                ) {
+                    return Ok(());
+                }
+            }
+
+            let max = self.max_connections.load(Ordering::Relaxed) as usize;
+            let current = states
+                .values()
+                .filter(|&&s| {
+                    matches!(
+                        s,
+                        ConnectionState::Connected
+                            | ConnectionState::Connecting
+                            | ConnectionState::Reconnecting
+                    )
+                })
+                .count();
+            if current >= max {
+                return Ok(());
+            }
+        }
+
+        {
+            let mut states = self
+                .connection_states
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states.insert(node.clone(), ConnectionState::Connecting);
+        }
+
+        let attempt_id = self
+            .next_connection_attempt_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        {
+            let mut attempts = self
+                .connection_attempt_ids
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            attempts.insert(node.clone(), attempt_id);
+        }
+
+        let peer = self
+            .create_pc(node.clone())
+            .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
+
+        peer.unordered_capability.set_initial_offerer();
+        let dc_init = RtcDataChannelInit::new();
+        dc_init.set_ordered(true);
+        let reliable = peer
+            .pc
+            .create_data_channel_with_data_channel_dict("reliable", &dc_init);
+        {
+            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
+            channels.insert(DeliveryMethod::ReliableOrdered, reliable.clone());
+        }
+        let unreliable_ordered_init = RtcDataChannelInit::new();
+        unreliable_ordered_init.set_ordered(true);
+        unreliable_ordered_init.set_max_retransmits(0);
+        let unreliable_ordered = peer.pc.create_data_channel_with_data_channel_dict(
+            "unreliable-ordered",
+            &unreliable_ordered_init,
+        );
+        {
+            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
+            channels.insert(
+                DeliveryMethod::UnreliableOrdered,
+                unreliable_ordered.clone(),
+            );
+        }
+
+        let unreliable_init = RtcDataChannelInit::new();
+        unreliable_init.set_ordered(false);
+        unreliable_init.set_max_retransmits(0);
+        let unreliable = peer
+            .pc
+            .create_data_channel_with_data_channel_dict("unreliable", &unreliable_init);
+        {
+            let mut channels = peer.channels.write().unwrap_or_else(|e| e.into_inner());
+            channels.insert(DeliveryMethod::Unreliable, unreliable.clone());
+        }
+        let room_id = self
+            .room_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        Peer::setup_dc_handlers(
+            reliable,
+            DeliveryMethod::ReliableOrdered,
+            peer.clone(),
+            self.event_handler.clone(),
+            node.clone(),
+            room_id.clone(),
+            self.connection_states.clone(),
+            self.disconnected_since.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
+            self.pending_candidates.clone(),
+            self.max_message_bytes.load(Ordering::Relaxed),
+        );
+
+        Peer::setup_dc_handlers(
+            unreliable_ordered,
+            DeliveryMethod::UnreliableOrdered,
+            peer.clone(),
+            self.event_handler.clone(),
+            node.clone(),
+            room_id.clone(),
+            self.connection_states.clone(),
+            self.disconnected_since.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
+            self.pending_candidates.clone(),
+            self.max_message_bytes.load(Ordering::Relaxed),
+        );
+
+        Peer::setup_dc_handlers(
+            unreliable,
+            DeliveryMethod::Unreliable,
+            peer.clone(),
+            self.event_handler.clone(),
+            node.clone(),
+            room_id,
+            self.connection_states.clone(),
+            self.disconnected_since.clone(),
+            self.peers.clone(),
+            self.peer_senders.clone(),
+            self.pending_candidates.clone(),
+            self.max_message_bytes.load(Ordering::Relaxed),
+        );
+
+        // Close any peer this displaces, same as `handle_offer` does at its
+        // own `peers.insert` -- without this, an orphaned old
+        // `RTCPeerConnection` is simply dropped from the map while its
+        // handlers (installed via `Peer::setup_handlers`, which uses
+        // `Closure::forget()` and so is never actually detached just because
+        // the `Arc<Peer>` is no longer referenced here) are still live. If
+        // that old connection's `oniceconnectionstatechange` fires later
+        // (e.g. it was already failing when this `connect()` call started),
+        // its handler does `peers.remove(&remote_id)` unconditionally -- which
+        // would silently delete the *new*, working connection just inserted
+        // below, not the dead one that fired the event.
+        let old_peer = {
+            let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            peers.insert(node.clone(), peer.clone())
+        };
+        if let Some(old_peer) = old_peer {
+            let room = self
+                .room_id
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            crate::app::reset_storage_senders(&room, node);
+            old_peer.close_all(node);
+        }
+
+        self.spawn_initial_connection_watchdog(node.clone(), attempt_id, peer.clone());
+
+        if let Err(e) = self.renegotiate_peer(node, &peer).await {
+            self.cleanup_peer_connection(node, true, IsolationRecovery::Schedule);
+            return Err(e);
+        }
+
         Ok(())
     }
 }
