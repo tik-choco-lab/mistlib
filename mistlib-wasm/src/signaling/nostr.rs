@@ -60,6 +60,7 @@ pub struct WasmNostrSignaler {
     identity_recovery: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::IdentityRecovery>>,
     measurements: Arc<std::sync::Mutex<NostrMeasurements>>,
     relays: Vec<String>,
+    prefer_local_relays: bool,
     relay_list_url: Option<String>,
     retry_incoming: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MessageContent>>>>,
     local_node_id: NodeId,
@@ -109,6 +110,7 @@ impl WasmNostrSignaler {
             identity_recovery: Default::default(),
             measurements: Default::default(),
             relays: config.relays,
+            prefer_local_relays: false,
             relay_list_url,
             retry_incoming: Default::default(),
             local_node_id,
@@ -140,6 +142,12 @@ impl WasmNostrSignaler {
             discovery_subscription_id: random_subscription_id(),
             message_subscription_id: random_subscription_id(),
         }
+    }
+
+    /// Enables loopback relay preference for the initial connection.
+    pub fn with_local_relay_preference(mut self, prefer_local_relays: bool) -> Self {
+        self.prefer_local_relays = prefer_local_relays;
+        self
     }
 
     fn current_identity(&self) -> TemporarySignalingIdentity {

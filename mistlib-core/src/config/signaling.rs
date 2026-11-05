@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 mod url;
 
-use self::url::{is_local_http_url, is_local_relay, is_supported_http_url};
+use self::url::{is_local_http_url, is_supported_http_url};
+use crate::signaling::nostr::is_local_relay;
 
 const DEFAULT_NOSTR_INVITE_SALT: &str = "nostr-sig-test-local-salt";
 const DEFAULT_NOSTR_INVITE_CODE: &str = "dev-invite-001";
@@ -35,8 +36,16 @@ pub const DEFAULT_NOSTR_RELAY_LIST_URL: &str = "https://data.tik-choco.com/serve
 #[serde(rename_all = "lowercase")]
 pub enum SignalingMode {
     WebSocket,
-    #[default]
     Nostr,
+    #[default]
+    #[serde(rename = "nostr_auto", alias = "nostrAuto")]
+    NostrAuto,
+}
+
+impl SignalingMode {
+    pub fn is_nostr(self) -> bool {
+        matches!(self, Self::Nostr | Self::NostrAuto)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -50,7 +59,7 @@ pub struct SignalingConfig {
 
 impl Default for SignalingConfig {
     fn default() -> Self {
-        Self::nostr()
+        Self::nostr_auto()
     }
 }
 
@@ -59,6 +68,13 @@ impl SignalingConfig {
         Self {
             mode: SignalingMode::WebSocket,
             nostr: None,
+        }
+    }
+
+    pub fn nostr_auto() -> Self {
+        Self {
+            mode: SignalingMode::NostrAuto,
+            nostr: Some(NostrSignalingConfig::default()),
         }
     }
 
@@ -170,5 +186,32 @@ impl NostrSignalingConfig {
     fn uses_default_invite(&self) -> bool {
         self.invite_salt == DEFAULT_NOSTR_INVITE_SALT
             && self.invite_code == DEFAULT_NOSTR_INVITE_CODE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SignalingConfig, SignalingMode};
+
+    #[test]
+    fn signaling_modes_serialize_and_deserialize() {
+        for (json, mode) in [
+            (r#""nostr_auto""#, SignalingMode::NostrAuto),
+            (r#""nostrAuto""#, SignalingMode::NostrAuto),
+            (r#""nostr""#, SignalingMode::Nostr),
+            (r#""websocket""#, SignalingMode::WebSocket),
+        ] {
+            assert_eq!(serde_json::from_str::<SignalingMode>(json).unwrap(), mode);
+        }
+        let config = SignalingConfig::default();
+        assert_eq!(serde_json::to_value(&config).unwrap()["mode"], "nostr_auto");
+        assert!(config.nostr.is_some());
+        assert_eq!(SignalingConfig::nostr().mode, SignalingMode::Nostr);
+        let missing_mode: SignalingConfig = serde_json::from_str(r#"{"nostr":{}}"#).unwrap();
+        assert_eq!(missing_mode.mode, SignalingMode::NostrAuto);
+        assert!(missing_mode.nostr.is_some());
+        assert!(SignalingMode::Nostr.is_nostr());
+        assert!(SignalingMode::NostrAuto.is_nostr());
+        assert!(!SignalingMode::WebSocket.is_nostr());
     }
 }

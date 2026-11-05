@@ -55,6 +55,7 @@ pub struct NostrSignaler {
     identity_recovery: Arc<std::sync::Mutex<mistlib_core::signaling::courtesy::IdentityRecovery>>,
     measurements: Arc<std::sync::Mutex<NostrMeasurements>>,
     relays: Vec<String>,
+    prefer_local_relays: bool,
     relay_list_url: Option<String>,
     retry_incoming: Arc<Mutex<Option<mpsc::Sender<MessageContent>>>>,
     local_node_id: NodeId,
@@ -113,6 +114,7 @@ impl NostrSignaler {
             identity_recovery: Default::default(),
             measurements: Default::default(),
             relays: config.relays,
+            prefer_local_relays: false,
             relay_list_url,
             retry_incoming: Default::default(),
             local_node_id,
@@ -145,6 +147,12 @@ impl NostrSignaler {
             subscription_ids: Arc::new(Mutex::new(None)),
             reconnect_cancel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Enables loopback relay preference for the initial connection.
+    pub fn with_local_relay_preference(mut self, prefer_local_relays: bool) -> Self {
+        self.prefer_local_relays = prefer_local_relays;
+        self
     }
 
     /// Returns the current room's discovery/message subscription ids,

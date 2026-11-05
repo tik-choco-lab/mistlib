@@ -368,7 +368,7 @@ impl Config {
     pub fn validate_signaling(&self) -> bool {
         match self.signaling.mode {
             SignalingMode::WebSocket => true,
-            SignalingMode::Nostr => self
+            SignalingMode::Nostr | SignalingMode::NostrAuto => self
                 .signaling
                 .nostr
                 .as_ref()

@@ -93,7 +93,7 @@ fn config_default_flat_values_match_expected_profile() {
         serde_json::from_str(&json).expect("default config should serialize to flat JSON");
 
     assert_eq!(flat["signalingUrl"], "wss://rtc.tik-choco.com/signaling");
-    assert_eq!(flat["signaling"]["mode"], "nostr");
+    assert_eq!(flat["signaling"]["mode"], "nostr_auto");
     assert!(
         flat["signaling"]["nostr"]["relays"]
             .as_array()

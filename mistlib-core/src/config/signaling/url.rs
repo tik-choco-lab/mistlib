@@ -16,17 +16,6 @@ pub(super) fn is_local_http_url(url: &str) -> bool {
     is_local_host(host)
 }
 
-pub(super) fn is_local_relay(relay: &str) -> bool {
-    let relay = relay.trim().to_ascii_lowercase();
-    let Some(rest) = relay
-        .strip_prefix("ws://")
-        .or_else(|| relay.strip_prefix("wss://"))
-    else {
-        return false;
-    };
-    host_from_authority(rest.split('/').next().unwrap_or(rest)).is_some_and(is_local_host)
-}
-
 fn host_from_http_url(url: &str) -> Option<&str> {
     let rest = url
         .strip_prefix("https://")
@@ -50,7 +39,8 @@ fn is_local_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_local_http_url, is_local_relay, is_supported_http_url};
+    use super::{is_local_http_url, is_supported_http_url};
+    use crate::signaling::nostr::is_local_relay;
 
     #[test]
     fn local_relay_detection_uses_the_relay_host() {

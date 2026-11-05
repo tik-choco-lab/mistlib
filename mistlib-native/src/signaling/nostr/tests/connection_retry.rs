@@ -217,7 +217,8 @@ async fn hung_handshake_times_out_while_other_relay_connects_in_parallel() {
         healthy_tx.send(()).unwrap();
         while ws.next().await.is_some() {}
     });
-    let signaler = NostrSignaler::new(NodeId("parallel-test".into()), cfg);
+    let signaler =
+        NostrSignaler::new(NodeId("parallel-test".into()), cfg).with_local_relay_preference(true);
     let connecting_signaler = signaler.clone();
     let started = Instant::now();
     let connecting =
@@ -248,7 +249,8 @@ async fn close_cancels_initial_hung_handshake() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let mut cfg = config();
     cfg.relays = vec![format!("ws://{}", listener.local_addr().unwrap())];
-    let signaler = NostrSignaler::new(NodeId("cancel-test".into()), cfg);
+    let signaler =
+        NostrSignaler::new(NodeId("cancel-test".into()), cfg).with_local_relay_preference(true);
     let connecting_signaler = signaler.clone();
     let connecting =
         tokio::spawn(async move { connecting_signaler.connect(mpsc::channel(8).0).await });
@@ -304,4 +306,241 @@ async fn close_cancels_writer_blocked_on_send() {
         .await
         .expect("cancel must drop the writer and its receiver during send");
     server.abort();
+}
+
+#[tokio::test]
+async fn healthy_local_skips_remote_and_relay_list() {
+    let local = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let list = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut cfg = config();
+    cfg.relays = vec![
+        format!(" ws://{} ", local.local_addr().unwrap()),
+        "ws://unreachable.example.invalid:7777".into(),
+    ];
+    cfg.relay_list_url = Some(format!("http://{}/relays.json", list.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        let (stream, _) = local.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        while ws.next().await.is_some() {}
+    });
+    let signaler =
+        NostrSignaler::new(NodeId("prefer-local".into()), cfg).with_local_relay_preference(true);
+    timeout(Duration::from_secs(3), signaler.connect(mpsc::channel(8).0))
+        .await
+        .expect("remote relay and list must not delay a healthy local relay")
+        .unwrap();
+    assert!(timeout(Duration::from_millis(200), list.accept())
+        .await
+        .is_err());
+    signaler.close().await.unwrap();
+    server.abort();
+}
+
+async fn relay_list_fallback_test(with_refused_local: bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fallback = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let list = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let refused = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let refused_url = format!("ws://{}", refused.local_addr().unwrap());
+    drop(refused);
+    let fallback_url = format!("ws://{}", fallback.local_addr().unwrap());
+    let mut cfg = config();
+    cfg.relays = if with_refused_local {
+        vec![refused_url.clone()]
+    } else {
+        vec![]
+    };
+    cfg.relay_list_url = Some(format!("http://{}/relays.json", list.local_addr().unwrap()));
+    let list_server = tokio::spawn(async move {
+        let (mut stream, _) = list.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        let body = serde_json::json!([refused_url, fallback_url]).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+    let relay_server = tokio::spawn(async move {
+        let (stream, _) = fallback.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        connected_tx.send(()).unwrap();
+        while ws.next().await.is_some() {}
+    });
+    let signaler =
+        NostrSignaler::new(NodeId("fallback".into()), cfg).with_local_relay_preference(true);
+    timeout(Duration::from_secs(3), signaler.connect(mpsc::channel(8).0))
+        .await
+        .unwrap()
+        .unwrap();
+    connected_rx.await.unwrap();
+    signaler.close().await.unwrap();
+    list_server.await.unwrap();
+    relay_server.abort();
+}
+
+#[tokio::test]
+async fn refused_local_falls_back_to_relay_list() {
+    relay_list_fallback_test(true).await;
+}
+
+#[tokio::test]
+async fn no_inline_local_still_fetches_and_connects_relay_list() {
+    relay_list_fallback_test(false).await;
+}
+
+#[tokio::test]
+async fn failed_local_is_not_retried_from_fetched_list() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let failed = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fallback = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let list = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let failed_url = format!("ws://{}", failed.local_addr().unwrap());
+    let fallback_url = format!("ws://{}", fallback.local_addr().unwrap());
+    let mut cfg = config();
+    cfg.relays = vec![failed_url.clone()];
+    cfg.relay_list_url = Some(format!("http://{}/relays.json", list.local_addr().unwrap()));
+    let list_server = tokio::spawn(async move {
+        let (mut stream, _) = list.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        let body = serde_json::json!([failed_url, fallback_url]).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let failed_server = tokio::spawn(async move {
+        let (stream, _) = failed.accept().await.unwrap();
+        drop(stream);
+        timeout(Duration::from_millis(500), failed.accept())
+            .await
+            .is_err()
+    });
+    let relay_server = tokio::spawn(async move {
+        let (stream, _) = fallback.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        while ws.next().await.is_some() {}
+    });
+    let signaler =
+        NostrSignaler::new(NodeId("no-local-retry".into()), cfg).with_local_relay_preference(true);
+    timeout(Duration::from_secs(3), signaler.connect(mpsc::channel(8).0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        failed_server.await.unwrap(),
+        "the failed local relay was retried"
+    );
+    signaler.close().await.unwrap();
+    list_server.await.unwrap();
+    relay_server.abort();
+}
+
+#[tokio::test]
+async fn close_cancels_pending_fallback_list_fetch() {
+    let list = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut cfg = config();
+    let refused = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    cfg.relays = vec![format!("ws://{}", refused.local_addr().unwrap())];
+    drop(refused);
+    cfg.relay_list_url = Some(format!("http://{}/relays.json", list.local_addr().unwrap()));
+    let signaler =
+        NostrSignaler::new(NodeId("cancel-list".into()), cfg).with_local_relay_preference(true);
+    let connecting_signaler = signaler.clone();
+    let connecting =
+        tokio::spawn(async move { connecting_signaler.connect(mpsc::channel(8).0).await });
+    let (_stream, _) = timeout(Duration::from_secs(3), list.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    signaler.close().await.unwrap();
+    assert!(timeout(Duration::from_secs(1), connecting)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+}
+
+#[tokio::test]
+async fn nostr_without_preference_fetches_list_and_connects_all_relays() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let local = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listed = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let list = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut cfg = config();
+    cfg.relays = vec![format!("ws://{}", local.local_addr().unwrap())];
+    cfg.relay_list_url = Some(format!("http://{}/relays.json", list.local_addr().unwrap()));
+    let listed_url = format!("ws://{}", listed.local_addr().unwrap());
+    let list_server = tokio::spawn(async move {
+        let (mut stream, _) = list.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        let body = serde_json::json!([listed_url]).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (connected_tx, mut connected_rx) = mpsc::channel(2);
+    let mut servers = Vec::new();
+    for listener in [local, listed] {
+        let connected_tx = connected_tx.clone();
+        servers.push(tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            connected_tx.send(()).await.unwrap();
+            while ws.next().await.is_some() {}
+        }));
+    }
+    let signaler = NostrSignaler::new(NodeId("nostr-all-relays".into()), cfg);
+    timeout(Duration::from_secs(3), signaler.connect(mpsc::channel(8).0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(connected_rx.recv().await.is_some());
+    assert!(connected_rx.recv().await.is_some());
+    assert_eq!(signaler.senders.lock().await.len(), 2);
+    signaler.close().await.unwrap();
+    list_server.await.unwrap();
+    for server in servers {
+        server.abort();
+    }
 }

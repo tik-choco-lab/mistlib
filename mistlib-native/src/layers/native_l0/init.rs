@@ -91,16 +91,16 @@ fn build_signaler(config: &Config, local_id: &NodeId) -> Arc<BootstrapSignaler> 
         SignalingMode::WebSocket => Arc::new(BootstrapSignaler::WebSocket(Arc::new(
             WebSocketSignaler::new(&config.signaling_url),
         ))),
-        SignalingMode::Nostr => {
+        SignalingMode::Nostr | SignalingMode::NostrAuto => {
             let nostr_config = config
                 .signaling
                 .nostr
                 .clone()
                 .expect("Nostr signaling mode requires validated Nostr config");
-            Arc::new(BootstrapSignaler::Nostr(Arc::new(NostrSignaler::new(
-                local_id.clone(),
-                nostr_config,
-            ))))
+            Arc::new(BootstrapSignaler::Nostr(Arc::new(
+                NostrSignaler::new(local_id.clone(), nostr_config)
+                    .with_local_relay_preference(config.signaling.mode == SignalingMode::NostrAuto),
+            )))
         }
     }
 }

@@ -69,7 +69,52 @@ impl NostrSignaler {
         }
         self.senders.lock().await.clear();
 
-        let relays = self.resolve_relays().await?;
+        let local = if self.prefer_local_relays {
+            self.local_inline_relays()
+        } else {
+            Vec::new()
+        };
+        if !local.is_empty() && self.connect_relay_set(&local, &incoming_tx, &cancel).await {
+            return Ok(());
+        }
+        if self.prefer_local_relays && cancel.is_cancelled() {
+            return Err(Self::connection_failed());
+        }
+        let relays = if self.prefer_local_relays {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Self::connection_failed()),
+                result = self.resolve_relays() => result?,
+            }
+        } else {
+            self.resolve_relays().await?
+        };
+        let remaining: Vec<_> = relays
+            .into_iter()
+            .filter(|relay| !local.contains(relay))
+            .collect();
+        if self
+            .connect_relay_set(&remaining, &incoming_tx, &cancel)
+            .await
+        {
+            Ok(())
+        } else {
+            Err(Self::connection_failed())
+        }
+    }
+
+    fn connection_failed() -> crate::error::MistError {
+        crate::error::MistError::Network(
+            "NostrSignaler: failed to connect to any relay".to_string(),
+        )
+    }
+
+    async fn connect_relay_set(
+        &self,
+        relays: &[String],
+        incoming_tx: &mpsc::Sender<MessageContent>,
+        cancel: &CancellationToken,
+    ) -> bool {
         let results = join_all(relays.iter().map(|relay| {
             let incoming_tx = incoming_tx.clone();
             let cancel = cancel.clone();
@@ -97,13 +142,7 @@ impl NostrSignaler {
             }
         }))
         .await;
-
-        if cancel.is_cancelled() || !results.into_iter().any(|connected| connected) {
-            return Err(crate::error::MistError::Network(
-                "NostrSignaler: failed to connect to any relay".to_string(),
-            ));
-        }
-        Ok(())
+        !cancel.is_cancelled() && results.into_iter().any(|connected| connected)
     }
 
     fn spawn_relay_supervisor(

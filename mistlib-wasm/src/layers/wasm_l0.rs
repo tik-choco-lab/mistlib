@@ -524,14 +524,15 @@ fn build_bootstrap_signaler(
         SignalingMode::WebSocket => Arc::new(WasmBootstrapSignaler::WebSocket(Arc::new(
             WasmWebSocketSignaler::new(signaling_url),
         ))),
-        SignalingMode::Nostr => {
+        SignalingMode::Nostr | SignalingMode::NostrAuto => {
             let nostr_config = config
                 .signaling
                 .nostr
                 .clone()
                 .expect("Nostr signaling mode requires validated Nostr config");
             Arc::new(WasmBootstrapSignaler::Nostr(Arc::new(
-                WasmNostrSignaler::new(local_id.clone(), nostr_config),
+                WasmNostrSignaler::new(local_id.clone(), nostr_config)
+                    .with_local_relay_preference(config.signaling.mode == SignalingMode::NostrAuto),
             )))
         }
     }

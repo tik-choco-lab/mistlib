@@ -35,7 +35,10 @@ pub use event::{
 };
 pub use identity::{BindOutcome, DiscoveryTable, SignalingSecretKey, TemporarySignalingIdentity};
 pub use invite::{derive_discovery_proof, derive_invite_scope, derive_invite_secret};
-pub use relay_list::{normalize_relays, parse_relay_list_json, DEFAULT_RELAY_LIST_URL};
+pub use relay_list::{
+    is_local_relay, normalize_relays, parse_relay_list_json, split_local_relays,
+    DEFAULT_RELAY_LIST_URL,
+};
 pub use session::{
     accept_message_order, accept_sender_for_payload, next_outgoing_sequence,
     record_discovery_and_should_request, MessageOrderAcceptance,

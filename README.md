@@ -143,7 +143,7 @@ to see every key and what it is set to.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `signaling.mode` | `"nostr"` | `"nostr"` or `"websocket"` |
+| `signaling.mode` | `"nostr_auto"` | `"nostr_auto"` prefers local relays; `"nostr"` connects to all relays; `"websocket"` uses WebSocket signaling |
 | `signaling.nostr.relays` | *(empty)* | Relays used for peer discovery. Left empty, mistlib fetches a relay list over the network at startup — set this to keep discovery under your control |
 | `signaling.nostr.inviteSalt` / `inviteCode` | placeholders | Shared secret scoping discovery to your app |
 | `aoiRange` | `10.0` | Radius, in world units, that counts as near |

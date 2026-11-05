@@ -1,7 +1,7 @@
 use super::WasmNostrSignaler;
 use futures::future::{select, Either};
 use gloo_timers::future::TimeoutFuture;
-use mistlib_core::signaling::nostr::{normalize_relays, parse_relay_list_json};
+use mistlib_core::signaling::nostr::{normalize_relays, parse_relay_list_json, split_local_relays};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -10,6 +10,10 @@ const FETCH_TIMEOUT_MS: u32 = 10_000;
 const MAX_RELAY_LIST_BYTES: usize = 256 * 1024;
 
 impl WasmNostrSignaler {
+    pub(super) fn local_inline_relays(&self) -> Vec<String> {
+        split_local_relays(normalize_relays(self.relays.clone()).unwrap_or_default()).0
+    }
+
     pub(super) async fn resolve_relays(&self) -> Result<Vec<String>, JsValue> {
         let mut relays = self.relays.clone();
         if let Some(url) = &self.relay_list_url {

@@ -6,7 +6,7 @@ use mistlib_core::signaling::nostr::{
 };
 use mistlib_core::signaling::MessageContent;
 use mistlib_core::stats::STATS;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use wasm_bindgen::prelude::*;
@@ -57,10 +57,73 @@ impl WasmNostrSignaler {
         let epoch = self.next_reconnect_epoch();
         self.close_sockets();
         let mut cancelled = self.reconnect_cancel.subscribe();
-        let mut waiters = Vec::new();
-        let relays = self.resolve_relays().await?;
+        let local = if self.prefer_local_relays {
+            self.local_inline_relays()
+        } else {
+            Vec::new()
+        };
+        if !local.is_empty() {
+            let (opened, _) = self.connect_relay_set(&local, &tx, epoch, true).await?;
+            if opened {
+                return Ok(());
+            }
+        }
+        if !self.reconnect_epoch_matches(epoch) {
+            return Err(JsValue::from_str(
+                "WasmNostrSignaler: stale reconnect epoch",
+            ));
+        }
+        let relays = if self.prefer_local_relays {
+            match futures::future::select(
+                Box::pin(self.resolve_relays()),
+                Box::pin(cancelled.changed()),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _))
+                    if self.reconnect_epoch_matches(epoch) =>
+                {
+                    result?
+                }
+                _ => {
+                    return Err(JsValue::from_str(
+                        "WasmNostrSignaler: stale reconnect epoch",
+                    ))
+                }
+            }
+        } else {
+            self.resolve_relays().await?
+        };
+        let remaining: Vec<_> = relays
+            .into_iter()
+            .filter(|relay| !local.contains(relay))
+            .collect();
+        let (opened, timed_out) = self
+            .connect_relay_set(&remaining, &tx, epoch, false)
+            .await?;
+        if opened {
+            Ok(())
+        } else if timed_out {
+            Err(JsValue::from_str(
+                "WasmNostrSignaler: relay connection timed out",
+            ))
+        } else {
+            Err(JsValue::from_str(
+                "WasmNostrSignaler: failed to connect to any relay",
+            ))
+        }
+    }
 
-        for relay in &relays {
+    async fn connect_relay_set(
+        &self,
+        relays: &[String],
+        tx: &mpsc::UnboundedSender<MessageContent>,
+        epoch: u64,
+        local_phase: bool,
+    ) -> Result<(bool, bool), JsValue> {
+        let mut cancelled = self.reconnect_cancel.subscribe();
+        let mut waiters = Vec::new();
+        for relay in relays {
             match self.open_relay(relay.clone(), tx.clone(), epoch).await {
                 Ok(connection) => waiters.push(connection),
                 Err(err) => {
@@ -71,51 +134,67 @@ impl WasmNostrSignaler {
             }
         }
 
-        let timeout = gloo_timers::future::TimeoutFuture::new(CONNECT_TIMEOUT_MS);
+        let sockets: Vec<_> = waiters.iter().map(|(ws, _)| ws.clone()).collect();
+        let opened = Rc::new(Cell::new(false));
+        let opened_waiters = opened.clone();
         let wait_all = async {
-            let mut opened_any = false;
-            for (ws, waiter) in waiters {
-                if matches!(waiter.await, Ok(Ok(()))) {
-                    opened_any = true;
-                } else {
-                    self.remove_socket(&ws);
-                    let _ = ws.close();
+            if local_phase {
+                futures::future::join_all(waiters.into_iter().map(|(ws, waiter)| {
+                    let opened = opened_waiters.clone();
+                    async move {
+                        if matches!(waiter.await, Ok(Ok(()))) {
+                            opened.set(true);
+                        } else {
+                            self.remove_socket(&ws);
+                            let _ = ws.close();
+                        }
+                    }
+                }))
+                .await;
+            } else {
+                for (ws, waiter) in waiters {
+                    if matches!(waiter.await, Ok(Ok(()))) {
+                        opened_waiters.set(true);
+                    } else {
+                        self.remove_socket(&ws);
+                        let _ = ws.close();
+                    }
                 }
             }
-            opened_any
         };
+        let timeout = gloo_timers::future::TimeoutFuture::new(CONNECT_TIMEOUT_MS);
         let connection = futures::future::select(Box::pin(wait_all), timeout);
         if !self.reconnect_epoch_matches(epoch) {
             return Err(JsValue::from_str(
                 "WasmNostrSignaler: stale reconnect epoch",
             ));
         }
-        let result = match futures::future::select(
+        let timed_out = match futures::future::select(
             Box::pin(connection),
             Box::pin(cancelled.changed()),
         )
         .await
         {
-            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Left((futures::future::Either::Left(_), _)) => false,
+            futures::future::Either::Left((futures::future::Either::Right(_), _)) => true,
             futures::future::Either::Right(_) => {
                 return Err(JsValue::from_str(
                     "WasmNostrSignaler: stale reconnect epoch",
-                ))
+                ));
             }
         };
-        match result {
-            futures::future::Either::Left((true, _)) => Ok(()),
-            futures::future::Either::Left((false, _)) => Err(JsValue::from_str(
-                "WasmNostrSignaler: failed to connect to any relay",
-            )),
-            // A hung relay must not fail the join when another one already
-            // opened; sockets still connecting stay registered and subscribe
-            // from onopen if they eventually open.
-            futures::future::Either::Right((_, _)) if self.any_socket_open() => Ok(()),
-            futures::future::Either::Right((_, _)) => Err(JsValue::from_str(
-                "WasmNostrSignaler: relay connection timed out",
-            )),
+        let opened_any = if timed_out {
+            (local_phase && opened.get()) || self.any_socket_open()
+        } else {
+            opened.get()
+        };
+        if local_phase && !opened_any {
+            for ws in sockets {
+                self.remove_socket(&ws);
+                let _ = ws.close();
+            }
         }
+        Ok((opened_any, timed_out))
     }
 
     fn any_socket_open(&self) -> bool {

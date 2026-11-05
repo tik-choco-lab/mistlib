@@ -143,7 +143,7 @@ Native の `get_version` / `get_build_info` は呼び出し側バッファへ書
 
 | キー | 既定値 | 意味 |
 | --- | --- | --- |
-| `signaling.mode` | `"nostr"` | `"nostr"` または `"websocket"` |
+| `signaling.mode` | `"nostr_auto"` | `"nostr_auto"` はローカル relay を優先、`"nostr"` は全 relay に接続、`"websocket"` は WebSocket シグナリングを使用 |
 | `signaling.nostr.relays` | *(空)* | ピア発見に使うリレー。空のままだと起動時にネットワーク越しにリレー一覧を取得しに行くので、経路を自分で握りたければ明示すること |
 | `signaling.nostr.inviteSalt` / `inviteCode` | プレースホルダ | 発見範囲をアプリ単位に区切る共有秘密 |
 | `aoiRange` | `10.0` | 「近い」とみなす半径（ワールド単位） |

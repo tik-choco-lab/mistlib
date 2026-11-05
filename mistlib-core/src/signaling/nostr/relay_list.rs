@@ -2,6 +2,7 @@ pub use crate::config::DEFAULT_NOSTR_RELAY_LIST_URL as DEFAULT_RELAY_LIST_URL;
 use crate::error::{MistError, Result};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::net::IpAddr;
 
 const MAX_RELAYS: usize = 64;
 
@@ -31,6 +32,25 @@ pub fn normalize_relays(relays: Vec<String>) -> Result<Vec<String>> {
         ));
     }
     Ok(out)
+}
+
+/// Returns whether a WebSocket relay URL has a loopback host.
+pub fn is_local_relay(relay: &str) -> bool {
+    let relay = relay.trim().to_ascii_lowercase();
+    let Some(rest) = relay
+        .strip_prefix("ws://")
+        .or_else(|| relay.strip_prefix("wss://"))
+    else {
+        return false;
+    };
+    host_from_authority(rest.split('/').next().unwrap_or(rest)).is_some_and(|host| {
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+/// Split already-normalized relay URLs into loopback and other relays.
+pub fn split_local_relays(relays: Vec<String>) -> (Vec<String>, Vec<String>) {
+    relays.into_iter().partition(|relay| is_local_relay(relay))
 }
 
 fn collect_relays(value: &Value, relays: &mut Vec<String>) {
@@ -82,7 +102,10 @@ fn host_from_authority(authority: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relays, parse_relay_list_json, DEFAULT_RELAY_LIST_URL};
+    use super::{
+        is_local_relay, normalize_relays, parse_relay_list_json, split_local_relays,
+        DEFAULT_RELAY_LIST_URL,
+    };
 
     #[test]
     fn parses_array_relay_list() {
@@ -126,6 +149,43 @@ mod tests {
 
         assert!(parse_relay_list_json(r#"{"relays":["https://not-relay"]}"#).is_err());
         assert!(parse_relay_list_json(r#"{"relays":["wss://","ws://:7777"]}"#).is_err());
+    }
+
+    #[test]
+    fn detects_only_loopback_relay_hosts() {
+        for relay in [
+            " ws://LOCALHOST:7777 ",
+            "wss://127.42.3.4",
+            "ws://[::1]:7777/path",
+            "WS://user@localhost/",
+        ] {
+            assert!(is_local_relay(relay), "{relay}");
+        }
+        for relay in [
+            "http://localhost",
+            "ws://localhost.example",
+            "ws://127.0.0.1.example",
+            "ws://[::2]",
+            "ws://128.0.0.1",
+            "ws://",
+        ] {
+            assert!(!is_local_relay(relay), "{relay}");
+        }
+    }
+
+    #[test]
+    fn normalized_relays_are_partitioned_for_initial_phase() {
+        let relays = normalize_relays(vec![
+            " wss://remote.example ".into(),
+            "ws://localhost:7777".into(),
+            "ws://localhost:7777".into(),
+            "https://localhost".into(),
+            "ws://127.10.2.3".into(),
+        ])
+        .unwrap();
+        let (local, remote) = split_local_relays(relays);
+        assert_eq!(local, ["ws://localhost:7777", "ws://127.10.2.3"]);
+        assert_eq!(remote, ["wss://remote.example"]);
     }
 
     #[test]

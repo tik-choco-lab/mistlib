@@ -138,7 +138,7 @@ WASM 的 `leave_room_id(id)` 是已弃用的别名；无参数的 `leave_room()`
 
 | 键 | 默认值 | 含义 |
 | --- | --- | --- |
-| `signaling.mode` | `"nostr"` | `"nostr"` 或 `"websocket"` |
+| `signaling.mode` | `"nostr_auto"` | `"nostr_auto"` 优先使用本地中继；`"nostr"` 连接所有中继；`"websocket"` 使用 WebSocket 信令 |
 | `signaling.nostr.relays` | *(空)* | 用于节点发现的中继。留空时会在启动阶段联网获取中继列表，若想自行掌控请显式指定 |
 | `signaling.nostr.inviteSalt` / `inviteCode` | 占位值 | 将发现范围限定到你的应用的共享密钥 |
 | `aoiRange` | `10.0` | 视为「附近」的半径（世界单位） |

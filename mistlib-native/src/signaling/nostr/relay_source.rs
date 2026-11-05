@@ -1,6 +1,6 @@
 use super::NostrSignaler;
 use crate::error::{MistError, Result};
-use mistlib_core::signaling::nostr::{normalize_relays, parse_relay_list_json};
+use mistlib_core::signaling::nostr::{normalize_relays, parse_relay_list_json, split_local_relays};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_native_tls::{native_tls, TlsConnector};
@@ -11,6 +11,10 @@ mod http;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl NostrSignaler {
+    pub(super) fn local_inline_relays(&self) -> Vec<String> {
+        split_local_relays(normalize_relays(self.relays.clone()).unwrap_or_default()).0
+    }
+
     pub(super) async fn resolve_relays(&self) -> Result<Vec<String>> {
         let mut relays = self.relays.clone();
         if let Some(url) = &self.relay_list_url {

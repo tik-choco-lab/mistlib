@@ -2,9 +2,9 @@ use crate::config::{Config, SignalingMode};
 use crate::signaling::nostr::DEFAULT_RELAY_LIST_URL;
 
 #[test]
-fn config_default_signaling_mode_is_nostr() {
+fn config_default_signaling_mode_is_nostr_auto() {
     let config = Config::new_default();
-    assert_eq!(config.signaling.mode, SignalingMode::Nostr);
+    assert_eq!(config.signaling.mode, SignalingMode::NostrAuto);
     assert_eq!(config.signaling_url, "wss://rtc.tik-choco.com/signaling");
     let nostr = config
         .signaling
@@ -15,7 +15,7 @@ fn config_default_signaling_mode_is_nostr() {
 }
 
 #[test]
-fn full_config_without_signaling_uses_default_nostr_mode() {
+fn full_config_without_signaling_uses_default_nostr_auto_mode() {
     let json = r#"{
         "signalingUrl": "wss://example.invalid/signaling",
         "limits": {
@@ -47,7 +47,7 @@ fn full_config_without_signaling_uses_default_nostr_mode() {
     }"#;
 
     let config: Config = serde_json::from_str(json).expect("old full config should deserialize");
-    assert_eq!(config.signaling.mode, SignalingMode::Nostr);
+    assert_eq!(config.signaling.mode, SignalingMode::NostrAuto);
     assert!(config.signaling.nostr.is_some());
 }
 
@@ -272,4 +272,28 @@ fn default_invite_is_rejected_for_public_relay_list_url() {
         updated.is_err(),
         "public relayListUrl requires a non-default invite"
     );
+}
+
+#[test]
+fn nostr_auto_flat_config_uses_nostr_validation() {
+    for mode in ["nostr_auto", "nostrAuto"] {
+        let mut config = Config::new_default();
+        let valid = format!(
+            r#"{{"signaling":{{"mode":"{mode}","nostr":{{"relays":["ws://localhost:7777"]}}}}}}"#
+        );
+        config.update_from_json(&valid).unwrap();
+        assert_eq!(config.signaling.mode, SignalingMode::NostrAuto);
+        assert!(config.validate_signaling());
+        let invalid = format!(
+            r#"{{"signaling":{{"mode":"{mode}","nostr":{{"relays":["wss://relay.example.invalid"]}}}}}}"#
+        );
+        assert!(config.update_from_json(&invalid).is_err());
+        let missing = format!(r#"{{"signaling":{{"mode":"{mode}"}}}}"#);
+        assert!(config.update_from_json(&missing).is_err());
+    }
+    let mut config = Config::new_default();
+    config
+        .update_from_json(r#"{"signaling":{"nostr":{"relays":["ws://localhost:7777"]}}}"#)
+        .unwrap();
+    assert_eq!(config.signaling.mode, SignalingMode::NostrAuto);
 }
