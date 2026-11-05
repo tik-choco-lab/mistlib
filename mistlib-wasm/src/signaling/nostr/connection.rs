@@ -2,7 +2,8 @@ use super::connection_state::SocketState;
 use super::WasmNostrSignaler;
 use js_sys::Uint8Array;
 use mistlib_core::signaling::nostr::{
-    discovery_filter, message_filter, parse_relay_message, req_frame_json, RelayMessage,
+    discovery_filter, message_filter, parse_relay_message, req_frame_json, split_local_relays,
+    RelayMessage,
 };
 use mistlib_core::signaling::MessageContent;
 use mistlib_core::stats::STATS;
@@ -94,10 +95,29 @@ impl WasmNostrSignaler {
         } else {
             self.resolve_relays().await?
         };
-        let remaining: Vec<_> = relays
+        let mut remaining: Vec<_> = relays
             .into_iter()
             .filter(|relay| !local.contains(relay))
             .collect();
+        if self.prefer_local_relays {
+            // The fetched relay list may itself contain a loopback relay (the
+            // default list does). Apply the same local-first rule to it.
+            let (listed_local, others) = split_local_relays(remaining);
+            if !listed_local.is_empty() {
+                let (opened, _) = self
+                    .connect_relay_set(&listed_local, &tx, epoch, true)
+                    .await?;
+                if opened {
+                    return Ok(());
+                }
+                if !self.reconnect_epoch_matches(epoch) {
+                    return Err(JsValue::from_str(
+                        "WasmNostrSignaler: stale reconnect epoch",
+                    ));
+                }
+            }
+            remaining = others;
+        }
         let (opened, timed_out) = self
             .connect_relay_set(&remaining, &tx, epoch, false)
             .await?;

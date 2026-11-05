@@ -544,3 +544,55 @@ async fn nostr_without_preference_fetches_list_and_connects_all_relays() {
         server.abort();
     }
 }
+
+#[tokio::test]
+async fn healthy_local_from_relay_list_skips_listed_remote_relays() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The default public relay list itself contains a loopback relay, so the
+    // local-first rule must also apply to fetched lists, not only inline relays.
+    let local = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let list = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let local_url = format!("ws://localhost:{}/", local.local_addr().unwrap().port());
+    let mut cfg = config();
+    cfg.relays = vec![];
+    cfg.relay_list_url = Some(format!("http://{}/relays.json", list.local_addr().unwrap()));
+    let list_server = tokio::spawn(async move {
+        let (mut stream, _) = list.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        // A non-routable (RFC 5737 TEST-NET-1) remote relay would hang until RELAY_CONNECT_TIMEOUT
+        // if it were attempted alongside the local one.
+        let body = serde_json::json!([local_url, "ws://192.0.2.1:7777"]).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let relay_server = tokio::spawn(async move {
+        let (stream, _) = local.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        while ws.next().await.is_some() {}
+    });
+    let signaler =
+        NostrSignaler::new(NodeId("listed-local".into()), cfg).with_local_relay_preference(true);
+    timeout(Duration::from_secs(3), signaler.connect(mpsc::channel(8).0))
+        .await
+        .expect("a listed remote relay must not be attempted once the listed local relay opens")
+        .unwrap();
+    assert_eq!(signaler.senders.lock().await.len(), 1);
+    signaler.close().await.unwrap();
+    list_server.await.unwrap();
+    relay_server.abort();
+}

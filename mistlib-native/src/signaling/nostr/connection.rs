@@ -5,7 +5,8 @@ use mistlib_core::signaling::nostr::closed::{
     is_permanent_closed_reason, ClosedAction, ClosedResubscribe,
 };
 use mistlib_core::signaling::nostr::{
-    discovery_filter, message_filter, parse_relay_message, req_frame_json, RelayMessage,
+    discovery_filter, message_filter, parse_relay_message, req_frame_json, split_local_relays,
+    RelayMessage,
 };
 use mistlib_core::signaling::reconnect::ReconnectBackoff;
 use mistlib_core::signaling::MessageContent;
@@ -89,10 +90,26 @@ impl NostrSignaler {
         } else {
             self.resolve_relays().await?
         };
-        let remaining: Vec<_> = relays
+        let mut remaining: Vec<_> = relays
             .into_iter()
             .filter(|relay| !local.contains(relay))
             .collect();
+        if self.prefer_local_relays {
+            // The fetched relay list may itself contain a loopback relay (the
+            // default list does). Apply the same local-first rule to it.
+            let (listed_local, others) = split_local_relays(remaining);
+            if !listed_local.is_empty()
+                && self
+                    .connect_relay_set(&listed_local, &incoming_tx, &cancel)
+                    .await
+            {
+                return Ok(());
+            }
+            if cancel.is_cancelled() {
+                return Err(Self::connection_failed());
+            }
+            remaining = others;
+        }
         if self
             .connect_relay_set(&remaining, &incoming_tx, &cancel)
             .await
