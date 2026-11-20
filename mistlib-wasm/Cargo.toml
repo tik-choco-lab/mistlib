@@ -1,6 +1,6 @@
 [package]
 name = "mistlib-wasm"
-version = "0.7.3-beta.5"
+version = "0.7.3-beta.6"
 edition = "2021"
 license = "MPL-2.0"
 
@@ -28,6 +28,7 @@ web-sys = { version = "0.3", features = [
     "RtcOfferOptions",
     "RtcPeerConnectionIceEvent",
     "RtcRtpReceiver",
+    "RtcRtpParameters",
     "RtcRtpSender",
     "RtcRtpTransceiver",
     "RtcSdpType",
@@ -77,3 +78,4 @@ getrandom = { version = "0.2", features = ["js"] }
 web-time = "1.1.0"
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = ["Document", "HtmlCanvasElement"] }

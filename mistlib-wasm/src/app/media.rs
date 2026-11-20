@@ -115,6 +115,29 @@ pub fn set_local_track_audience(
     Ok(())
 }
 
+pub fn set_local_track_encoding(
+    track_id: String,
+    max_bitrate_bps: Option<u32>,
+    max_framerate: Option<f64>,
+    degradation_preference: Option<String>,
+) -> Result<(), JsValue> {
+    let transports = crate::app::all_session_webrtc_transports();
+    if transports.is_empty() {
+        return Err(JsValue::from_str("WebRTC transport is not initialized"));
+    }
+    let encoding = crate::transport::webrtc::TrackEncoding {
+        max_bitrate_bps,
+        max_framerate,
+        degradation_preference,
+    };
+    for webrtc in transports {
+        webrtc
+            .set_local_track_encoding(&track_id, encoding.clone())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub fn publish_local_track(track_id: String) -> Result<(), JsValue> {
     let transports = crate::app::all_session_webrtc_transports();
     if transports.is_empty() {

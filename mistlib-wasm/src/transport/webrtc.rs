@@ -261,12 +261,22 @@ const BUFFERED_AMOUNT_HARD_LIMIT: u32 = 8 * 1024 * 1024; // 8 MiB
 /// grants permission to send while still above the high watermark.
 const BUFFERED_AMOUNT_WAIT_TIMEOUT_MS: u32 = 3000;
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackEncoding {
+    pub max_bitrate_bps: Option<u32>,
+    pub max_framerate: Option<f64>,
+    /// "maintain-framerate", "maintain-resolution", or "balanced".
+    pub degradation_preference: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct LocalTrack {
     pub track: MediaStreamTrack,
     pub kind: String,
     pub published: bool,
     pub audience: mistlib_core::transport::track_audience::TrackAudience,
+    pub encoding: Option<TrackEncoding>,
+    encoding_updates: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub struct WasmWebRtcTransport {
@@ -2012,6 +2022,7 @@ impl WasmWebRtcTransport {
                 .await
                 .map_err(|e| mistlib_core::error::MistError::Internal(format!("{:?}", e)))?;
 
+            self.reapply_peer_track_encodings(&remote_id);
             self.apply_pending_candidates(&remote_id, &peer);
 
             self.send_negotiation(&remote_id, SignalingType::Answer, answer_sdp)
@@ -2208,6 +2219,7 @@ impl WasmWebRtcTransport {
             return Err(mistlib_core::error::MistError::Internal(format!("{:?}", e)));
         }
 
+        self.reapply_peer_track_encodings(&remote_id);
         self.apply_pending_candidates(&remote_id, &peer);
 
         let room_id = self
@@ -3185,6 +3197,7 @@ impl SignalingHandler for WasmWebRtcTransport {
                             .await;
                         return Err(mistlib_core::error::MistError::Internal(format!("{:?}", e)));
                     }
+                    self.reapply_peer_track_encodings(&data.sender_id);
                     *peer
                         .applied_answer_sdp
                         .lock()

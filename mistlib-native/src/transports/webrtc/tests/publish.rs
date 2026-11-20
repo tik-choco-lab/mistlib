@@ -1,15 +1,9 @@
 //! Unit coverage for the native-side track PUBLISH API
 //! (`transports::webrtc::publish`): the `published_tracks`/`published_senders`
 //! bookkeeping, `attach_published_tracks_to_peer`'s idempotency, and the
-//! new-peer hook wired into `connection::create_pc`. These don't need real
-//! ICE connectivity -- `create_offer`/`set_local_description`/`add_track` are
-//! all local SDP/state operations -- so, like the rest of this module's
-//! tests, they run against `MockSignaler` without a live network. The
-//! renegotiation-over-a-real-connection path (reaching `Stable` with a second
-//! real peer) is covered by the `#[ignore]`d test in
-//! `mistlib-native/tests/loopback_media.rs`, matching how
-//! `add_track_and_renegotiate_rejects_while_first_offer_is_still_pending`
-//! (`tests/basic.rs`) already documents that split.
+//! new-peer hook wired into `connection::create_pc`. The bookkeeping tests
+//! use `MockSignaler`. The renegotiation tests connect two local peers and
+//! send RTP through the same transport and track callback used by the app.
 
 use super::make_transport;
 use mistlib_core::types::NodeId;
@@ -428,4 +422,128 @@ async fn audience_change_before_the_peer_is_registered_is_caught_up() {
     // Already in sync: a no-op.
     t.resync_registered_peer(&added, &peer).await;
     assert!(has_sender(&t, &added, "voice").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renegotiated_tracks_reach_initial_offerer() {
+    receive_renegotiated_tracks(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renegotiated_tracks_reach_initial_answerer() {
+    receive_renegotiated_tracks(false).await;
+}
+
+async fn receive_renegotiated_tracks(receiver_offers_first: bool) {
+    use super::disconnect::{make_connected_pair, wait_for_state};
+    use bytes::Bytes;
+    use mistlib_core::{transport::Transport, types::ConnectionState};
+    use std::time::Duration;
+    use webrtc::api::media_engine::MIME_TYPE_OPUS;
+    use webrtc::track::track_local::TrackLocalWriter;
+
+    let (initiator, responder, initiator_id, responder_id) = make_connected_pair();
+    initiator.set_ice_servers(vec![]);
+    responder.set_ice_servers(vec![]);
+    let (receiver, publisher, receiver_id, publisher_id) = if receiver_offers_first {
+        (&initiator, &responder, &initiator_id, &responder_id)
+    } else {
+        (&responder, &initiator, &responder_id, &initiator_id)
+    };
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    receiver.set_media_track_handler(tx);
+    initiator.connect(&responder_id).await.unwrap();
+    assert!(wait_for_state(publisher, receiver_id, ConnectionState::Connected, 10_000).await);
+    assert!(wait_for_state(receiver, publisher_id, ConnectionState::Connected, 10_000).await);
+
+    let peer = publisher.peers.read().await[receiver_id].clone();
+    let initial = peer.pc.current_local_description().await.unwrap();
+    assert_eq!(
+        initial.sdp.lines().filter(|l| l.starts_with("m=")).count(),
+        1
+    );
+    assert!(initial.sdp.contains("m=application "));
+
+    let video = make_track("video");
+    let audio = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            ..Default::default()
+        },
+        "audio".to_owned(),
+        "stream".to_owned(),
+    ));
+    peer.pc.add_track(audio.clone()).await.unwrap();
+    peer.pc.add_track(video.clone()).await.unwrap();
+    publisher.send_offer(receiver_id, &peer).await.unwrap();
+    let offer = peer.pc.local_description().await.unwrap();
+    assert!(offer.sdp.lines().any(|line| line == "a=group:BUNDLE 0 1 2"));
+
+    // on_track is dispatched on the first RTP packet for each receiver.
+    let mut codecs = Vec::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut sequence_number = 0u16;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while codecs.len() < 2 {
+            tokio::select! {
+                event = events.recv() => {
+                    let event = event.expect("media channel closed");
+                    assert_eq!(&event.remote_id, publisher_id);
+                    codecs.push(event.track.codec().capability.mime_type);
+                }
+                _ = tick.tick() => {
+                    for (track, step, payload) in [
+                        (&video, 1800, &[0x65, 0x88][..]),
+                        (&audio, 960, &[0xf8, 0xff, 0xfe][..]),
+                    ] {
+                        track.write_rtp(&rtp::packet::Packet {
+                            header: rtp::header::Header {
+                                version: 2,
+                                marker: true,
+                                sequence_number,
+                                timestamp: u32::from(sequence_number) * step,
+                                ..Default::default()
+                            },
+                            payload: Bytes::from_static(payload),
+                        }).await.unwrap();
+                    }
+                    sequence_number += 1;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out receiving H264 and Opus; got {codecs:?}"));
+    codecs.sort();
+    assert_eq!(codecs, [MIME_TYPE_OPUS, MIME_TYPE_H264]);
+
+    // webrtc-rs accepts a role change on an established transport; Chrome
+    // checks the answer before it sends any RTP. The first answer is active,
+    // so the original offerer must keep its passive role on every bundled MID.
+    let expected_setup = if receiver_offers_first {
+        "a=setup:passive"
+    } else {
+        "a=setup:active"
+    };
+    let answer = peer.pc.current_remote_description().await.unwrap();
+    let setup: Vec<_> = answer
+        .sdp
+        .lines()
+        .filter(|l| l.starts_with("a=setup:"))
+        .collect();
+    assert_eq!(setup, [expected_setup; 3]);
+    if receiver_offers_first {
+        let receiver_peer = receiver.peers.read().await[publisher_id].clone();
+        let local_answer = receiver_peer.pc.local_description().await.unwrap();
+        let media_setup: Vec<_> = local_answer
+            .sdp
+            .split("\nm=")
+            .skip(1)
+            .map(|section| section.lines().find(|line| line.starts_with("a=setup:")))
+            .collect();
+        assert_eq!(media_setup, [Some("a=setup:passive"); 3]);
+    }
+    initiator.disconnect(&responder_id).await.unwrap();
 }

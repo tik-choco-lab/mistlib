@@ -428,6 +428,7 @@ impl WebRtcTransport {
         };
 
         if let Some(peer) = existing_peer {
+            let negotiating = peer.negotiating.lock().await;
             // Glare resolution: if we're the impolite side (lower ID =
             // initiator) and we have our own offer in flight on this same
             // peer connection, ignore their offer so ours proceeds instead of
@@ -461,6 +462,7 @@ impl WebRtcTransport {
                 .should_takeover_on_fresh_offer(&remote_id, &peer, &sdp)
                 .await
             {
+                drop(negotiating);
                 self.takeover_stale_session(&remote_id, "remote_new_offer_takeover")
                     .await;
             } else {
@@ -490,6 +492,7 @@ impl WebRtcTransport {
                 );
                 match decision {
                     Some(DuplicateOfferAction::ResendAnswer) => {
+                        drop(negotiating);
                         tracing::info!(
                             "[OfferResend] duplicate offer from {}: re-sending existing answer",
                             remote_id
@@ -526,7 +529,7 @@ impl WebRtcTransport {
                     None => {}
                 }
                 return self
-                    .apply_offer(remote_id, sdp, reliable_unordered, peer)
+                    .apply_offer_locked(remote_id, sdp, reliable_unordered, &peer)
                     .await;
             }
         }
@@ -598,6 +601,8 @@ impl WebRtcTransport {
             }
         };
 
+        // Reserve the first exchange before a local track change can offer on this peer.
+        let negotiating = peer.negotiating.lock().await;
         let old_peer = {
             let mut peers = self.peers.write().await;
             peers.insert(remote_id.clone(), peer.clone())
@@ -639,8 +644,9 @@ impl WebRtcTransport {
         self.spawn_connection_watchdog(remote_id.clone(), attempt_id);
 
         let result = self
-            .apply_offer(remote_id.clone(), sdp, reliable_unordered, peer.clone())
+            .apply_offer_locked(remote_id.clone(), sdp, reliable_unordered, &peer)
             .await;
+        drop(negotiating);
 
         if result.is_err() {
             // Guard on the peer this call just inserted: a concurrent
@@ -656,14 +662,14 @@ impl WebRtcTransport {
         } else if self.has_published_tracks_for(&remote_id) {
             // New-peer hook, answer-side completion: `create_pc` (called
             // above) already attached every published track to `peer`'s
-            // RTCPeerConnection before `apply_offer` ran, but per JSEP the
+            // RTCPeerConnection before `apply_offer_locked` ran, but per JSEP the
             // answer we just sent cannot introduce m= sections beyond what
             // the remote's offer contained -- `webrtc-rs`'s `create_answer`
             // silently omits any local transceiver that doesn't match one in
             // the remote offer (`generate_matched_sdp(..., includeUnmatched:
             // false, ...)`). So the published tracks' transceivers exist on
             // the peer connection but are not yet negotiated. Once signaling
-            // has settled back to Stable (which `apply_offer` just did), send
+            // has settled back to Stable (which `apply_offer_locked` just did), send
             // a follow-up offer of our own -- webrtc-rs's `create_offer` does
             // include unmatched local transceivers once a remote description
             // is already set, so this picks them up. A live network test of
@@ -691,25 +697,14 @@ impl WebRtcTransport {
     /// existing live peer being renegotiated -- since the offer/answer
     /// mechanics are identical either way; only what happens on error differs
     /// (the caller decides whether to tear the peer down).
-    async fn apply_offer(
+    /// The caller holds `peer.negotiating` throughout the exchange.
+    async fn apply_offer_locked(
         &self,
         remote_id: NodeId,
         sdp: String,
         reliable_unordered: Option<u8>,
-        peer: Arc<Peer>,
+        peer: &Peer,
     ) -> crate::error::Result<()> {
-        // Held for the whole set_remote_description -> create_answer ->
-        // set_local_description -> send sequence below -- see
-        // `Peer::negotiating`'s doc comment. Both of `handle_offer`'s call
-        // sites read `signaling_state` before reaching here without holding
-        // this lock, so re-check it immediately below now that we actually
-        // hold it: a concurrent negotiation step on this same peer (e.g.
-        // another `apply_offer` for a second offer that arrived moments
-        // later via the overlay signaling path, which dispatches each
-        // inbound message on its own unserialized `tokio::spawn`) may have
-        // already changed the state by the time this call gets its turn.
-        let _negotiating = peer.negotiating.lock().await;
-
         if peer.pc.signaling_state() != RTCSignalingState::Stable {
             return Err(crate::error::MistError::Internal(format!(
                 "Offer precondition failed: signaling_state={:?}",

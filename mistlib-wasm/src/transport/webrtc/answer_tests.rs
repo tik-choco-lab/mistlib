@@ -260,3 +260,131 @@ async fn duplicate_answers_are_idempotent_and_acknowledged() {
     peer.close_all(&remote);
     answerer.close();
 }
+
+#[wasm_bindgen_test(async)]
+async fn local_track_encoding_survives_replacement_and_updates_negotiated_sender() {
+    let transport = WasmWebRtcTransport::new(Arc::new(Recorder::default()), NodeId("a".into()));
+    transport.set_ice_servers(vec![]);
+    let remote = NodeId("b".into());
+    let canvas: web_sys::HtmlCanvasElement = web_sys::window()
+        .unwrap()
+        .document()
+        .unwrap()
+        .create_element("canvas")
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    let stream = canvas.capture_stream().unwrap();
+    let track: MediaStreamTrack = stream.get_video_tracks().get(0).dyn_into().unwrap();
+    let replacement = MediaStreamTrack::clone(&track);
+
+    let track_id = "screen";
+    let initial = TrackEncoding {
+        max_bitrate_bps: Some(8_000_000),
+        max_framerate: Some(30.0),
+        degradation_preference: None,
+    };
+    assert!(transport
+        .set_local_track_encoding(track_id, initial.clone())
+        .is_err());
+    transport
+        .register_local_track(track_id.into(), track.clone())
+        .unwrap();
+    transport
+        .set_local_track_encoding(track_id, initial.clone())
+        .unwrap();
+    transport.publish_local_track(track_id).await.unwrap();
+    transport
+        .register_local_track(track_id.into(), replacement.clone())
+        .unwrap();
+    {
+        let tracks = transport.local_tracks.read().unwrap();
+        let local = &tracks[track_id];
+        assert_eq!(local.encoding.as_ref(), Some(&initial));
+        assert!(local.published);
+    }
+
+    let peer = transport.create_pc(remote.clone()).unwrap();
+    transport
+        .peers
+        .write()
+        .unwrap()
+        .insert(remote.clone(), peer.clone());
+    let sender = transport.peer_senders.read().unwrap()[&remote][track_id].clone();
+    let offer: RtcSessionDescriptionInit = JsFuture::from(peer.pc.create_offer())
+        .await
+        .unwrap()
+        .unchecked_into();
+    JsFuture::from(peer.pc.set_local_description(&offer))
+        .await
+        .unwrap();
+    let answerer = RtcPeerConnection::new().unwrap();
+    JsFuture::from(answerer.set_remote_description(&offer))
+        .await
+        .unwrap();
+    let answer: RtcSessionDescriptionInit = JsFuture::from(answerer.create_answer())
+        .await
+        .unwrap()
+        .unchecked_into();
+    JsFuture::from(answerer.set_local_description(&answer))
+        .await
+        .unwrap();
+    transport
+        .handle_message(MessageContent::Data(SignalingData {
+            sender_id: remote.clone(),
+            receiver_id: NodeId("a".into()),
+            room_id: String::new(),
+            signaling_type: SignalingType::Answer,
+            data: answer.get_sdp().unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert_sender_limits(&sender, Some(8_000_000.0), Some(30.0)).await;
+
+    transport
+        .set_local_track_encoding(
+            track_id,
+            TrackEncoding {
+                max_bitrate_bps: Some(4_000_000),
+                max_framerate: Some(24.0),
+                ..TrackEncoding::default()
+            },
+        )
+        .unwrap();
+    assert_sender_limits(&sender, Some(4_000_000.0), Some(24.0)).await;
+    transport
+        .set_local_track_encoding(track_id, TrackEncoding::default())
+        .unwrap();
+    assert_sender_limits(&sender, None, None).await;
+
+    track.stop();
+    replacement.stop();
+    peer.close_all(&remote);
+    answerer.close();
+}
+
+async fn assert_sender_limits(sender: &RtcRtpSender, bitrate: Option<f64>, framerate: Option<f64>) {
+    let expected = (bitrate, framerate);
+    let mut actual = (None, None);
+    for _ in 0..50 {
+        let params = sender.get_parameters();
+        let encodings: js_sys::Array = Reflect::get(&params, &JsValue::from_str("encodings"))
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        if encodings.length() > 0 {
+            let first = encodings.get(0);
+            let get_limit = |name| {
+                Reflect::get(&first, &JsValue::from_str(name))
+                    .unwrap()
+                    .as_f64()
+            };
+            actual = (get_limit("maxBitrate"), get_limit("maxFramerate"));
+            if actual == expected {
+                return;
+            }
+        }
+        gloo_timers::future::TimeoutFuture::new(10).await;
+    }
+    panic!("sender encoding limits were {actual:?}, expected {expected:?}");
+}

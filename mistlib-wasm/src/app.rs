@@ -28,7 +28,8 @@ pub(crate) use events::{reset_storage_room, reset_storage_senders};
 pub use media::{
     emit_media_track_added, emit_media_track_removed, get_local_track, publish_local_track,
     register_local_track, register_media_event_callback, remove_local_track,
-    set_local_track_audience, set_local_track_enabled, unpublish_local_track,
+    set_local_track_audience, set_local_track_enabled, set_local_track_encoding,
+    unpublish_local_track,
 };
 pub(crate) use state::*;
 

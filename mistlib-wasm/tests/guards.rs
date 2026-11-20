@@ -40,3 +40,6 @@ mod session_registry;
 mod storage_frame;
 #[path = "guards/track_audience.rs"]
 mod track_audience;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../src/ffi/track_encoding.rs"]
+mod track_encoding;

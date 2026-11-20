@@ -7,6 +7,7 @@ use mistlib_core::signaling::{MessageContent, SignalingData, SignalingType};
 use mistlib_core::transport::NetworkEvent;
 use mistlib_core::types::{DeliveryMethod, NodeId};
 use tokio_util::sync::CancellationToken;
+use webrtc::api::API;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -15,7 +16,16 @@ use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use super::{rollback_to_stable_on_failure, Peer, WebRtcTransport};
 
 impl WebRtcTransport {
+    /// Creates a peer for an incoming initial offer.
     pub(crate) async fn create_pc(&self, remote_id: NodeId) -> crate::error::Result<Arc<Peer>> {
+        self.create_pc_with_api(remote_id, &self.api).await
+    }
+
+    async fn create_pc_with_api(
+        &self,
+        remote_id: NodeId,
+        api: &API,
+    ) -> crate::error::Result<Arc<Peer>> {
         let ice_servers = self.ice_servers.read().unwrap().clone();
         let config = RTCConfiguration {
             ice_servers,
@@ -24,7 +34,7 @@ impl WebRtcTransport {
 
         self.pair_backoff.lock().unwrap().started(&remote_id);
         let cancel_token = CancellationToken::new();
-        let pc = Arc::new(self.api.new_peer_connection(config).await?);
+        let pc = Arc::new(api.new_peer_connection(config).await?);
         let channels: Arc<
             tokio::sync::RwLock<HashMap<DeliveryMethod, Arc<webrtc::data_channel::RTCDataChannel>>>,
         > = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -335,7 +345,15 @@ impl WebRtcTransport {
         // signaling path's per-message `tokio::spawn` in
         // `MistEngine::handle_message_content`).
         let _negotiating = peer.negotiating.lock().await;
+        self.send_offer_locked(node, peer).await
+    }
 
+    /// The caller holds `peer.negotiating`.
+    async fn send_offer_locked(
+        &self,
+        node: &NodeId,
+        peer: &Peer,
+    ) -> mistlib_core::error::Result<()> {
         let signaling_state = peer.pc.signaling_state();
         let pc_state = peer.pc.connection_state();
         // A previous offer that was applied locally but never delivered
@@ -436,7 +454,7 @@ impl WebRtcTransport {
         let mut created_peer: Option<Arc<Peer>> = None;
         let result: mistlib_core::error::Result<()> = async {
             let peer = self
-                .create_pc(node.clone())
+                .create_pc_with_api(node.clone(), &self.initial_offerer_api)
                 .await
                 .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
             created_peer = Some(peer.clone());
@@ -456,9 +474,12 @@ impl WebRtcTransport {
             self.spawn_connection_watchdog(node.clone(), attempt_id);
 
             self.setup_outgoing_data_channels(&peer, node).await?;
+            // Reserve the first exchange before an inbound offer can find this peer.
+            let negotiating = peer.negotiating.lock().await;
             self.replace_peer_and_close_old(node, peer.clone()).await;
             self.resync_registered_peer(node, &peer).await;
-            self.send_offer(node, &peer).await?;
+            self.send_offer_locked(node, &peer).await?;
+            drop(negotiating);
             // Offer resend, initiator side: only the fresh connect_inner
             // attempt path opts into this -- `send_offer` is also called by
             // renegotiation/ICE-restart paths on an already-established

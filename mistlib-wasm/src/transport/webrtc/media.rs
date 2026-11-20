@@ -1,9 +1,11 @@
-use super::{LocalTrack, Peer, WasmWebRtcTransport};
+use super::{LocalTrack, Peer, TrackEncoding, WasmWebRtcTransport};
+use js_sys::{Array, Object, Reflect};
 use mistlib_core::transport::track_audience::TrackAudience;
 use mistlib_core::types::NodeId;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{MediaStream, MediaStreamTrack, RtcRtpSender};
 
 impl WasmWebRtcTransport {
@@ -54,16 +56,16 @@ impl WasmWebRtcTransport {
                 .unwrap_or_else(|e| e.into_inner())
                 .entry(remote_id.clone())
                 .or_default()
-                .insert(track_id, sender);
+                .insert(track_id.clone(), sender.clone());
+            self.spawn_sender_encoding_update(remote_id, &track_id, sender);
             changed = true;
         }
 
         Ok(changed)
     }
 
-    fn replace_track_for_existing_senders(&self, track_id: &str, track: &MediaStreamTrack) {
-        let replacements: Vec<(NodeId, RtcRtpSender)> = self
-            .peer_senders
+    fn senders_for_local_track(&self, track_id: &str) -> Vec<(NodeId, RtcRtpSender)> {
+        self.peer_senders
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -73,9 +75,11 @@ impl WasmWebRtcTransport {
                     .cloned()
                     .map(|sender| (node_id.clone(), sender))
             })
-            .collect();
+            .collect()
+    }
 
-        for (node_id, sender) in replacements {
+    fn replace_track_for_existing_senders(&self, track_id: &str, track: &MediaStreamTrack) {
+        for (node_id, sender) in self.senders_for_local_track(track_id) {
             let track = track.clone();
             let track_id = track_id.to_string();
             wasm_bindgen_futures::spawn_local(async move {
@@ -99,24 +103,25 @@ impl WasmWebRtcTransport {
         let kind = track.kind();
         let published = {
             let mut lock = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
-            let published = lock
-                .get(&track_id)
-                .map(|entry| entry.published)
-                .unwrap_or(false);
-            let audience = lock
-                .get(&track_id)
-                .map(|entry| entry.audience.clone())
-                .unwrap_or_default();
-            lock.insert(
-                track_id.clone(),
-                LocalTrack {
-                    track: track.clone(),
-                    kind,
-                    published,
-                    audience,
-                },
-            );
-            published
+            match lock.entry(track_id.clone()) {
+                Entry::Occupied(mut entry) => {
+                    let local = entry.get_mut();
+                    local.track = track.clone();
+                    local.kind = kind;
+                    local.published
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(LocalTrack {
+                        track: track.clone(),
+                        kind,
+                        published: false,
+                        audience: TrackAudience::default(),
+                        encoding: None,
+                        encoding_updates: Default::default(),
+                    });
+                    false
+                }
+            }
         };
 
         if published {
@@ -163,6 +168,71 @@ impl WasmWebRtcTransport {
             }
         }
         Ok(())
+    }
+
+    pub fn set_local_track_encoding(
+        &self,
+        track_id: &str,
+        encoding: TrackEncoding,
+    ) -> mistlib_core::error::Result<()> {
+        {
+            let mut tracks = self.local_tracks.write().unwrap_or_else(|e| e.into_inner());
+            let entry = tracks.get_mut(track_id).ok_or_else(|| {
+                mistlib_core::error::MistError::Internal(format!("Unknown local track: {track_id}"))
+            })?;
+            // Keep an explicit clear so it can be retried if the encodings are empty.
+            entry.encoding = Some(encoding);
+        }
+        for (remote_id, sender) in self.senders_for_local_track(track_id) {
+            self.spawn_sender_encoding_update(&remote_id, track_id, sender);
+        }
+        Ok(())
+    }
+
+    pub(super) fn reapply_peer_track_encodings(&self, remote_id: &NodeId) {
+        let senders = self
+            .peer_senders
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(remote_id)
+            .cloned();
+        if let Some(senders) = senders {
+            for (track_id, sender) in senders {
+                self.spawn_sender_encoding_update(remote_id, &track_id, sender);
+            }
+        }
+    }
+
+    fn spawn_sender_encoding_update(
+        &self,
+        remote_id: &NodeId,
+        track_id: &str,
+        sender: RtcRtpSender,
+    ) {
+        let (encoding, updates) = {
+            let tracks = self.local_tracks.read().unwrap_or_else(|e| e.into_inner());
+            let Some(track) = tracks.get(track_id) else {
+                return;
+            };
+            let Some(encoding) = track.encoding.clone() else {
+                return;
+            };
+            (encoding, track.encoding_updates.clone())
+        };
+        let remote_id = remote_id.clone();
+        let track_id = track_id.to_owned();
+        spawn_local(async move {
+            // Wait for earlier setParameters calls to settle before reading parameters.
+            let _update = updates.lock().await;
+            if let Err(err) = apply_sender_encoding(&sender, &encoding).await {
+                tracing::warn!(
+                    "Failed to apply local track encoding for {} to peer {}: {:?}",
+                    track_id,
+                    remote_id.0,
+                    err
+                );
+            }
+        });
     }
 
     pub async fn publish_local_track(&self, track_id: &str) -> mistlib_core::error::Result<()> {
@@ -373,4 +443,53 @@ impl WasmWebRtcTransport {
             .get(track_id)
             .map(|entry| entry.track.clone())
     }
+}
+
+async fn apply_sender_encoding(
+    sender: &RtcRtpSender,
+    encoding: &TrackEncoding,
+) -> Result<(), JsValue> {
+    let params = sender.get_parameters();
+    let encodings: Array = Reflect::get(&params, &JsValue::from_str("encodings"))?.dyn_into()?;
+    if encodings.length() == 0 {
+        // Some browsers expose encodings only after negotiation.
+        return Ok(());
+    }
+
+    let max_bitrate = encoding.max_bitrate_bps.map(JsValue::from);
+    let max_framerate = encoding.max_framerate.map(JsValue::from);
+    let mut changed = false;
+    for entry in encodings.iter() {
+        let entry: Object = entry.dyn_into()?;
+        changed |= update_encoding_property(&entry, "maxBitrate", max_bitrate.as_ref())?;
+        changed |= update_encoding_property(&entry, "maxFramerate", max_framerate.as_ref())?;
+    }
+    if let Some(preference) = &encoding.degradation_preference {
+        changed |= update_encoding_property(
+            params.as_ref(),
+            "degradationPreference",
+            Some(&JsValue::from_str(preference)),
+        )?;
+    }
+    if changed {
+        JsFuture::from(sender.set_parameters_with_parameters(&params)).await?;
+    }
+    Ok(())
+}
+
+fn update_encoding_property(
+    object: &Object,
+    name: &str,
+    value: Option<&JsValue>,
+) -> Result<bool, JsValue> {
+    let key = JsValue::from_str(name);
+    let updated = match value {
+        Some(value) if Reflect::get(object, &key)? != *value => Reflect::set(object, &key, value)?,
+        None if Reflect::has(object, &key)? => Reflect::delete_property(object, &key)?,
+        _ => return Ok(false),
+    };
+    if !updated {
+        return Err(JsValue::from_str(&format!("Could not update {name}")));
+    }
+    Ok(true)
 }

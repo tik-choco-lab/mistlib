@@ -18,6 +18,7 @@ use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::api::API;
+use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
@@ -777,6 +778,7 @@ pub struct WebRtcTransport {
     pub signaler: Arc<dyn Signaler>,
     pub local_node_id: NodeId,
     pub api: API,
+    initial_offerer_api: API,
     pub peers: Arc<tokio::sync::RwLock<HashMap<NodeId, Arc<Peer>>>>,
     /// Secondary, synchronous mirror of `peers`' keyset -> that peer's
     /// `Peer::send_tx`, kept in lock-step at every site that inserts or
@@ -977,57 +979,61 @@ pub(crate) type PublishedSenders = HashMap<NodeId, HashMap<String, Arc<RTCRtpSen
 type SendCommit<'a> =
     Box<dyn FnOnce(Bytes, DeliveryMethod) -> mistlib_core::error::Result<()> + 'a>;
 
+fn build_webrtc_api(setting_engine: SettingEngine) -> API {
+    let mut m = MediaEngine::default();
+    // Answer-side codec pinning: register ONLY H264 (video) + Opus
+    // (audio) instead of `register_default_codecs()`. That default set
+    // also includes VP8/VP9/AV1/H265/G722/PCMU/PCMA, and browsers
+    // (tc-chat via mistlib-wasm's `publish_local_track`) typically list
+    // VP8 first in their offer's codec preference order. Since we are
+    // the answerer, the codecs WE list in the answer are what the
+    // browser is constrained to send -- if VP8 were present in our
+    // answer, the browser could pick it, and this native peer only ever
+    // relays H264 onward (to RTSP/AVPro on the VRChat side, which has no
+    // VP8 decode path). Restricting the engine to H264 + Opus forces the
+    // answer to advertise only codecs we can actually consume, so the
+    // browser is left with H264 as its only viable video choice.
+    // Data channels are unaffected by codec registration -- SCTP doesn't
+    // negotiate through the MediaEngine.
+    register_h264_opus_codecs(&mut m)
+        .expect("registering a fixed H264+Opus codec set on a fresh MediaEngine cannot fail");
+
+    // Wire up the interceptor pipeline (NACK generator/responder, RTCP
+    // sender/receiver reports, receive-side TWCC) so RTCP feedback the
+    // codecs above already advertise (`nack`/`nack pli` in
+    // `register_h264_opus_codecs`) actually does something. Without a
+    // registered interceptor chain -- the default before this change --
+    // `APIBuilder` falls back to an empty `Registry` (see
+    // `APIBuilder::build` in webrtc-rs), so lost inbound packets were
+    // never NACKed and no retransmissions were ever served for outbound
+    // ones; the relay could only mitigate loss by dropping until the
+    // next IDR. `register_default_interceptors` must run after codec
+    // registration (it registers additional feedback/header-extension
+    // capabilities against the already-populated `MediaEngine`, mirroring
+    // pion/webrtc-rs's own `NewAPI` example ordering).
+    let mut registry = webrtc::interceptor::registry::Registry::new();
+    registry = webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut m)
+        .expect(
+            "registering the default interceptor set (NACK, RTCP reports, TWCC) against a \
+             MediaEngine with only H264+Opus registered cannot fail",
+        );
+
+    APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
+        .build()
+}
+
 impl WebRtcTransport {
     pub fn new(signaler: Arc<dyn Signaler>, local_node_id: NodeId) -> Self {
-        let mut m = MediaEngine::default();
-        // Answer-side codec pinning: register ONLY H264 (video) + Opus
-        // (audio) instead of `register_default_codecs()`. That default set
-        // also includes VP8/VP9/AV1/H265/G722/PCMU/PCMA, and browsers
-        // (tc-chat via mistlib-wasm's `publish_local_track`) typically list
-        // VP8 first in their offer's codec preference order. Since we are
-        // the answerer, the codecs WE list in the answer are what the
-        // browser is constrained to send -- if VP8 were present in our
-        // answer, the browser could pick it, and this native peer only ever
-        // relays H264 onward (to RTSP/AVPro on the VRChat side, which has no
-        // VP8 decode path). Restricting the engine to H264 + Opus forces the
-        // answer to advertise only codecs we can actually consume, so the
-        // browser is left with H264 as its only viable video choice.
-        // Data channels are unaffected by codec registration -- SCTP doesn't
-        // negotiate through the MediaEngine.
-        register_h264_opus_codecs(&mut m)
-            .expect("registering a fixed H264+Opus codec set on a fresh MediaEngine cannot fail");
-
-        // Wire up the interceptor pipeline (NACK generator/responder, RTCP
-        // sender/receiver reports, receive-side TWCC) so RTCP feedback the
-        // codecs above already advertise (`nack`/`nack pli` in
-        // `register_h264_opus_codecs`) actually does something. Without a
-        // registered interceptor chain -- the default before this change --
-        // `APIBuilder` falls back to an empty `Registry` (see
-        // `APIBuilder::build` in webrtc-rs), so lost inbound packets were
-        // never NACKed and no retransmissions were ever served for outbound
-        // ones; the relay could only mitigate loss by dropping until the
-        // next IDR. `register_default_interceptors` must run after codec
-        // registration (it registers additional feedback/header-extension
-        // capabilities against the already-populated `MediaEngine`, mirroring
-        // pion/webrtc-rs's own `NewAPI` example ordering).
-        let mut registry = webrtc::interceptor::registry::Registry::new();
-        registry =
-            webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut m)
-                .expect(
-                    "registering the default interceptor set (NACK, RTCP reports, TWCC) against a \
-                 MediaEngine with only H264+Opus registered cannot fail",
-                );
-
         // Repair-first ICE restart, Change 1: shorten the ICE agent's own
         // Disconnected/Failed/keepalive timeouts from webrtc-rs's pion-style
         // defaults (5s/25s/2s) so `RTCPeerConnectionState::Disconnected` --
         // this module's earliest repair trigger -- fires much sooner. See
         // `ICE_DISCONNECTED_TIMEOUT_MS`'s doc comment for why this is safe to
         // be aggressive about (a cheap, non-destructive repair trigger, not
-        // the teardown decision). Applied once here to the single `API`
-        // shared by every `RTCPeerConnection` this transport ever creates
-        // (`connection::create_pc`'s `self.api.new_peer_connection(..)`) --
-        // `SettingEngine` has no per-call knob, only this process-wide one.
+        // the teardown decision). Both APIs share these ICE settings.
         let ice_disconnected_timeout_ms = env_override_u64_ms(
             "MIST_WEBRTC_ICE_DISCONNECTED_TIMEOUT_MS",
             ICE_DISCONNECTED_TIMEOUT_MS,
@@ -1064,11 +1070,19 @@ impl WebRtcTransport {
             Some(Duration::from_millis(ice_keepalive_interval_ms)),
         );
 
-        let api = APIBuilder::new()
-            .with_media_engine(m)
-            .with_interceptor_registry(registry)
-            .with_setting_engine(setting_engine)
-            .build();
+        // An initial active answer leaves us as the DTLS server. Keep that role
+        // when we later answer a renegotiation on this connection.
+        // In webrtc 0.13.0, create_answer reads the setting (src/peer_connection/mod.rs:954-960).
+        // Both offer paths use the actpass default (src/peer_connection/peer_connection_internal.rs:781,
+        // src/peer_connection/mod.rs:841, src/dtls_transport/dtls_role.rs:40,83).
+        // At handshake time the remote's explicit role takes precedence
+        // (src/dtls_transport/mod.rs:284-300).
+        let mut offerer_settings = setting_engine.clone();
+        offerer_settings
+            .set_answering_dtls_role(DTLSRole::Server)
+            .expect("DTLS server is a valid answering role");
+        let api = build_webrtc_api(setting_engine);
+        let initial_offerer_api = build_webrtc_api(offerer_settings);
 
         let max_concurrent_handshakes = std::env::var("MIST_WEBRTC_MAX_CONCURRENT_HANDSHAKES")
             .ok()
@@ -1091,6 +1105,7 @@ impl WebRtcTransport {
             signaler,
             local_node_id,
             api,
+            initial_offerer_api,
             peers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             send_queues: Arc::new(StdRwLock::new(HashMap::new())),
             event_handler: Mutex::new(None),

@@ -1,3 +1,6 @@
+mod track_encoding;
+
+use self::track_encoding::validate_track_encoding;
 use wasm_bindgen::prelude::*;
 use web_sys::MediaStreamTrack;
 
@@ -257,6 +260,29 @@ pub fn set_local_track_audience(
         Some(nodes)
     };
     crate::app::set_local_track_audience(track_id, nodes)
+}
+
+/// Set RTP encoding limits for a registered local track across joined rooms.
+/// Omitted limits are cleared. An omitted degradation preference is left as is.
+#[wasm_bindgen]
+pub fn set_local_track_encoding(
+    track_id: String,
+    max_bitrate_bps: Option<u32>,
+    max_framerate: Option<f64>,
+    degradation_preference: Option<String>,
+) -> Result<(), JsValue> {
+    validate_track_encoding(
+        max_bitrate_bps,
+        max_framerate,
+        degradation_preference.as_deref(),
+    )
+    .map_err(JsValue::from_str)?;
+    crate::app::set_local_track_encoding(
+        track_id,
+        max_bitrate_bps,
+        max_framerate,
+        degradation_preference,
+    )
 }
 
 #[wasm_bindgen]

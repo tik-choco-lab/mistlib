@@ -181,7 +181,6 @@ async fn webrtc_track_flows_through_bridge_into_an_hls_segment() {
         .expect("timed out waiting for MediaTrackEvent")
         .expect("media channel closed unexpectedly");
     assert_eq!(event.remote_id, node_a);
-    keep_sending.abort();
 
     // Wire B's received track into a bridge (as an `RtpSink`) via
     // TrackBroadcaster, and the bridge's paced output into a Segmenter —
@@ -212,19 +211,14 @@ async fn webrtc_track_flows_through_bridge_into_an_hls_segment() {
         }
     });
 
-    // Send real RTP packets over the real WebRTC connection: a keyframe,
-    // then a second keyframe ~1.5s later (past the 1s target duration) to
-    // force a segment rotation.
-    send_frame(&video_track, 0x65, 0).await;
-    tokio::time::sleep(Duration::from_millis(300)).await; // let write_rtp process
-
-    send_frame(&video_track, 0x65, 135_000).await; // +1.5s at 90kHz
-
+    // Continue the same RTP sequence until a keyframe crosses the segment
+    // boundary. The bridge clamps timestamp jumps greater than one second.
     wait_until(
         || segmenter.read().unwrap().segment_count() >= 1,
         Duration::from_secs(10),
     )
     .await;
+    keep_sending.abort();
 
     let playlist = segmenter.read().unwrap().playlist();
     assert!(playlist.contains("#EXTM3U"));
@@ -431,6 +425,7 @@ fn video_section_sends(sdp: &str) -> bool {
 async fn send_frame(track: &Arc<TrackLocalStaticRTP>, nal_byte: u8, timestamp: u32) {
     let pkt = rtp::packet::Packet {
         header: rtp::header::Header {
+            version: 2,
             payload_type: 96,
             sequence_number: (timestamp / 3000) as u16,
             timestamp,
