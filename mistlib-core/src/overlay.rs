@@ -121,6 +121,18 @@ pub trait TopologyStrategy {
     ) -> Vec<OverlayAction> {
         Vec::new()
     }
+
+    /// Called by the engine's overlay loop (coalesced) after nodes the
+    /// overlay did not know before were learned, so a strategy can evaluate
+    /// connections without waiting for its periodic timer. Must stay within
+    /// the strategy's normal limits. Default is a no-op.
+    fn on_nodes_learned(
+        &self,
+        _config: &Config,
+        _connected_node_states: &[(NodeId, crate::types::ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        Vec::new()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -150,6 +162,18 @@ pub trait TopologyStrategy: Send + Sync {
     /// manages connection topology can react immediately instead of waiting
     /// for the next periodic `tick`. Default is a no-op.
     fn on_peer_disconnected(
+        &self,
+        _config: &Config,
+        _connected_node_states: &[(NodeId, crate::types::ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        Vec::new()
+    }
+
+    /// Called by the engine's overlay loop (coalesced) after nodes the
+    /// overlay did not know before were learned, so a strategy can evaluate
+    /// connections without waiting for its periodic timer. Must stay within
+    /// the strategy's normal limits. Default is a no-op.
+    fn on_nodes_learned(
         &self,
         _config: &Config,
         _connected_node_states: &[(NodeId, crate::types::ConnectionState)],

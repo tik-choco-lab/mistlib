@@ -1,4 +1,4 @@
-use mistlib_core::signaling::nostr::{build_discovery_event_with_joined_at, event_frame_json};
+use mistlib_core::signaling::nostr::{build_discovery_event_with_transports, event_frame_json};
 use mistlib_core::stats::STATS;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -51,12 +51,13 @@ impl NostrSignaler {
                     Some(joined_at) => *joined_at.lock().await,
                     None => break,
                 };
-                let frame = match build_discovery_event_with_joined_at(
+                let frame = match build_discovery_event_with_transports(
                     &codec_config,
                     &crypto,
                     &active_identity,
                     &room_id,
                     joined_at,
+                    crate::transports::selector::announced_transports(),
                 )
                 .and_then(|event| event_frame_json(&event))
                 {

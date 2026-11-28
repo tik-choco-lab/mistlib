@@ -154,6 +154,39 @@ fn flat_config_can_select_browser_webrtc_ab_profile() {
 }
 
 #[test]
+fn ice_quic_is_on_by_default_in_flat_and_full_config() {
+    let config = Config::new_default();
+    assert!(config.webrtc.ice_quic);
+
+    for (json, expected) in [
+        (r#"{"webrtcIceQuic":false}"#, false),
+        (r#"{"webrtcIceQuic":true}"#, true),
+        (r#"{"maxConnectionCount":12}"#, true),
+    ] {
+        let mut config = Config::new_default();
+        config.update_from_json(json).unwrap();
+        assert_eq!(config.webrtc.ice_quic, expected, "{json}");
+    }
+
+    // Full Config JSON: `webrtc.iceQuic`, defaulting to true when absent
+    // (configs written before the flag existed).
+    let mut full: serde_json::Value = serde_json::to_value(Config::new_default()).unwrap();
+    assert_eq!(full["webrtc"]["iceQuic"], serde_json::json!(true));
+    full["webrtc"].as_object_mut().unwrap().remove("iceQuic");
+    let mut config = Config::new_default();
+    config.update_from_json(&full.to_string()).unwrap();
+    assert!(config.webrtc.ice_quic);
+    full["webrtc"]["iceQuic"] = serde_json::json!(false);
+    config.update_from_json(&full.to_string()).unwrap();
+    assert!(!config.webrtc.ice_quic);
+
+    // The flat export round-trips an explicit opt-out.
+    let mut reloaded = Config::new_default();
+    reloaded.update_from_json(&config.to_json_string()).unwrap();
+    assert!(!reloaded.webrtc.ice_quic);
+}
+
+#[test]
 fn browser_webrtc_connection_timeout_must_be_positive() {
     let mut config = Config::new_default();
     let err = config

@@ -1,5 +1,7 @@
 use super::{config, extract_sub_id, NostrSignaler};
-use crate::signaling::nostr::connection::RELAY_CONNECT_TIMEOUT;
+use crate::signaling::nostr::connection::{
+    RELAY_CONNECT_ATTEMPT_TIMEOUT, RELAY_CONNECT_MAX_ATTEMPTS,
+};
 use futures_util::{SinkExt, StreamExt};
 use mistlib_core::signaling::Signaler;
 use mistlib_core::types::NodeId;
@@ -227,11 +229,8 @@ async fn hung_handshake_times_out_while_other_relay_connects_in_parallel() {
         .await
         .expect("healthy relay must connect before the hung relay times out")
         .unwrap();
-    let result = timeout(
-        RELAY_CONNECT_TIMEOUT + Duration::from_millis(500),
-        connecting,
-    )
-    .await;
+    let slack = Duration::from_millis(500);
+    let result = timeout(RELAY_CONNECT_ATTEMPT_TIMEOUT + slack, connecting).await;
     signaler.close().await.unwrap();
     hung_server.abort();
     healthy_server.abort();
@@ -239,9 +238,11 @@ async fn hung_handshake_times_out_while_other_relay_connects_in_parallel() {
         .expect("connect must have a deadline")
         .unwrap()
         .unwrap();
-    // join_all waits for every initial attempt, including the 10s timeout.
-    assert!(started.elapsed() >= RELAY_CONNECT_TIMEOUT);
-    assert!(started.elapsed() < RELAY_CONNECT_TIMEOUT + Duration::from_millis(500));
+    // join_all waits for the in-flight attempt of every relay, but the hung
+    // relay is not retried once the healthy one has opened.
+    let elapsed = started.elapsed();
+    assert!(elapsed >= RELAY_CONNECT_ATTEMPT_TIMEOUT);
+    assert!(elapsed < RELAY_CONNECT_ATTEMPT_TIMEOUT + slack);
 }
 
 #[tokio::test]
@@ -279,12 +280,108 @@ async fn initial_handshake_failure_does_not_start_supervisor() {
     });
     let signaler = NostrSignaler::new(NodeId("initial-failure-test".into()), cfg);
     assert!(signaler.connect(mpsc::channel(8).0).await.is_err());
-    rx.recv().await.unwrap();
+    // A connection dropped before the upgrade is transient: the bounded
+    // initial schedule uses every attempt, then nothing reconnects.
+    for _ in 0..RELAY_CONNECT_MAX_ATTEMPTS {
+        rx.recv().await.unwrap();
+    }
     assert!(timeout(Duration::from_millis(1300), rx.recv())
         .await
         .is_err());
     signaler.close().await.unwrap();
     server.abort();
+}
+
+/// The measured failure: TCP connects but the WebSocket upgrade never
+/// completes on the first connection. A fresh connection must rescue the join.
+#[tokio::test]
+async fn stalled_upgrade_is_retried_on_a_fresh_connection() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut cfg = config();
+    cfg.relays = vec![format!("ws://{}", listener.local_addr().unwrap())];
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(8);
+    let server = tokio::spawn(async move {
+        let (stalled, stalled_peer) = listener.accept().await.unwrap();
+        accepted_tx.send(stalled_peer).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        accepted_tx.send(peer).await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        while ws.next().await.is_some() {}
+        drop(stalled);
+    });
+    let signaler = NostrSignaler::new(NodeId("stalled-upgrade".into()), cfg);
+    let started = Instant::now();
+    timeout(
+        RELAY_CONNECT_ATTEMPT_TIMEOUT + Duration::from_secs(2),
+        signaler.connect(mpsc::channel(8).0),
+    )
+    .await
+    .expect("the retry must finish within one attempt timeout plus backoff")
+    .expect("join must succeed via the retry");
+    assert!(started.elapsed() >= RELAY_CONNECT_ATTEMPT_TIMEOUT);
+    let first = accepted_rx.recv().await.unwrap();
+    let second = accepted_rx.recv().await.unwrap();
+    assert_ne!(first, second, "fresh TCP connection per attempt");
+    assert_eq!(signaler.senders.lock().await.len(), 1);
+    signaler.close().await.unwrap();
+    server.abort();
+}
+
+/// An HTTP response refusing the upgrade is permanent and not retried.
+#[tokio::test]
+async fn refused_http_upgrade_is_not_retried() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut cfg = config();
+    cfg.relays = vec![format!("ws://{}", listener.local_addr().unwrap())];
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(8);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0; 1];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response).await;
+        }
+    });
+    let signaler = NostrSignaler::new(NodeId("upgrade-refused".into()), cfg);
+    let started = Instant::now();
+    let err = signaler.connect(mpsc::channel(8).0).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("failed to connect to any relay"), "{msg}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    accepted_rx.recv().await.unwrap();
+    assert!(timeout(Duration::from_millis(800), accepted_rx.recv())
+        .await
+        .is_err());
+    signaler.close().await.unwrap();
+    server.abort();
+}
+
+/// A refused TCP connection is retried, but the attempt cap keeps a dead relay
+/// from looping until the budget runs out.
+#[tokio::test]
+async fn refused_connection_retries_are_bounded() {
+    let refused = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut cfg = config();
+    cfg.relays = vec![format!("ws://{}", refused.local_addr().unwrap())];
+    drop(refused);
+    let signaler = NostrSignaler::new(NodeId("refused-bounded".into()), cfg);
+    let started = Instant::now();
+    assert!(signaler.connect(mpsc::channel(8).0).await.is_err());
+    // Three retry delays: 250 + 500 + 1000ms, each ±20%.
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1400), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(2800), "{elapsed:?}");
+    signaler.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -565,7 +662,7 @@ async fn healthy_local_from_relay_list_skips_listed_remote_relays() {
             stream.read_exact(&mut byte).await.unwrap();
             request.push(byte[0]);
         }
-        // A non-routable (RFC 5737 TEST-NET-1) remote relay would hang until RELAY_CONNECT_TIMEOUT
+        // A non-routable (RFC 5737 TEST-NET-1) remote relay would hang until RELAY_CONNECT_BUDGET
         // if it were attempted alongside the local one.
         let body = serde_json::json!([local_url, "ws://192.0.2.1:7777"]).to_string();
         stream

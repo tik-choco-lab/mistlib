@@ -25,6 +25,16 @@ pub enum SignalingType {
     CandidateAck,
     /// End-to-end acknowledgement for an Offer/Answer transaction.
     NegotiationAck,
+    /// ICE+QUIC link offer (SPEC-25 O2): `data` is the iq1 JSON (ICE ufrag,
+    /// pwd, candidates, certificate fingerprint). Appended after the
+    /// existing variants so their bincode discriminants (used inside overlay
+    /// envelopes) do not move. Older builds cannot decode this variant, so
+    /// it is only ever sent to a peer that announced `iq1`
+    /// (see [`crate::signaling::capabilities`]).
+    IceQuicOffer,
+    /// ICE+QUIC link answer; same payload shape and rule as
+    /// [`SignalingType::IceQuicOffer`].
+    IceQuicAnswer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +135,72 @@ mod tests {
         assert!(!SignalingType::CandidateAck.is_local_only());
         assert!(!SignalingType::NegotiationAck.is_local_only());
         assert!(!SignalingType::Request.is_local_only());
+        assert!(!SignalingType::IceQuicOffer.is_local_only());
+        assert!(!SignalingType::IceQuicAnswer.is_local_only());
+    }
+
+    /// Every variant with its wire identity: the bincode discriminant (overlay
+    /// envelopes, varint form) and the JSON name (Nostr / WebSocket
+    /// `SignalingData`). Existing rows must never change.
+    const WIRE_TABLE: [(SignalingType, u8, &str); 10] = [
+        (SignalingType::Offer, 0, "Offer"),
+        (SignalingType::Answer, 1, "Answer"),
+        (SignalingType::Candidate, 2, "Candidate"),
+        (SignalingType::Candidates, 3, "Candidates"),
+        (SignalingType::Request, 4, "Request"),
+        (SignalingType::Rejoin, 5, "Rejoin"),
+        (SignalingType::CandidateAck, 6, "CandidateAck"),
+        (SignalingType::NegotiationAck, 7, "NegotiationAck"),
+        (SignalingType::IceQuicOffer, 8, "IceQuicOffer"),
+        (SignalingType::IceQuicAnswer, 9, "IceQuicAnswer"),
+    ];
+
+    #[test]
+    fn discriminants_and_json_names_are_stable() {
+        for (kind, index, name) in WIRE_TABLE {
+            let bin = crate::overlay::wire::serialize(&kind).unwrap();
+            assert_eq!(bin, vec![index], "{kind:?} varint discriminant");
+            assert_eq!(
+                crate::overlay::wire::deserialize::<SignalingType>(&bin).unwrap(),
+                kind
+            );
+            // Legacy fixint form (4-byte LE tag) as used by `bincode::serialize`.
+            let fixint = bincode::serialize(&kind).unwrap();
+            assert_eq!(fixint, vec![index, 0, 0, 0], "{kind:?} fixint discriminant");
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<SignalingType>(&json).unwrap(), kind);
+        }
+    }
+
+    /// An older build's enum ends at `NegotiationAck`; it must reject the new
+    /// values rather than misread them as an existing type. This is why they
+    /// are only sent to peers that announced `iq1`.
+    #[test]
+    fn older_reader_rejects_new_variants_instead_of_aliasing() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        enum OldSignalingType {
+            Offer,
+            Answer,
+            Candidate,
+            Candidates,
+            Request,
+            Rejoin,
+            CandidateAck,
+            NegotiationAck,
+        }
+        for kind in [SignalingType::IceQuicOffer, SignalingType::IceQuicAnswer] {
+            let bin = crate::overlay::wire::serialize(&kind).unwrap();
+            assert!(crate::overlay::wire::deserialize::<OldSignalingType>(&bin).is_err());
+            let json = serde_json::to_string(&kind).unwrap();
+            assert!(serde_json::from_str::<OldSignalingType>(&json).is_err());
+        }
+        let bin = crate::overlay::wire::serialize(&SignalingType::NegotiationAck).unwrap();
+        assert!(matches!(
+            crate::overlay::wire::deserialize::<OldSignalingType>(&bin).unwrap(),
+            OldSignalingType::NegotiationAck
+        ));
     }
 }
 

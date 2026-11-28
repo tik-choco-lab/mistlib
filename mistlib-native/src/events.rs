@@ -138,7 +138,7 @@ fn request_immediate_rebalance(ctx: Option<Arc<SessionCtx>>) {
     let Some(overlay) = ctx.overlay.as_ref() else {
         return;
     };
-    let Some(wt) = ctx.webrtc_transport.as_ref() else {
+    let Some(wt) = ctx.link_selector.as_ref() else {
         return;
     };
     let states = wt.get_active_connection_states();

@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "SPEC-24 §5.3: 仮定値・実経路計測で校正予定。各値は片道・方向別。",
+    "Gilbert-Elliott: loss gemodel p r (1-h) (1-k). 仮定 r=20%, bad state loss=100%, good state loss=0%, 平均 bad run=1/r=5 packets。定常平均損失 L=p/(p+r) より p=L*r/(1-L)。1% -> p=0.202020202%, 5% -> p=1.052631579%, 12.5% -> p=2.857142857%。",
+    "severe は SPEC の 10〜15% の中点 12.5%。asym は A 側を良好方向・B 側を劣化方向とし AB=good / BA=peak。peak の深いキューは仮に総キュー予算 1000ms (1500B packet 換算)。typical は netem 既定 limit。",
+    "shift は good -> peak (20s) -> peak + 50% random loss (40s〜42s) -> peak -> good (50s)。時間点・キュー深さ・burst 長は校正対象。",
+    "jitterNoReorder: 帯域制限のない区間で netem のジッターがパケットを並べ替えないよう直列化する（2026-11-25 段階A で intl-good の高レート時に大量並べ替えが発生したため追加）。rate 付きプロファイルは rate により既に直列化される。",
+    "lan-bn: 帯域制限付きの短距離対照（片道 1 ms、100 Mbit/s）。lan は CPU 上限を測ってしまうため、確認実験の対照に使う（SPEC-24 §7.2）。",
+    "intl-peak-tloss: intl-peak から per-packet の loss gemodel を除き、壁時計時間の Gilbert-Elliott 損失 lossTimeAB/BA（平均損失 5%、bad 期間 平均 25 ms の指数分布・100% 損失）に置換した比較用。25 ms は仮定値で実測ではない（SPEC-24 P3r で校正予定）。seed 省略時は job から決定論的に導出。"
+  ],
+  "lan": {},
+  "domestic": {
+    "pathAB": "delay 8ms 1ms",
+    "pathBA": "delay 8ms 1ms",
+    "jitterNoReorder": true
+  },
+  "intl-good": {
+    "pathAB": "delay 25ms 3ms loss 0.1%",
+    "pathBA": "delay 25ms 3ms loss 0.1%",
+    "jitterNoReorder": true
+  },
+  "intl-typical": {
+    "pathAB": "delay 40ms 10ms loss gemodel 0.202020202% 20% 100% 0%",
+    "pathBA": "delay 40ms 10ms loss gemodel 0.202020202% 20% 100% 0%",
+    "bottleneckAB": {
+      "rateKbit": 20000
+    },
+    "bottleneckBA": {
+      "rateKbit": 20000
+    }
+  },
+  "intl-peak": {
+    "pathAB": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%",
+    "pathBA": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%",
+    "bottleneckAB": {
+      "rateKbit": 10000,
+      "queueMs": 1000
+    },
+    "bottleneckBA": {
+      "rateKbit": 10000,
+      "queueMs": 1000
+    }
+  },
+  "intl-peak-tloss": {
+    "pathAB": "delay 75ms 25ms",
+    "pathBA": "delay 75ms 25ms",
+    "bottleneckAB": {
+      "rateKbit": 10000,
+      "queueMs": 1000
+    },
+    "bottleneckBA": {
+      "rateKbit": 10000,
+      "queueMs": 1000
+    },
+    "lossTimeAB": {
+      "rate": 0.05,
+      "meanBurstMs": 25
+    },
+    "lossTimeBA": {
+      "rate": 0.05,
+      "meanBurstMs": 25
+    }
+  },
+  "intl-severe": {
+    "pathAB": "delay 120ms 40ms loss gemodel 2.857142857% 20% 100% 0%",
+    "pathBA": "delay 120ms 40ms loss gemodel 2.857142857% 20% 100% 0%",
+    "policerAB": {
+      "rateKbit": 2000,
+      "burstBytes": 32768
+    },
+    "policerBA": {
+      "rateKbit": 2000,
+      "burstBytes": 32768
+    }
+  },
+  "intl-asym": {
+    "pathAB": "delay 25ms 3ms loss 0.1%",
+    "pathBA": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%",
+    "bottleneckBA": {
+      "rateKbit": 10000,
+      "queueMs": 1000
+    },
+    "jitterNoReorder": true
+  },
+  "intl-shift": {
+    "pathAB": "delay 25ms 3ms loss 0.1%",
+    "pathBA": "delay 25ms 3ms loss 0.1%",
+    "schedule": [
+      {
+        "atS": 20,
+        "pathAB": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%",
+        "pathBA": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%",
+        "bottleneckAB": {
+          "rateKbit": 10000,
+          "queueMs": 1000
+        },
+        "bottleneckBA": {
+          "rateKbit": 10000,
+          "queueMs": 1000
+        }
+      },
+      {
+        "atS": 40,
+        "pathAB": "delay 75ms 25ms loss 50%",
+        "pathBA": "delay 75ms 25ms loss 50%"
+      },
+      {
+        "atS": 42,
+        "pathAB": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%",
+        "pathBA": "delay 75ms 25ms loss gemodel 1.052631579% 20% 100% 0%"
+      },
+      {
+        "atS": 50,
+        "pathAB": "delay 25ms 3ms loss 0.1%",
+        "pathBA": "delay 25ms 3ms loss 0.1%",
+        "bottleneckAB": null,
+        "bottleneckBA": null
+      }
+    ],
+    "jitterNoReorder": true
+  },
+  "lan-bn": {
+    "pathAB": "delay 1ms",
+    "pathBA": "delay 1ms",
+    "bottleneckAB": {
+      "rateKbit": 100000
+    },
+    "bottleneckBA": {
+      "rateKbit": 100000
+    }
+  }
+}

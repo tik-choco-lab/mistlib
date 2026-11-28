@@ -59,7 +59,7 @@ impl super::MistEngine {
         sig_tx: mpsc::Sender<MessageContent>,
     ) -> crate::error::Result<()> {
         if let Some(signaler) = ctx.bootstrap_signaler.as_ref() {
-            if let Some(webrtc) = ctx.webrtc_transport.as_ref() {
+            if let Some(webrtc) = ctx.link_selector.as_ref() {
                 let webrtc = webrtc.clone();
                 signaler.set_on_session_reestablished(Arc::new(move || {
                     let webrtc = webrtc.clone();
@@ -84,7 +84,7 @@ impl super::MistEngine {
         network_tx: mpsc::UnboundedSender<NetworkEvent>,
     ) -> crate::error::Result<()> {
         let adapter = Arc::new(NetworkEventHandlerAdapter(network_tx));
-        if let Some(wt) = ctx.webrtc_transport.as_ref() {
+        if let Some(wt) = ctx.link_selector.as_ref() {
             wt.start(adapter.clone()).await?;
         }
         ctx.transport.start(adapter).await?;
@@ -101,7 +101,7 @@ impl super::MistEngine {
     }
 
     async fn announce_to_room(&self, ctx: &SessionCtx) -> crate::error::Result<()> {
-        if let Some(wt) = ctx.webrtc_transport.as_ref() {
+        if let Some(wt) = ctx.link_selector.as_ref() {
             wt.announce_to_room().await?;
         }
         Ok(())
@@ -122,6 +122,9 @@ impl super::MistEngine {
                     msg = sig_rx.recv() => {
                         let Some(msg) = msg else { break };
                         if let MessageContent::Data(ref d) = msg {
+                            if let Some(selector) = ctx.link_selector.as_ref() {
+                                selector.observe_signaling(d);
+                            }
                             ctx.ensure_node_registered(&d.sender_id);
                         }
                         if let Err(err) = handler.handle_message(msg).await {

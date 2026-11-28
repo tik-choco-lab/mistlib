@@ -19,7 +19,140 @@ use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
 
+/// Per-attempt deadline used by the reconnect supervisor of an already-opened
+/// relay (`spawn_relay_supervisor`). The initial connection uses the bounded
+/// retry schedule below instead.
 pub(super) const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline of one initial connection attempt (TCP + TLS + WebSocket upgrade).
+///
+/// A healthy handshake is ~2-3 RTT. 3.5s still lets a lost SYN or upgrade
+/// segment be recovered by the kernel's first two retransmissions (1s + 2s
+/// RTO), but abandons a connection whose retransmission timer has backed off
+/// further: a fresh TCP connection is then more likely to finish first.
+pub(super) const RELAY_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(3500);
+/// Overall per-relay budget of the initial connection, measured from the start
+/// of the first attempt. Only a little above the former single 10s attempt so
+/// that a dead relay is still reported promptly.
+const RELAY_CONNECT_BUDGET: Duration = Duration::from_secs(12);
+/// Upper bound on initial attempts per relay (bounds fast failures such as a
+/// refused connection, which would otherwise loop until the budget runs out).
+pub(super) const RELAY_CONNECT_MAX_ATTEMPTS: u32 = 4;
+/// Delay before the first retry; doubles per retry, with ±20% jitter.
+const RELAY_CONNECT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+/// Do not start an attempt that would have less time than this to finish.
+const RELAY_CONNECT_MIN_ATTEMPT: Duration = Duration::from_secs(1);
+
+type RelayStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Why one connection attempt failed, and whether a new attempt may help.
+#[derive(Debug)]
+struct ConnectFailure {
+    error: crate::error::MistError,
+    /// Short cause for the retry log. Never contains the relay URL.
+    reason: String,
+    retryable: bool,
+}
+
+impl ConnectFailure {
+    fn cancelled() -> Self {
+        Self {
+            error: crate::error::MistError::Network("NostrSignaler: connection cancelled".into()),
+            reason: "cancelled".into(),
+            retryable: false,
+        }
+    }
+
+    fn timed_out(relay: &str, timeout: Duration) -> Self {
+        Self {
+            error: crate::error::MistError::Network(format!(
+                "NostrSignaler: connect to {relay} timed out"
+            )),
+            reason: format!("timed out after {}ms", timeout.as_millis()),
+            retryable: true,
+        }
+    }
+
+    fn handshake(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        let retryable = is_retryable_handshake_error(&err);
+        // Only transport errors are retried and logged; their Display carries
+        // the OS error, not the URL.
+        let reason = err.to_string();
+        Self {
+            error: crate::error::MistError::Network(reason.clone()),
+            reason,
+            retryable,
+        }
+    }
+}
+
+/// Classifies a handshake error. Only transport-level failures that happen
+/// before the HTTP upgrade completes are retried (refused, reset, aborted,
+/// EOF, timed out); invalid URLs, DNS failures, TLS errors and an HTTP response
+/// refusing the upgrade are permanent.
+fn is_retryable_handshake_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use std::io::ErrorKind;
+    use tokio_tungstenite::tungstenite::error::{Error, ProtocolError};
+    match err {
+        Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::TimedOut
+                | ErrorKind::BrokenPipe
+                | ErrorKind::NotConnected
+                | ErrorKind::Interrupted
+        ),
+        Error::ConnectionClosed => true,
+        Error::Protocol(
+            ProtocolError::HandshakeIncomplete | ProtocolError::ResetWithoutClosingHandshake,
+        ) => true,
+        _ => false,
+    }
+}
+
+/// Retry schedule of the initial connection. After `attempts_done` failed
+/// attempts and `elapsed` since the first one started, returns the delay
+/// before the next attempt and that attempt's timeout, or `None` once the
+/// attempt cap or the budget is exhausted. `jitter` is in `[0, 1)`.
+fn next_initial_attempt(
+    attempts_done: u32,
+    elapsed: Duration,
+    jitter: f64,
+) -> Option<(Duration, Duration)> {
+    if attempts_done >= RELAY_CONNECT_MAX_ATTEMPTS {
+        return None;
+    }
+    let delay = if attempts_done == 0 {
+        Duration::ZERO
+    } else {
+        let base = RELAY_CONNECT_RETRY_BASE_DELAY * 2u32.pow(attempts_done - 1);
+        base.mul_f64(0.8 + 0.4 * jitter.clamp(0.0, 1.0))
+    };
+    let remaining = RELAY_CONNECT_BUDGET.checked_sub(elapsed + delay)?;
+    if remaining < RELAY_CONNECT_MIN_ATTEMPT {
+        return None;
+    }
+    Some((delay, remaining.min(RELAY_CONNECT_ATTEMPT_TIMEOUT)))
+}
+
+/// Relay URL for logs reduced to `scheme://host:port`: userinfo, path, query
+/// and fragment are dropped because any of them may carry credentials.
+fn redact_relay(relay: &str) -> String {
+    let (scheme, rest) = match relay.find("://") {
+        Some(idx) => (&relay[..idx + 3], &relay[idx + 3..]),
+        None => ("", relay),
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    format!("{scheme}{host}")
+}
 
 #[derive(Default)]
 struct SubscriptionRetry {
@@ -75,7 +208,14 @@ impl NostrSignaler {
         } else {
             Vec::new()
         };
-        if !local.is_empty() && self.connect_relay_set(&local, &incoming_tx, &cancel).await {
+        // Loopback relays in the local-first stages get a single attempt so a
+        // dead local relay falls back to the remote stage without delay; the
+        // remote stage retries (see `connect_relay_with_retry`).
+        if !local.is_empty()
+            && self
+                .connect_relay_set(&local, &incoming_tx, &cancel, false)
+                .await
+        {
             return Ok(());
         }
         if self.prefer_local_relays && cancel.is_cancelled() {
@@ -100,7 +240,7 @@ impl NostrSignaler {
             let (listed_local, others) = split_local_relays(remaining);
             if !listed_local.is_empty()
                 && self
-                    .connect_relay_set(&listed_local, &incoming_tx, &cancel)
+                    .connect_relay_set(&listed_local, &incoming_tx, &cancel, false)
                     .await
             {
                 return Ok(());
@@ -111,7 +251,7 @@ impl NostrSignaler {
             remaining = others;
         }
         if self
-            .connect_relay_set(&remaining, &incoming_tx, &cancel)
+            .connect_relay_set(&remaining, &incoming_tx, &cancel, true)
             .await
         {
             Ok(())
@@ -126,23 +266,34 @@ impl NostrSignaler {
         )
     }
 
+    /// Opens every relay of one stage in parallel. With `retry`, each relay
+    /// follows the bounded schedule of [`next_initial_attempt`]; a relay stops
+    /// retrying (after its in-flight attempt) once another relay of the set
+    /// has opened, so one dead relay does not hold the join open for the
+    /// whole budget.
     async fn connect_relay_set(
         &self,
         relays: &[String],
         incoming_tx: &mpsc::Sender<MessageContent>,
         cancel: &CancellationToken,
+        retry: bool,
     ) -> bool {
+        let any_connected = CancellationToken::new();
         let results = join_all(relays.iter().map(|relay| {
             let incoming_tx = incoming_tx.clone();
             let cancel = cancel.clone();
+            let any_connected = any_connected.clone();
             async move {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return false,
-                    result = self.connect_relay_once(relay, incoming_tx.clone(), cancel.clone()) => result,
+                    result = self.connect_relay_with_retry(
+                        relay, incoming_tx.clone(), cancel.clone(), retry, &any_connected,
+                    ) => result,
                 };
                 match result {
                     Ok(disconnected) => {
+                        any_connected.cancel();
                         self.spawn_relay_supervisor(
                             relay.clone(),
                             incoming_tx.clone(),
@@ -160,6 +311,53 @@ impl NostrSignaler {
         }))
         .await;
         !cancel.is_cancelled() && results.into_iter().any(|connected| connected)
+    }
+
+    /// Initial connection to one relay: a fresh TCP connection per attempt,
+    /// retried on transient handshake failures within the budget.
+    async fn connect_relay_with_retry(
+        &self,
+        relay: &str,
+        incoming_tx: mpsc::Sender<MessageContent>,
+        cancel: CancellationToken,
+        retry: bool,
+        any_connected: &CancellationToken,
+    ) -> crate::error::Result<oneshot::Receiver<()>> {
+        let started = Instant::now();
+        let mut attempts = 0;
+        let mut attempt_timeout = RELAY_CONNECT_ATTEMPT_TIMEOUT;
+        loop {
+            attempts += 1;
+            let failure = match self.open_relay(relay, attempt_timeout, &cancel).await {
+                Ok(ws) => return self.attach_relay(relay, ws, incoming_tx, cancel).await,
+                Err(failure) => failure,
+            };
+            if !retry || !failure.retryable || any_connected.is_cancelled() {
+                return Err(failure.error);
+            }
+            let Some((delay, timeout)) =
+                next_initial_attempt(attempts, started.elapsed(), rand::random())
+            else {
+                return Err(failure.error);
+            };
+            tracing::info!(
+                "NostrSignaler: relay connect retry attempt={} max_attempts={} relay={} delay_ms={} timeout_ms={} elapsed_ms={} cause={}",
+                attempts + 1,
+                RELAY_CONNECT_MAX_ATTEMPTS,
+                redact_relay(relay),
+                delay.as_millis(),
+                timeout.as_millis(),
+                started.elapsed().as_millis(),
+                failure.reason
+            );
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(failure.error),
+                _ = any_connected.cancelled() => return Err(failure.error),
+                _ = tokio::time::sleep(delay) => {}
+            }
+            attempt_timeout = timeout;
+        }
     }
 
     fn spawn_relay_supervisor(
@@ -220,21 +418,42 @@ impl NostrSignaler {
         incoming_tx: mpsc::Sender<MessageContent>,
         cancel: CancellationToken,
     ) -> crate::error::Result<oneshot::Receiver<()>> {
+        let ws = self
+            .open_relay(relay, RELAY_CONNECT_TIMEOUT, &cancel)
+            .await
+            .map_err(|failure| failure.error)?;
+        self.attach_relay(relay, ws, incoming_tx, cancel).await
+    }
+
+    /// One handshake attempt on a fresh TCP connection.
+    async fn open_relay(
+        &self,
+        relay: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<RelayStream, ConnectFailure> {
         tracing::info!("NostrSignaler: connecting to {}", relay);
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                return Err(crate::error::MistError::Network("NostrSignaler: connection cancelled".into()));
-            }
-            result = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, connect_async(relay)) => result,
+            _ = cancel.cancelled() => return Err(ConnectFailure::cancelled()),
+            result = tokio::time::timeout(timeout, connect_async(relay)) => result,
         };
-        let (ws_stream, _) = result
-            .map_err(|_| {
-                crate::error::MistError::Network(format!(
-                    "NostrSignaler: connect to {relay} timed out"
-                ))
-            })?
-            .map_err(|err| crate::error::MistError::Network(err.to_string()))?;
+        match result {
+            Err(_) => Err(ConnectFailure::timed_out(relay, timeout)),
+            Ok(Err(err)) => Err(ConnectFailure::handshake(err)),
+            Ok(Ok((ws_stream, _))) => Ok(ws_stream),
+        }
+    }
+
+    /// Wires an opened relay connection into the signaler (subscribe,
+    /// discovery, writer/reader tasks).
+    async fn attach_relay(
+        &self,
+        relay: &str,
+        ws_stream: RelayStream,
+        incoming_tx: mpsc::Sender<MessageContent>,
+        cancel: CancellationToken,
+    ) -> crate::error::Result<oneshot::Receiver<()>> {
         let (mut write, mut read) = ws_stream.split();
         let (tx, mut rx) = mpsc::channel::<String>(1024);
         let (disconnected_tx, disconnected_rx) = oneshot::channel::<()>();
@@ -623,5 +842,71 @@ fn log_relay_status(message: RelayMessage) {
             );
         }
         RelayMessage::Eose { .. } | RelayMessage::Event { .. } | RelayMessage::Closed { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_schedule_fits_three_stalled_attempts_in_the_budget() {
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 0;
+        let mut timeouts = Vec::new();
+        while let Some((delay, timeout)) = next_initial_attempt(attempts, elapsed, 1.0) {
+            assert!(timeout <= RELAY_CONNECT_ATTEMPT_TIMEOUT);
+            elapsed += delay + timeout;
+            attempts += 1;
+            timeouts.push(timeout);
+        }
+        assert_eq!(timeouts, vec![RELAY_CONNECT_ATTEMPT_TIMEOUT; 3]);
+        assert!(elapsed <= RELAY_CONNECT_BUDGET);
+    }
+
+    #[test]
+    fn initial_schedule_caps_attempts_and_jitters_delays() {
+        let exhausted = next_initial_attempt(RELAY_CONNECT_MAX_ATTEMPTS, Duration::ZERO, 0.5);
+        assert!(exhausted.is_none());
+        let (delay, _) = next_initial_attempt(1, Duration::ZERO, 0.0).unwrap();
+        assert_eq!(delay, Duration::from_millis(200));
+        let (delay, _) = next_initial_attempt(1, Duration::ZERO, 1.0).unwrap();
+        assert_eq!(delay, Duration::from_millis(300));
+        // The last attempt is shortened to what is left of the budget.
+        let late = Duration::from_secs(10);
+        let (_, last) = next_initial_attempt(1, late, 0.0).unwrap();
+        assert!(last < RELAY_CONNECT_ATTEMPT_TIMEOUT);
+    }
+
+    #[test]
+    fn handshake_error_classification() {
+        use std::io::{Error as IoError, ErrorKind};
+        use tokio_tungstenite::tungstenite::error::{Error, UrlError};
+        use tokio_tungstenite::tungstenite::http::Response;
+
+        let retryable = |err: Error| is_retryable_handshake_error(&err);
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(retryable(Error::Io(IoError::from(kind))));
+        }
+        let dns = IoError::other("failed to lookup address");
+        assert!(!retryable(Error::Io(dns)));
+        assert!(!retryable(Error::Url(UrlError::UnsupportedUrlScheme)));
+        let refused = Response::builder().status(403).body(None).unwrap();
+        assert!(!retryable(Error::Http(Box::new(refused))));
+    }
+
+    #[test]
+    fn relay_redaction_drops_credentials() {
+        assert_eq!(
+            redact_relay("wss://user:secret@relay.example:443/path/token?auth=x#f"),
+            "wss://relay.example:443"
+        );
+        assert_eq!(redact_relay("ws://127.0.0.1:7777"), "ws://127.0.0.1:7777");
+        assert_eq!(redact_relay("relay.example?x=1"), "relay.example");
     }
 }

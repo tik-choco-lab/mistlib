@@ -69,7 +69,7 @@ impl super::MistEngine {
                 to, data, method, ..
             } = action
             {
-                if let Some(wt) = &ctx.webrtc_transport {
+                if let Some(wt) = &ctx.link_selector {
                     tokio::select! {
                         _ = ctx.cancel.cancelled() => return,
                         result = wt.enqueue_received_send(&to, data, method) => {
@@ -141,6 +141,9 @@ impl super::MistEngine {
                 );
             }
             MessageContent::Data(signaling_data) => {
+                if let Some(selector) = ctx.link_selector.as_ref() {
+                    selector.observe_signaling(&signaling_data);
+                }
                 ctx.ensure_node_registered(&signaling_data.sender_id);
                 if let Some(dispatcher) = &ctx.p2p_signaling_dispatcher {
                     dispatcher
@@ -330,7 +333,7 @@ mod tests {
         let ctx = Arc::new(SessionCtx {
             room_id: "room-a".to_string(),
             transport: Arc::new(NoopTransport),
-            webrtc_transport: None,
+            link_selector: None,
             ws_signaling_handler: Arc::new(NoopSignalingHandler),
             p2p_signaling_dispatcher: Some(Arc::new(super::super::P2pSignalingDispatcher::new(
                 handler.clone(),

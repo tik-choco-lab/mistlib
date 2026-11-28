@@ -627,3 +627,178 @@ async fn sweeper_reaps_a_stale_connecting_reservation_with_no_peer_past_the_gate
         "the stale reservation timestamp must be cleared alongside the reap"
     );
 }
+
+// --- Two-stage connect watchdog (`decide_connect_watchdog`) --------------
+
+mod connect_watchdog_decision {
+    use crate::transports::webrtc::sweeper::{
+        decide_connect_watchdog, ice_transport_connected, WatchdogDecision, WatchdogStage,
+    };
+    use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState as Ice;
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as Pc;
+
+    const ALL_ICE: [Ice; 8] = [
+        Ice::Unspecified,
+        Ice::New,
+        Ice::Checking,
+        Ice::Connected,
+        Ice::Completed,
+        Ice::Disconnected,
+        Ice::Failed,
+        Ice::Closed,
+    ];
+    const ALL_PC: [Pc; 7] = [
+        Pc::Unspecified,
+        Pc::New,
+        Pc::Connecting,
+        Pc::Connected,
+        Pc::Disconnected,
+        Pc::Failed,
+        Pc::Closed,
+    ];
+    const STAGES: [WatchdogStage; 2] = [WatchdogStage::Initial, WatchdogStage::Extended];
+
+    fn transports() -> Vec<Option<(Ice, Pc)>> {
+        let mut out = vec![None];
+        for ice in ALL_ICE {
+            for pc in ALL_PC {
+                out.push(Some((ice, pc)));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ice_connected_rule() {
+        for ice in ALL_ICE {
+            for pc in ALL_PC {
+                let expected = matches!(ice, Ice::Connected | Ice::Completed)
+                    && !matches!(pc, Pc::Failed | Pc::Closed);
+                assert_eq!(
+                    ice_transport_connected(ice, pc),
+                    expected,
+                    "ice={ice:?} pc={pc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn measured_dtls_sctp_tail_is_extended_at_stage_one() {
+        // The measured case: ICE Connected, PC still Connecting (DTLS/SCTP
+        // pending), DC not open.
+        assert_eq!(
+            decide_connect_watchdog(
+                WatchdogStage::Initial,
+                true,
+                true,
+                false,
+                Some((Ice::Connected, Pc::Connecting))
+            ),
+            WatchdogDecision::Extend
+        );
+    }
+
+    #[test]
+    fn ice_still_checking_is_torn_down_at_stage_one_as_before() {
+        assert_eq!(
+            decide_connect_watchdog(
+                WatchdogStage::Initial,
+                true,
+                true,
+                false,
+                Some((Ice::Checking, Pc::Connecting))
+            ),
+            WatchdogDecision::Teardown
+        );
+    }
+
+    #[test]
+    fn dtls_failure_after_ice_connected_is_not_extended() {
+        assert_eq!(
+            decide_connect_watchdog(
+                WatchdogStage::Initial,
+                true,
+                true,
+                false,
+                Some((Ice::Connected, Pc::Failed))
+            ),
+            WatchdogDecision::Teardown
+        );
+    }
+
+    #[test]
+    fn missing_peer_is_torn_down_at_either_stage() {
+        for stage in STAGES {
+            assert_eq!(
+                decide_connect_watchdog(stage, true, true, false, None),
+                WatchdogDecision::Teardown
+            );
+        }
+    }
+
+    #[test]
+    fn extension_is_granted_at_most_once() {
+        assert_eq!(
+            decide_connect_watchdog(
+                WatchdogStage::Extended,
+                true,
+                true,
+                false,
+                Some((Ice::Connected, Pc::Connecting))
+            ),
+            WatchdogDecision::Teardown
+        );
+    }
+
+    #[test]
+    fn superseded_resolved_or_open_attempts_are_never_touched() {
+        let connected = Some((Ice::Connected, Pc::Connecting));
+        for stage in STAGES {
+            assert_eq!(
+                decide_connect_watchdog(stage, false, true, false, connected),
+                WatchdogDecision::Resolved
+            );
+            assert_eq!(
+                decide_connect_watchdog(stage, true, false, false, connected),
+                WatchdogDecision::Resolved
+            );
+            assert_eq!(
+                decide_connect_watchdog(stage, true, true, true, connected),
+                WatchdogDecision::Resolved
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_decision_table() {
+        for stage in STAGES {
+            for is_current in [false, true] {
+                for still_connecting in [false, true] {
+                    for dc_open in [false, true] {
+                        for transport in transports() {
+                            let ctx = (stage, is_current, still_connecting, dc_open, transport);
+                            let got = decide_connect_watchdog(
+                                stage,
+                                is_current,
+                                still_connecting,
+                                dc_open,
+                                transport,
+                            );
+                            let expected = if !is_current || !still_connecting || dc_open {
+                                WatchdogDecision::Resolved
+                            } else if stage == WatchdogStage::Initial
+                                && transport.is_some_and(|(i, p)| ice_transport_connected(i, p))
+                            {
+                                WatchdogDecision::Extend
+                            } else {
+                                WatchdogDecision::Teardown
+                            };
+                            assert_eq!(got, expected, "{ctx:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

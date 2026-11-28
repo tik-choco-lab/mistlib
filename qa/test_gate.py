@@ -72,6 +72,7 @@ class GateTest(unittest.TestCase):
             infos = [deepcopy(info) for _ in range(3)]
             if browser:
                 infos += [{**info, "target": "wasm32-unknown-unknown"} for _ in range(6)]
+                infos += [deepcopy(info), deepcopy(info), {**info, "target": "wasm32-unknown-unknown"}]
             cases = []
             for pair in (["browser-browser", "browser-native", "native-browser"] if browser else ["native-native"]):
                 for phase in self.policy["phases"]:
@@ -91,6 +92,12 @@ class GateTest(unittest.TestCase):
                             "transferMs": [40000, 41000]},
                         "soak": {"observedMs": 15000, "samples": 10}}[phase])
                     cases.append({"id": f"{pair}/{phase}", "passed": True, "durationMs": 1000, "metrics": metrics})
+            if browser:
+                count = 6 * self.policy["messagesPerDirection"]
+                cases.append({"id": "native-native-browser/mixed-room", "passed": True, "durationMs": 1000,
+                    "metrics": {"sent": count, "received": count, "deliveryMs": 100, "connectionMs": 500,
+                        "transfers": 6, "corruptions": 0, "links": {"native0-native1": "iceQuic",
+                            "native0-browser": "webrtc", "native1-browser": "webrtc"}}})
             native = self.manifests["native-linux-x86_64" if browser else identity]
             report = {"schema": 1, "id": identity, "passed": True, "commit": COMMIT, "version": VERSION,
                 "policySha256": sha256(POLICY), "nativeSha256": native["binarySha256"],
@@ -121,7 +128,7 @@ class GateTest(unittest.TestCase):
 
         mutations = {
             "failed run": lambda r: r.update(passed=False),
-            "missing phase": lambda r: r["cases"].pop(),
+            "missing phase": lambda r: r["cases"].pop(0),
             "duplicate phase": lambda r: r["cases"].append(r["cases"][0]),
             "stale commit": lambda r: r.update(commit="b" * 40),
             "wrong policy": lambda r: r.update(policySha256="0" * 64),
@@ -164,6 +171,44 @@ class GateTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.evaluate()
         self.write(path, original)
+
+    def test_mixed_room_is_required_for_browsers_only(self):
+        case_id = "native-native-browser/mixed-room"
+        for identity in ("browser-chromium", "browser-firefox"):
+            with self.subTest(identity=identity):
+                original = self.report_data[identity]
+                report = deepcopy(original)
+                report["cases"] = [case for case in report["cases"] if case["id"] != case_id]
+                path = self.reports / f"{identity}.json"
+                self.write(path, report)
+                with self.assertRaisesRegex(ValueError, "missing/duplicate cases"):
+                    self.evaluate()
+                self.write(path, original)
+        mixed = next(case for case in self.report_data["browser-chromium"]["cases"] if case["id"] == case_id)
+        report = deepcopy(self.report_data["native-linux-x86_64"])
+        report["cases"].append(mixed)
+        self.write(self.reports / "native-linux-x86_64.json", report)
+        with self.assertRaisesRegex(ValueError, "missing/duplicate cases"):
+            self.evaluate()
+
+    def test_mixed_room_metrics_are_required(self):
+        for identity in ("browser-chromium", "browser-firefox"):
+            original = self.report_data[identity]
+            path = self.reports / f"{identity}.json"
+            for change, error in (({"links": {"native0-native1": "webrtc", "native0-browser": "webrtc",
+                                               "native1-browser": "webrtc"}}, "mixed-room link selection"),
+                                  ({"transfers": 5}, "mixed-room storage contract"),
+                                  ({"corruptions": 1}, "mixed-room storage contract"),
+                                  ({"received": 0}, "mixed-room missing messages"),
+                                  ({"sent": 0, "received": 0}, "mixed-room missing messages")):
+                with self.subTest(identity=identity, change=change):
+                    report = deepcopy(original)
+                    case = next(case for case in report["cases"] if case["id"] == "native-native-browser/mixed-room")
+                    case["metrics"].update(change)
+                    self.write(path, report)
+                    with self.assertRaisesRegex(ValueError, error):
+                        self.evaluate()
+            self.write(path, original)
 
     def test_linux_wan_shaping_is_required_for_every_pair(self):
         for identity in ("native-linux-x86_64", "browser-chromium", "browser-firefox"):

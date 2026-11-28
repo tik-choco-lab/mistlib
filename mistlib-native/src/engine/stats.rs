@@ -41,11 +41,15 @@ impl super::MistEngine {
         let mut diag_peers = 0usize;
         let mut diag_connection_states = 0usize;
         let mut diag_pending_candidates = 0usize;
+        // Nodes the ICE+QUIC link carries; every other node is on WebRTC.
+        let mut ice_quic_nodes = std::collections::HashSet::new();
 
         for (room_id, ctx) in &sessions {
-            let Some(wt) = ctx.webrtc_transport.as_ref() else {
+            let Some(links) = ctx.link_selector.as_ref() else {
                 continue;
             };
+            // SCTP and candidate counters are WebRTC-link diagnostics.
+            let wt = links.webrtc();
 
             transport_stats.extend(wt.storage_transport_stats().await);
             let t_sctp = std::time::Instant::now();
@@ -96,6 +100,10 @@ impl super::MistEngine {
 
             sctp_raw.extend(sctp);
             connection_states.extend(states_json);
+            for (node_id, state) in links.ice_quic_states() {
+                connection_states.insert(node_id.0.clone(), state.to_string());
+                ice_quic_nodes.insert(node_id.0);
+            }
             diag_peers += peers;
             diag_connection_states += states_len;
             diag_pending_candidates += cands;
@@ -153,6 +161,10 @@ impl super::MistEngine {
                 let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
                 if let Some(nodes) = value["nodes"].as_array_mut() {
                     for node in nodes {
+                        let on_ice_quic = node["id"]
+                            .as_str()
+                            .is_some_and(|id| ice_quic_nodes.contains(id));
+                        node["link"] = if on_ice_quic { "iceQuic" } else { "webrtc" }.into();
                         if let Some(transport) = node["id"]
                             .as_str()
                             .and_then(|id| transport_stats.remove(id))

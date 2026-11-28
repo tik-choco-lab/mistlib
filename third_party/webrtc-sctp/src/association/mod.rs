@@ -81,6 +81,23 @@ fn receive_buffer_size(configured: u32, application_default: u32) -> u32 {
     }
 }
 
+pub use crate::congestion::CongestionControl;
+
+/// MistLib research patch (see MISTLIB_PATCHES.md). Sender congestion control for
+/// associations created afterwards; existing associations keep theirs.
+/// Process-wide for the same reason as the receive-buffer default: webrtc-rs
+/// 0.13 builds `Config` itself and exposes no per-PeerConnection SCTP hook.
+/// The default `Reno` is upstream's controller, unchanged.
+static DEFAULT_CONGESTION_CONTROL: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_default_congestion_control(cc: CongestionControl) {
+    DEFAULT_CONGESTION_CONTROL.store(cc.to_u8(), Ordering::SeqCst);
+}
+
+pub fn default_congestion_control() -> CongestionControl {
+    CongestionControl::from_u8(DEFAULT_CONGESTION_CONTROL.load(Ordering::SeqCst))
+}
+
 #[cfg(test)]
 mod receive_buffer_tests {
     use super::*;

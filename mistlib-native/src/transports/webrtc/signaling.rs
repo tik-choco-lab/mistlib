@@ -128,7 +128,7 @@ impl WebRtcTransport {
                     sender_id: self.local_node_id.clone(),
                     receiver_id: node.clone(),
                     room_id: self.get_room_id(),
-                    data: String::new(),
+                    data: crate::transports::selector::connect_request_data(),
                     signaling_type: SignalingType::Request,
                 }),
             )
@@ -258,6 +258,7 @@ impl WebRtcTransport {
             ms_since_connected,
             ms_since_last_takeover,
             ms_since_connect_started,
+            self.in_flight_attempt_window_ms(),
         ) {
             return;
         }
@@ -296,6 +297,7 @@ impl WebRtcTransport {
             ms_since_connected,
             ms_since_last_takeover,
             ms_since_connect_started,
+            self.in_flight_attempt_window_ms(),
         );
         if takeover {
             tracing::warn!(
@@ -552,7 +554,8 @@ impl WebRtcTransport {
                                 | ConnectionState::Reconnecting
                         )
                     })
-                    .count();
+                    .count()
+                    + self.external_active_count();
                 if count >= max {
                     return Ok(());
                 }
@@ -1148,6 +1151,9 @@ impl SignalingHandler for WebRtcTransport {
             SignalingType::CandidateAck => Ok(()),
             // Native still emits legacy one-shot Offer/Answer payloads.
             SignalingType::NegotiationAck => Ok(()),
+            // ICE+QUIC negotiation belongs to the selection layer, which
+            // consumes these before WebRTC; never a WebRTC message.
+            SignalingType::IceQuicOffer | SignalingType::IceQuicAnswer => Ok(()),
             SignalingType::Rejoin => {
                 // Locally-synthesized-only notification (see
                 // `SignalingType::Rejoin`'s doc comment): the signaling layer
@@ -1334,6 +1340,7 @@ pub(crate) fn offer_takeover_decision(
     ms_since_connected: Option<u64>,
     ms_since_last_takeover: Option<u64>,
     ms_since_connect_started: Option<u128>,
+    in_flight_window_ms: u64,
 ) -> bool {
     match (existing_fingerprint, incoming_fingerprint) {
         (Some(existing), Some(incoming)) if existing != incoming => super::takeover_allowed(
@@ -1341,6 +1348,7 @@ pub(crate) fn offer_takeover_decision(
             ms_since_connected,
             ms_since_last_takeover,
             ms_since_connect_started,
+            in_flight_window_ms,
         ),
         _ => false,
     }
@@ -1428,7 +1436,8 @@ mod payload_tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                crate::transports::webrtc::sweeper::DEFAULT_IN_FLIGHT_ATTEMPT_WINDOW_MS
             ));
             assert!(matches!(
                 duplicate_offer_decision(raw == decoded.sdp, RTCSignalingState::Stable, true),

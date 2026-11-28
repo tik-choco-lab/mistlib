@@ -95,10 +95,32 @@ mod sdp_fingerprint_tests {
 // --- `takeover_allowed` (shared guards) ---------------------------------
 
 mod takeover_allowed_tests {
-    use super::takeover_allowed;
-    use crate::transports::webrtc::{
-        CONNECTION_TIMEOUT_MS, REMOTE_TAKEOVER_MIN_INTERVAL_MS, REMOTE_TAKEOVER_RECENT_CONNECT_MS,
+    use crate::transports::webrtc::sweeper::{
+        in_flight_attempt_window_ms, DEFAULT_IN_FLIGHT_ATTEMPT_WINDOW_MS,
     };
+    use crate::transports::webrtc::{
+        CONNECTION_EXTENSION_MS, CONNECTION_TIMEOUT_MS, REMOTE_TAKEOVER_MIN_INTERVAL_MS,
+        REMOTE_TAKEOVER_RECENT_CONNECT_MS,
+    };
+
+    /// The window a default (env-unset) transport passes:
+    /// `WebRtcTransport::in_flight_attempt_window_ms()`.
+    const WINDOW_MS: u64 = DEFAULT_IN_FLIGHT_ATTEMPT_WINDOW_MS;
+
+    fn takeover_allowed(
+        healthy: bool,
+        ms_since_connected: Option<u64>,
+        ms_since_last_takeover: Option<u64>,
+        ms_since_connect_started: Option<u128>,
+    ) -> bool {
+        super::takeover_allowed(
+            healthy,
+            ms_since_connected,
+            ms_since_last_takeover,
+            ms_since_connect_started,
+            WINDOW_MS,
+        )
+    }
 
     #[test]
     fn allowed_with_no_prior_state_at_all() {
@@ -202,7 +224,7 @@ mod takeover_allowed_tests {
             false,
             None,
             None,
-            Some(CONNECTION_TIMEOUT_MS as u128 + 1)
+            Some(WINDOW_MS as u128 + 1)
         ));
     }
 
@@ -210,12 +232,60 @@ mod takeover_allowed_tests {
     fn boundary_ms_since_connect_started_exactly_at_threshold_is_not_young() {
         // Strict `<`, matching the recent-connect guard's own boundary
         // convention: `ms == threshold` no longer counts as "young".
-        assert!(takeover_allowed(
+        let at_threshold = Some(WINDOW_MS as u128);
+        assert!(takeover_allowed(false, None, None, at_threshold));
+    }
+
+    // --- Two-stage connect watchdog: extension stays protected ----------
+
+    #[test]
+    fn default_window_is_watchdog_timeout_plus_extension() {
+        assert_eq!(
+            WINDOW_MS,
+            in_flight_attempt_window_ms(CONNECTION_TIMEOUT_MS, CONNECTION_EXTENSION_MS)
+        );
+        assert_eq!(WINDOW_MS, CONNECTION_TIMEOUT_MS + CONNECTION_EXTENSION_MS);
+    }
+
+    #[test]
+    fn attempt_inside_its_watchdog_extension_is_still_protected() {
+        // Past stage 1 (the watchdog chose to extend: ICE connected, DC
+        // still opening) but before stage 2 -- a remote takeover here would
+        // destroy exactly the attempt the watchdog decided to keep.
+        assert!(!takeover_allowed(
             false,
             None,
             None,
             Some(CONNECTION_TIMEOUT_MS as u128)
         ));
+        assert!(!takeover_allowed(
+            false,
+            None,
+            None,
+            Some(WINDOW_MS as u128 - 1)
+        ));
+    }
+
+    #[test]
+    fn window_follows_the_callers_instance_timeouts() {
+        // `takeover_allowed` uses the window it is given (e.g. env-overridden
+        // instance timeouts), not a compile-time constant.
+        let window = in_flight_attempt_window_ms(1000, 500);
+        assert!(!super::takeover_allowed(
+            false,
+            None,
+            None,
+            Some(1499),
+            window
+        ));
+        assert!(super::takeover_allowed(
+            false,
+            None,
+            None,
+            Some(1500),
+            window
+        ));
+        assert_eq!(in_flight_attempt_window_ms(u64::MAX, 1), u64::MAX);
     }
 
     #[test]
@@ -235,7 +305,28 @@ mod takeover_allowed_tests {
 // --- `offer_takeover_decision` (Change 2's fingerprint x guards table) --
 
 mod offer_takeover_decision_tests {
-    use super::offer_takeover_decision;
+    use crate::transports::webrtc::sweeper::DEFAULT_IN_FLIGHT_ATTEMPT_WINDOW_MS;
+
+    /// Every case here is about the fingerprint table, not the in-flight
+    /// window, so pin the window to the default instance's value.
+    fn offer_takeover_decision(
+        existing: Option<&str>,
+        incoming: Option<&str>,
+        healthy: bool,
+        ms_since_connected: Option<u64>,
+        ms_since_last_takeover: Option<u64>,
+        ms_since_connect_started: Option<u128>,
+    ) -> bool {
+        super::offer_takeover_decision(
+            existing,
+            incoming,
+            healthy,
+            ms_since_connected,
+            ms_since_last_takeover,
+            ms_since_connect_started,
+            DEFAULT_IN_FLIGHT_ATTEMPT_WINDOW_MS,
+        )
+    }
 
     #[test]
     fn same_fingerprint_never_takes_over_even_if_guards_would_allow_it() {

@@ -100,6 +100,17 @@ pub struct WebRtcConfig {
     /// Preserve ICE candidates that arrive before the browser peer exists.
     #[serde(default = "default_buffer_early_ice_candidates")]
     pub buffer_early_ice_candidates: bool,
+    /// Native only (SPEC-25 O2), on by default: announce the ICE+QUIC link
+    /// (`iq1`) and let native↔native pairs where both sides announce it use
+    /// that link instead of WebRTC. `false` announces nothing and keeps
+    /// every peer on WebRTC. WASM ignores it. Native also stays on WebRTC
+    /// while the app only listens for WebRTC media (see CONFIG.md).
+    #[serde(default = "default_ice_quic")]
+    pub ice_quic: bool,
+}
+
+fn default_ice_quic() -> bool {
+    true
 }
 
 fn default_webrtc_connection_timeout_ms() -> u32 {
@@ -322,6 +333,7 @@ impl Config {
                 defer_connection_watchdog_until_negotiated:
                     default_defer_connection_watchdog_until_negotiated(),
                 buffer_early_ice_candidates: default_buffer_early_ice_candidates(),
+                ice_quic: default_ice_quic(),
             },
             storage: StorageConfig::default(),
         }

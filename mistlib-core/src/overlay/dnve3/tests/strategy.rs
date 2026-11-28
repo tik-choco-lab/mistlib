@@ -206,6 +206,62 @@ fn strategy_on_peer_disconnected_bypasses_balancer_tick_timer() {
 }
 
 #[test]
+fn strategy_on_nodes_learned_selects_early_only_below_target() {
+    let mut config = test_config();
+    config.dnve.connection_mode = ConnectionMode::NodeListProximity;
+    config.limits.max_connection_count = 2;
+    config.limits.reserved_connection_count = 0;
+
+    let node_store = Arc::new(Mutex::new(NodeStore::new()));
+    let routing_table = Arc::new(Mutex::new(RoutingTable::new()));
+    let strategy = DNVE3Strategy::new(&config, node_store, node("local"), routing_table);
+    let insert = |id: &str, x: f32| {
+        strategy.node_store.lock().unwrap().nodes.insert(
+            node(id),
+            NodeInfo {
+                id: node(id),
+                position: pos(x, 0.0, 0.0),
+            },
+        );
+    };
+    let connects_to = |actions: &[OverlayAction], id: &str| {
+        actions
+            .iter()
+            .any(|a| matches!(a, OverlayAction::Connect { to } if *to == node(id)))
+    };
+    insert("local", 0.0);
+
+    // Session start: the first tick runs the balancer with nobody known yet.
+    let _ = strategy.tick(&config, &[]);
+
+    // A peer learned right after must not wait for the 2s balancer timer.
+    insert("late-peer", 2.0);
+    assert!(
+        !connects_to(&strategy.tick(&config, &[]), "late-peer"),
+        "a plain tick is still gated by the balancer timer"
+    );
+    assert!(
+        connects_to(&strategy.on_nodes_learned(&config, &[]), "late-peer"),
+        "on_nodes_learned should select the newly learned peer immediately"
+    );
+    assert!(
+        !connects_to(&strategy.tick(&config, &[]), "late-peer"),
+        "the early run pushes the next periodic balancer tick out"
+    );
+
+    // At the connection target the early path stays out of the way.
+    insert("third-peer", 3.0);
+    let full = [
+        (node("a"), ConnectionState::Connected),
+        (node("b"), ConnectionState::Connected),
+    ];
+    assert!(
+        strategy.on_nodes_learned(&config, &full).is_empty(),
+        "no early evaluation once Connected reaches the target"
+    );
+}
+
+#[test]
 fn strategy_node_list_modes_push_node_list_instead_of_requesting() {
     for mode in [
         ConnectionMode::DirectionDensityLight,

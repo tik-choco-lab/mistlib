@@ -21,11 +21,12 @@ pub mod signature;
 mod util;
 
 pub use codec::{
-    build_discovery_event, build_discovery_event_with_joined_at, build_message_event,
-    build_message_event_with_sequence, build_message_event_with_sequence_and_joined_at,
-    decode_discovery_event, decode_message_event, discovery_filter, is_broadcast_sentinel_message,
-    is_room_mailbox_message, message_filter, DecodedDiscovery, DecodedMessage, NostrCodecConfig,
-    TAG_DISCOVERY_PROOF, TAG_EXPIRATION, TAG_INVITE_SCOPE, TAG_JOINED_AT, TAG_P,
+    build_discovery_event, build_discovery_event_with_joined_at,
+    build_discovery_event_with_transports, build_message_event, build_message_event_with_sequence,
+    build_message_event_with_sequence_and_joined_at, decode_discovery_event, decode_message_event,
+    discovery_filter, is_broadcast_sentinel_message, is_room_mailbox_message, message_filter,
+    DecodedDiscovery, DecodedMessage, NostrCodecConfig, TAG_DISCOVERY_PROOF, TAG_EXPIRATION,
+    TAG_INVITE_SCOPE, TAG_JOINED_AT, TAG_P, TAG_TRANSPORTS,
 };
 pub use crypto::{InvitePskCrypto, NostrCrypto};
 pub use dedupe::DedupeCache;

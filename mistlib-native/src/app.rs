@@ -117,7 +117,7 @@ pub async fn register_media_track_handler_async(
 ) -> crate::error::Result<()> {
     *crate::transports::webrtc::GLOBAL_MEDIA_TX.lock().unwrap() = Some(tx.clone());
     for (_, ctx) in ENGINE.sessions_snapshot().await {
-        if let Some(transport) = ctx.webrtc_transport.as_ref() {
+        if let Some(transport) = ctx.link_selector.as_ref() {
             transport.set_media_track_handler(tx.clone());
         }
     }
@@ -194,6 +194,31 @@ pub fn set_local_track_audience_blocking(
         .block_on(set_local_track_audience(room_id, track_id, nodes))
 }
 
+/// Writes one RTP packet of the published local track `track_id` in
+/// `room_id` to every peer in its audience: WebRTC peers through the track
+/// (same as `track.write_rtp`), and peers carried by the ICE+QUIC link
+/// (`webrtc.iceQuic`) as a QUIC DATAGRAM. Use this instead of writing to the
+/// `TrackLocalStaticRTP` directly so ICE+QUIC peers receive media too.
+pub async fn write_local_rtp(
+    room_id: &str,
+    track_id: &str,
+    packet: &webrtc::rtp::packet::Packet,
+) -> crate::error::Result<()> {
+    let transport = resolve_room_webrtc_transport(room_id).await?;
+    transport.write_local_rtp(track_id, packet).await
+}
+
+/// Receives RTP packets from peers carried by the ICE+QUIC link (one
+/// [`crate::MediaPacketEvent`] per packet). WebRTC peers keep delivering
+/// tracks through [`register_media_track_handler`].
+pub fn register_media_packet_handler(
+    tx: mpsc::UnboundedSender<crate::transports::MediaPacketEvent>,
+) {
+    *crate::transports::media_packet::GLOBAL_MEDIA_PACKET_TX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+}
+
 /// Unpublishes and forgets `track_id` in `room_id`; its audience is cleared.
 pub async fn remove_local_track(room_id: &str, track_id: &str) -> crate::error::Result<()> {
     let transport = resolve_room_webrtc_transport(room_id).await?;
@@ -202,11 +227,11 @@ pub async fn remove_local_track(room_id: &str, track_id: &str) -> crate::error::
 
 async fn resolve_room_webrtc_transport(
     room_id: &str,
-) -> crate::error::Result<Arc<crate::transports::webrtc::WebRtcTransport>> {
+) -> crate::error::Result<Arc<crate::transports::LinkSelector>> {
     let ctx = ENGINE.get_session(room_id).await.ok_or_else(|| {
         crate::error::MistError::Internal(format!("room '{room_id}' is not joined"))
     })?;
-    ctx.webrtc_transport.clone().ok_or_else(|| {
+    ctx.link_selector.clone().ok_or_else(|| {
         crate::error::MistError::Internal(format!("room '{room_id}' has no WebRTC transport"))
     })
 }
@@ -382,7 +407,7 @@ pub async fn send_message_direct(
             "overlay router is not available".to_string(),
         ));
     };
-    let Some(transport) = ctx.webrtc_transport.as_ref() else {
+    let Some(transport) = ctx.link_selector.as_ref() else {
         return Err(crate::error::MistError::Internal(
             "WebRTC transport is not available".to_string(),
         ));
@@ -471,7 +496,7 @@ async fn send_message_direct_wait_for(
     let overlay = ctx.overlay.as_ref().ok_or_else(|| {
         crate::error::MistError::Internal("overlay router is not available".to_string())
     })?;
-    let transport = ctx.webrtc_transport.as_ref().ok_or_else(|| {
+    let transport = ctx.link_selector.as_ref().ok_or_else(|| {
         crate::error::MistError::Internal("WebRTC transport is not available".to_string())
     })?;
     // Snapshot the next hop before waiting. The reserved queue stays bound to this
@@ -554,7 +579,7 @@ pub async fn get_connected_nodes_async() -> Vec<String> {
     let mut nodes = std::collections::HashSet::new();
     for (_, ctx) in ENGINE.sessions_snapshot().await {
         let session_nodes = ctx
-            .webrtc_transport
+            .link_selector
             .as_ref()
             .map(|transport| transport.get_connected_nodes())
             .unwrap_or_else(|| ctx.transport.get_connected_nodes());
@@ -578,7 +603,7 @@ pub async fn get_room_connections_async() -> Vec<(String, Vec<(String, String)>)
     let mut rooms = Vec::new();
     for (room_id, ctx) in ENGINE.sessions_snapshot().await {
         let session_nodes = ctx
-            .webrtc_transport
+            .link_selector
             .as_ref()
             .map(|transport| transport.get_connected_nodes())
             .unwrap_or_else(|| ctx.transport.get_connected_nodes());
@@ -586,7 +611,7 @@ pub async fn get_room_connections_async() -> Vec<(String, Vec<(String, String)>)
             .into_iter()
             .map(|node| {
                 let state = ctx
-                    .webrtc_transport
+                    .link_selector
                     .as_ref()
                     .map(|transport| transport.get_connection_state(&node))
                     .unwrap_or_else(|| ctx.transport.get_connection_state(&node));
@@ -618,7 +643,7 @@ pub async fn get_connection_state_value_async(node_id: &str) -> ConnectionState 
     let node = NodeId(node_id.to_string());
     for (_, ctx) in ENGINE.sessions_snapshot().await {
         let state = ctx
-            .webrtc_transport
+            .link_selector
             .as_ref()
             .map(|transport| transport.get_connection_state(&node))
             .unwrap_or_else(|| ctx.transport.get_connection_state(&node));

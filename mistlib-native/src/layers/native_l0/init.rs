@@ -1,6 +1,6 @@
 use crate::engine::{SessionCtx, ENGINE};
 use crate::signaling::{BootstrapSignaler, NostrSignaler, WebSocketSignaler};
-use crate::transports::WebRtcTransport;
+use crate::transports::{LinkSelector, WebRtcTransport};
 use mistlib_core::config::{Config, SignalingMode};
 use mistlib_core::overlay::dnve3::strategy::DNVE3Strategy;
 use mistlib_core::overlay::node_store::NodeStore;
@@ -49,14 +49,29 @@ pub(super) async fn build_session_context(room_id: String, local_id: NodeId) -> 
     ));
     let webrtc_transport =
         build_webrtc_transport(&routed_signaler, &local_id, &config, room_id.clone());
+    crate::transports::selector::set_ice_quic_enabled(config.webrtc.ice_quic);
+    let mut link_selector = LinkSelector::new(webrtc_transport.clone());
+    if config.webrtc.ice_quic {
+        let quic = crate::transports::ice_quic::IceQuicPeers::new(
+            local_id.clone(),
+            room_id.clone(),
+            routed_signaler.clone() as Arc<dyn Signaler>,
+            crate::transports::ice_quic::IceQuicConfig::with_ice_servers(
+                &config.webrtc.ice_servers,
+            ),
+            &webrtc_transport,
+        );
+        link_selector = link_selector.with_ice_quic(quic);
+    }
+    let link_selector = Arc::new(link_selector);
     let ws_signaling_handler = Arc::new(RoutedSignalingHandler::new(
         routed_signaler.clone(),
-        webrtc_transport.clone() as Arc<dyn SignalingHandler>,
+        link_selector.clone() as Arc<dyn SignalingHandler>,
         SignalingRoute::WebSocket,
     ));
     let p2p_signaling_handler = Arc::new(RoutedSignalingHandler::new(
         routed_signaler.clone(),
-        webrtc_transport.clone() as Arc<dyn SignalingHandler>,
+        link_selector.clone() as Arc<dyn SignalingHandler>,
         SignalingRoute::Overlay,
     ));
     let l1 = build_l1_transport(&overlay_transport, &node_store, &local_id, room_id.clone());
@@ -69,7 +84,7 @@ pub(super) async fn build_session_context(room_id: String, local_id: NodeId) -> 
     Arc::new(SessionCtx {
         room_id,
         transport: overlay_transport.clone(),
-        webrtc_transport: Some(webrtc_transport),
+        link_selector: Some(link_selector),
         ws_signaling_handler,
         p2p_signaling_dispatcher: Some(Arc::new(crate::engine::P2pSignalingDispatcher::new(
             p2p_signaling_handler,
@@ -156,7 +171,7 @@ impl mistlib_core::overlay::ActionHandler for SessionActionHandler {
                 .get_session_sync(&self.room_id)
                 .ok_or_else(mistlib_core::transport::send::closed_send)?;
             let transport = ctx
-                .webrtc_transport
+                .link_selector
                 .as_ref()
                 .ok_or_else(mistlib_core::transport::send::closed_send)?;
             transport.reserve_overlay_send(to, bytes, lane).await

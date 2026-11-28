@@ -45,6 +45,8 @@ pub fn signaling_label(kind: &SignalingType) -> &'static str {
         SignalingType::CandidateAck => "candidate_ack",
         SignalingType::NegotiationAck => "negotiation_ack",
         SignalingType::Rejoin => "rejoin",
+        SignalingType::IceQuicOffer => "ice_quic_offer",
+        SignalingType::IceQuicAnswer => "ice_quic_answer",
     }
 }
 

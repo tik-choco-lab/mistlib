@@ -168,8 +168,16 @@ pub(crate) fn is_ice_restart_initiator(local_id: &NodeId, remote_id: &NodeId) ->
 /// - `ms_since_connect_started` implements the **young in-flight attempt
 ///   guard**: refuses takeover while `connect_started_at` (an attempt still
 ///   between reserving a handshake permit and either the ReliableOrdered DC
-///   opening or the connect watchdog firing) is younger than
-///   `CONNECTION_TIMEOUT_MS`. Measured on a steady 50-node fleet with no
+///   opening or the connect watchdog tearing it down) is younger than
+///   `in_flight_window_ms`. Callers pass
+///   `WebRtcTransport::in_flight_attempt_window_ms()` -- the instance's
+///   watchdog timeout plus its one-shot extension, i.e. the longest an
+///   attempt can stay in flight under the two-stage watchdog -- so an attempt
+///   the watchdog chose to extend (ICE connected, DataChannel still opening)
+///   is never destroyed by a remote takeover mid-extension. An attempt the
+///   watchdog tears down at stage 1 loses its `connect_started_at` entry at
+///   that moment, so the longer window does not protect it any further.
+///   Measured on a steady 50-node fleet with no
 ///   fault injection: the higher-ID side's `CONNECT_REQUEST_RETRY_INITIAL_MS`
 ///   (1s) retry routinely landed while the lower-ID/initiator side's own
 ///   dial to the very same peer was still mid-flight (fresh cross-host
@@ -207,6 +215,7 @@ pub(crate) fn takeover_allowed(
     ms_since_connected: Option<u64>,
     ms_since_last_takeover: Option<u64>,
     ms_since_connect_started: Option<u128>,
+    in_flight_window_ms: u64,
 ) -> bool {
     let recently_connected_and_healthy =
         healthy && ms_since_connected.is_some_and(|ms| ms < REMOTE_TAKEOVER_RECENT_CONNECT_MS);
@@ -214,7 +223,7 @@ pub(crate) fn takeover_allowed(
         return false;
     }
     let young_in_flight_attempt =
-        ms_since_connect_started.is_some_and(|ms| ms < CONNECTION_TIMEOUT_MS as u128);
+        ms_since_connect_started.is_some_and(|ms| ms < in_flight_window_ms as u128);
     if young_in_flight_attempt {
         return false;
     }
@@ -301,11 +310,36 @@ fn rollback_description() -> RTCSessionDescription {
 }
 
 const SERVER_ID: &str = "server";
-/// Default for the `connection_timeout_ms` instance field (per-attempt
-/// connect watchdog) -- overridable via `MIST_WEBRTC_CONNECTION_TIMEOUT_MS`,
-/// read once at construction (see `WebRtcTransport::new`).
+/// Default for the `connection_timeout_ms` instance field: stage 1 of the
+/// per-attempt connect watchdog (`sweeper::spawn_connection_watchdog`) --
+/// overridable via `MIST_WEBRTC_CONNECTION_TIMEOUT_MS`, read once at
+/// construction (see `WebRtcTransport::new`). When it fires on a
+/// still-`Connecting` attempt whose ReliableOrdered DataChannel is not open:
+/// an attempt whose ICE transport never connected is torn down right away
+/// (it cannot succeed), while one whose ICE transport already connected
+/// (`sweeper::ice_transport_connected`) gets one stage-2 extension of
+/// [`CONNECTION_EXTENSION_MS`] for DTLS + SCTP + DCEP to finish before the
+/// same check runs again and tears it down.
 const CONNECTION_TIMEOUT_MS: u64 = 6000;
-const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 5000;
+/// Default for the `connection_extension_ms` instance field: stage 2 of the
+/// connect watchdog (see [`CONNECTION_TIMEOUT_MS`]), granted at most once per
+/// attempt and only when ICE already connected but the ReliableOrdered
+/// DataChannel is not open yet. Measured on a NAT testbed (75 ms one-way
+/// delay, 5 % bursty loss): ICE connected after ~1 s, but raw webrtc-rs
+/// DataChannel open took up to 9.4 s, so a 6 s one-stage watchdog destroyed
+/// attempts that were about to succeed. 6 s + 8 s = 14 s covers that tail.
+/// Overridable via `MIST_WEBRTC_CONNECTION_EXTENSION_MS`, read once at
+/// construction (see `WebRtcTransport::new`).
+const CONNECTION_EXTENSION_MS: u64 = 8000;
+/// Sweeper zombie check: a peer whose `RTCPeerConnection` reached Connected
+/// (ICE + DTLS done) but whose ReliableOrdered DataChannel is still not open
+/// after this long is reaped (`sweeper_dc_timeout`). Overridable via
+/// `MIST_WEBRTC_DC_OPEN_TIMEOUT_MS`. 10 s rather than the former 5 s: on the
+/// NAT testbed (75 ms one-way delay, 5 % bursty loss) raw webrtc-rs took up to
+/// 9.4 s from DTLS connected to DataChannel open (SCTP INIT/COOKIE and DCEP
+/// retransmissions), so 5 s reaped attempts that the connect watchdog's
+/// extension (see [`CONNECTION_EXTENSION_MS`]) was deliberately keeping.
+const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 10_000;
 /// Default for the `reconnect_cooldown_ms` instance field (per-peer
 /// re-`connect()` cooldown, also reused as the `last_disconnect_at` TTL) --
 /// overridable via `MIST_WEBRTC_RECONNECT_COOLDOWN_MS`, read once at
@@ -764,6 +798,9 @@ fn register_h264_opus_codecs(engine: &mut MediaEngine) -> webrtc::error::Result<
 /// transports, so registration stashes the sender here and every new
 /// transport inherits it at construction. `app::register_media_track_handler`
 /// also applies it to already-running sessions.
+/// Where remote media track events go (`None` = nobody listens yet).
+pub(crate) type MediaTrackSink = Arc<Mutex<Option<mpsc::UnboundedSender<MediaTrackEvent>>>>;
+
 pub(crate) static GLOBAL_MEDIA_TX: Mutex<Option<mpsc::UnboundedSender<MediaTrackEvent>>> =
     Mutex::new(None);
 
@@ -806,7 +843,10 @@ pub struct WebRtcTransport {
     /// default (data-channel-only mode); set via `set_media_track_handler`
     /// before connecting peers that are expected to carry media, e.g. by a
     /// WHIP/broadcast-facing consumer such as mistlib-media.
-    pub(crate) media_tx: Mutex<Option<mpsc::UnboundedSender<MediaTrackEvent>>>,
+    /// Shared with every peer's `on_track` handler, which reads it when a
+    /// track arrives, so a handler registered later also covers peers that
+    /// are already connected.
+    pub(crate) media_tx: MediaTrackSink,
     pub connection_states: Arc<StdRwLock<HashMap<NodeId, ConnectionState>>>,
     pub room_id: Arc<StdRwLock<String>>,
     pub pending_candidates: Arc<tokio::sync::RwLock<HashMap<NodeId, Vec<String>>>>,
@@ -817,6 +857,10 @@ pub struct WebRtcTransport {
     /// construction (`layers::native_l0::init::build_webrtc_transport`).
     pub ice_servers: Arc<StdRwLock<Vec<RTCIceServer>>>,
     pub max_connections: AtomicU32,
+    /// Peers carried by other links of the same room (ICE+QUIC, SPEC-25
+    /// O2.2). Added to this transport's own count when enforcing
+    /// `max_connections`, so the room-wide limit spans every link.
+    pub(crate) external_active: StdRwLock<Option<Arc<std::sync::atomic::AtomicUsize>>>,
     /// SPEC-13: upper bound (bytes, post-envelope/pre-wire) enforced by
     /// `Transport::send` before a payload ever reaches a DataChannel.
     /// Defaults to 64KiB, matching `Config::limits.max_message_bytes`'s
@@ -837,6 +881,11 @@ pub struct WebRtcTransport {
     /// overridable via `MIST_WEBRTC_CONNECTION_TIMEOUT_MS`). Read once at
     /// construction; see `env_override_u64_ms`.
     pub(crate) connection_timeout_ms: u64,
+    /// One-shot stage-2 extension of the connect watchdog for attempts whose
+    /// ICE transport already connected (default [`CONNECTION_EXTENSION_MS`],
+    /// overridable via `MIST_WEBRTC_CONNECTION_EXTENSION_MS`). Read once at
+    /// construction; see `env_override_u64_ms`.
+    pub(crate) connection_extension_ms: u64,
     pub connection_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
     pub connect_request_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
     /// Sweeper livelock fix: when a `connection_states[node] = Connecting`
@@ -976,7 +1025,7 @@ pub struct WebRtcTransport {
 pub(crate) type PublishedSenders = HashMap<NodeId, HashMap<String, Arc<RTCRtpSender>>>;
 
 /// One synchronous hand-off through an already reserved peer queue permit.
-type SendCommit<'a> =
+pub(crate) type SendCommit<'a> =
     Box<dyn FnOnce(Bytes, DeliveryMethod) -> mistlib_core::error::Result<()> + 'a>;
 
 fn build_webrtc_api(setting_engine: SettingEngine) -> API {
@@ -1096,6 +1145,10 @@ impl WebRtcTransport {
             env_override_u64_ms("MIST_WEBRTC_DISCONNECTED_GRACE_MS", DISCONNECTED_GRACE_MS);
         let connection_timeout_ms =
             env_override_u64_ms("MIST_WEBRTC_CONNECTION_TIMEOUT_MS", CONNECTION_TIMEOUT_MS);
+        let connection_extension_ms = env_override_u64_ms(
+            "MIST_WEBRTC_CONNECTION_EXTENSION_MS",
+            CONNECTION_EXTENSION_MS,
+        );
 
         Self {
             storage_transfer: StdRwLock::new(Default::default()),
@@ -1109,7 +1162,7 @@ impl WebRtcTransport {
             peers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             send_queues: Arc::new(StdRwLock::new(HashMap::new())),
             event_handler: Mutex::new(None),
-            media_tx: Mutex::new(GLOBAL_MEDIA_TX.lock().unwrap().clone()),
+            media_tx: Arc::new(Mutex::new(GLOBAL_MEDIA_TX.lock().unwrap().clone())),
             connection_states: Arc::new(StdRwLock::new(HashMap::new())),
             room_id: Arc::new(StdRwLock::new("lobby".to_string())),
             pending_candidates: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1124,10 +1177,12 @@ impl WebRtcTransport {
                 ..Default::default()
             }])),
             max_connections: AtomicU32::new(30),
+            external_active: StdRwLock::new(None),
             max_message_bytes: AtomicU32::new(65536),
             reconnect_cooldown_ms,
             disconnected_grace_ms,
             connection_timeout_ms,
+            connection_extension_ms,
             connection_attempt_ids: Arc::new(StdRwLock::new(HashMap::new())),
             connect_request_attempt_ids: Arc::new(StdRwLock::new(HashMap::new())),
             connecting_reserved_at: Arc::new(StdRwLock::new(HashMap::new())),
@@ -1158,6 +1213,19 @@ impl WebRtcTransport {
     pub fn set_room_id(&self, room_id: String) {
         let mut room = self.room_id.write().unwrap();
         *room = room_id;
+    }
+
+    /// Count the peers of another link of this room toward `max_connections`.
+    pub(crate) fn set_external_active(&self, counter: Arc<std::sync::atomic::AtomicUsize>) {
+        *self.external_active.write().unwrap() = Some(counter);
+    }
+
+    pub(crate) fn external_active_count(&self) -> usize {
+        self.external_active
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     pub fn set_max_connections(&self, max: u32) {
@@ -1204,8 +1272,9 @@ impl WebRtcTransport {
     }
 
     /// Registers a channel to receive remote media track (audio/video) arrival
-    /// events for peers connected from this point forward. Peers created before
-    /// this call was made do not retroactively get the handler wired up.
+    /// events. Applies to every peer, including ones already connected: their
+    /// `on_track` handlers read this sink when a track arrives. Tracks that
+    /// arrived before the call are not replayed.
     pub fn set_media_track_handler(&self, tx: mpsc::UnboundedSender<MediaTrackEvent>) {
         let mut media_tx = self.media_tx.lock().unwrap();
         *media_tx = Some(tx);
@@ -1941,7 +2010,8 @@ impl WebRtcTransport {
                             | ConnectionState::Reconnecting
                     )
                 })
-                .count();
+                .count()
+                + self.external_active_count();
             if count >= max {
                 return Ok(());
             }

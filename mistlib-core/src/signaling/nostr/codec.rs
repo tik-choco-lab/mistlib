@@ -8,6 +8,7 @@ use super::invite::{
 use super::util::now_unix_seconds;
 use crate::config::NostrSignalingConfig;
 use crate::error::{MistError, Result};
+use crate::signaling::capabilities::sanitize_transports;
 use crate::signaling::SignalingData;
 use crate::types::NodeId;
 
@@ -26,6 +27,12 @@ pub const TAG_NONCE: &str = "nonce";
 pub const TAG_DISCOVERY_PROOF: &str = "proof";
 pub const TAG_JOINED_AT: &str = "joined_at";
 pub const TAG_P: &str = "p";
+/// Optional discovery tag announcing the publisher's link kinds:
+/// `["transports", "webrtc", "iq1"]` (SPEC-25 §6.2). Omitted when nothing is
+/// announced; readers that predate it never look it up, and it is covered by
+/// the event signature like every other tag. Relay-visible plaintext, like the
+/// rest of the discovery tags.
+pub const TAG_TRANSPORTS: &str = "transports";
 const MIN_ROOM_SCOPE_ROTATION_SECONDS: u64 = 30;
 const MAX_ROOM_SCOPE_ROTATION_SECONDS: u64 = 3_600;
 /// Default clock-skew tolerance used when [`NostrSignalingConfig::max_clock_skew_seconds`]
@@ -143,6 +150,10 @@ pub struct DecodedDiscovery {
     pub expires_at: u64,
     pub topology_rank: String,
     pub joined_at: Option<u64>,
+    /// Link kinds from [`TAG_TRANSPORTS`], sanitized
+    /// (see [`crate::signaling::capabilities::sanitize_transports`]). Empty when
+    /// the publisher announced nothing.
+    pub transports: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,6 +213,20 @@ pub fn build_discovery_event_with_joined_at<C: NostrCrypto>(
     room_id: &str,
     joined_at: Option<u64>,
 ) -> Result<NostrEvent> {
+    build_discovery_event_with_transports(config, crypto, identity, room_id, joined_at, &[])
+}
+
+/// [`build_discovery_event_with_joined_at`] plus an optional
+/// [`TAG_TRANSPORTS`] announcement. An empty `transports` builds exactly the
+/// same tag set as before the announcement existed.
+pub fn build_discovery_event_with_transports<C: NostrCrypto>(
+    config: &NostrCodecConfig,
+    crypto: &C,
+    identity: &TemporarySignalingIdentity,
+    room_id: &str,
+    joined_at: Option<u64>,
+    transports: &[&str],
+) -> Result<NostrEvent> {
     let expires_at = config.expires_at();
     let room_scope = config.current_room_scope(room_id);
     let nonce = random_subscription_id();
@@ -214,6 +239,13 @@ pub fn build_discovery_event_with_joined_at<C: NostrCrypto>(
     ];
     if let Some(joined_at) = joined_at {
         tags.push(tag(TAG_JOINED_AT, &joined_at.to_string()));
+    }
+    let transports = sanitize_transports(transports.iter().copied());
+    if !transports.is_empty() {
+        let mut field = Vec::with_capacity(transports.len() + 1);
+        field.push(TAG_TRANSPORTS.to_string());
+        field.extend(transports);
+        tags.push(field);
     }
     let mut event = NostrEvent::unsigned(
         identity.public_key.clone(),
@@ -238,11 +270,18 @@ pub fn decode_discovery_event<C: NostrCrypto>(
     let joined_at = event
         .tag_value(TAG_JOINED_AT)
         .and_then(|value| value.parse::<u64>().ok());
+    let transports = event
+        .tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some(TAG_TRANSPORTS))
+        .map(|tag| sanitize_transports(tag[1..].iter().map(String::as_str)))
+        .unwrap_or_default();
     Ok(DecodedDiscovery {
         signaling_pubkey: event.pubkey.clone(),
         expires_at,
         topology_rank: config.topology_rank(room_id, &event.pubkey),
         joined_at,
+        transports,
     })
 }
 

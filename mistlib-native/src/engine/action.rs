@@ -19,7 +19,7 @@ impl super::MistEngine {
             to, data, method, ..
         } = action
         {
-            let wt = ctx.webrtc_transport.as_ref().ok_or_else(|| {
+            let wt = ctx.link_selector.as_ref().ok_or_else(|| {
                 mistlib_core::error::MistError::Internal("WebRTC transport is not available".into())
             })?;
             if to.is_broadcast() {
@@ -41,7 +41,7 @@ impl super::MistEngine {
             to, data, method, ..
         } = action
         {
-            if let Some(wt) = &ctx.webrtc_transport {
+            if let Some(wt) = &ctx.link_selector {
                 let send = wt.retain_received_send(&to, data, method);
                 self.runtime.handle().spawn(async move {
                     if let Err(err) = send.await {
@@ -59,14 +59,14 @@ impl super::MistEngine {
                     "handled synchronously above and returned before reaching this spawn"
                 ),
                 OverlayAction::Connect { to } => {
-                    if let Some(wt) = &ctx.webrtc_transport {
+                    if let Some(wt) = &ctx.link_selector {
                         if let Err(err) = wt.connect(&to).await {
                             tracing::warn!("Failed to connect overlay action to {}: {err:?}", to.0);
                         }
                     }
                 }
                 OverlayAction::Disconnect { to } => {
-                    if let Some(wt) = &ctx.webrtc_transport {
+                    if let Some(wt) = &ctx.link_selector {
                         if let Err(err) = wt.disconnect(&to).await {
                             tracing::warn!(
                                 "Failed to disconnect overlay action to {}: {err:?}",
@@ -76,7 +76,7 @@ impl super::MistEngine {
                     }
                 }
                 OverlayAction::SuspectDisconnected { to } => {
-                    if let Some(wt) = &ctx.webrtc_transport {
+                    if let Some(wt) = &ctx.link_selector {
                         if let Err(err) = wt.suspect_disconnected(&to).await {
                             tracing::warn!(
                                 "Failed to mark suspect-disconnected overlay action to {}: {err:?}",
@@ -86,7 +86,7 @@ impl super::MistEngine {
                     }
                 }
                 OverlayAction::ClearSuspect { to } => {
-                    if let Some(wt) = &ctx.webrtc_transport {
+                    if let Some(wt) = &ctx.link_selector {
                         if let Err(err) = wt.clear_suspect(&to).await {
                             tracing::warn!(
                                 "Failed to clear-suspect overlay action to {}: {err:?}",

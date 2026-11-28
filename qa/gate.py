@@ -109,6 +109,8 @@ def evaluate(dist, reports, commit, version, policy_path):
             require(type(report.get("browserVersion")) is str and report["browserVersion"], "missing browser version")
         pairs = ["browser-browser", "browser-native", "native-browser"] if browser else ["native-native"]
         expected_cases = {f"{pair}/{phase}" for pair in pairs for phase in policy["phases"]}
+        if browser:
+            expected_cases.add("native-native-browser/mixed-room")
         cases = report.get("cases", [])
         require(len(cases) == len(expected_cases) and {case.get("id") for case in cases} == expected_cases, f"missing/duplicate cases {identity}")
         infos = report.get("buildInfo", [])
@@ -123,7 +125,13 @@ def evaluate(dist, reports, commit, version, policy_path):
             for counter in ("sent", "received", "transfers", "corruptions", "bytes", "samples", "missing", "false", "roomLeaks", "cycles", "disconnectedSockets", "restarts"):
                 if counter in metrics:
                     require(type(metrics[counter]) is int and metrics[counter] >= 0, f"invalid counter {identity}/{phase}/{counter}")
-            if phase == "storage":
+            if phase == "mixed-room":
+                require(metrics.get("transfers") == 6 and metrics.get("corruptions") == 0, f"mixed-room storage contract {identity}")
+                sent = metrics.get("sent")
+                require(type(sent) is int and sent > 0 and metrics.get("received") == sent, f"mixed-room missing messages {identity}")
+                require(metrics.get("links") == {"native0-native1": "iceQuic", "native0-browser": "webrtc",
+                        "native1-browser": "webrtc"}, f"mixed-room link selection {identity}")
+            elif phase == "storage":
                 require(metrics.get("transfers") == 2 and metrics.get("corruptions") == 0, f"storage contract {identity}")
             elif phase == "storage-wan":
                 require(metrics.get("transfers") == 2 and metrics.get("corruptions") == 0 and

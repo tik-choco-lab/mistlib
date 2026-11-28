@@ -2,7 +2,14 @@ use crate::overlay::dnve3::Vector3;
 use crate::types::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use web_time::Instant;
+
+/// Called with the id of a node the store did not hold before (first sighting,
+/// or re-learned after `retain_recent` forgot it). Runs while the store's lock
+/// is held, so it must be cheap and must not touch the store (e.g. just wake a
+/// loop via `tokio::sync::Notify`).
+pub type NewNodeListener = Arc<dyn Fn(&NodeId) + Send + Sync>;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NodeInfo {
@@ -13,6 +20,7 @@ pub struct NodeInfo {
 pub struct NodeStore {
     pub nodes: HashMap<NodeId, NodeInfo>,
     pub last_updated: HashMap<NodeId, Instant>,
+    new_node_listener: Option<NewNodeListener>,
 }
 
 impl Default for NodeStore {
@@ -26,17 +34,33 @@ impl NodeStore {
         Self {
             nodes: HashMap::new(),
             last_updated: HashMap::new(),
+            new_node_listener: None,
         }
     }
 
+    /// Installs (replacing any previous) the hook fired when a node unknown to
+    /// this store is inserted. See [`NewNodeListener`].
+    pub fn set_new_node_listener(&mut self, listener: NewNodeListener) {
+        self.new_node_listener = Some(listener);
+    }
+
     pub fn update_node_position(&mut self, id: NodeId, position: Vector3) {
+        let mut is_new = false;
         self.nodes
             .entry(id.clone())
             .and_modify(|n| n.position = position)
-            .or_insert_with(|| NodeInfo {
-                id: id.clone(),
-                position,
+            .or_insert_with(|| {
+                is_new = true;
+                NodeInfo {
+                    id: id.clone(),
+                    position,
+                }
             });
+        if is_new {
+            if let Some(listener) = &self.new_node_listener {
+                listener(&id);
+            }
+        }
         self.last_updated.insert(id, Instant::now());
     }
 
@@ -182,6 +206,25 @@ mod tests {
         assert!(!store.touch_node(&unknown));
         assert!(!store.nodes.contains_key(&unknown));
         assert!(!store.last_updated.contains_key(&unknown));
+    }
+
+    #[test]
+    fn new_node_listener_fires_once_per_unknown_node() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<NodeId>::new()));
+        let mut store = NodeStore::new();
+        let sink = seen.clone();
+        store.set_new_node_listener(Arc::new(move |id| sink.lock().unwrap().push(id.clone())));
+        let a = NodeId("a".to_string());
+
+        store.update_node_position(a.clone(), Vector3::zero());
+        store.update_node_position(a.clone(), Vector3::new(1.0, 0.0, 0.0));
+        assert!(store.touch_node(&a));
+        assert_eq!(*seen.lock().unwrap(), vec![a.clone()]);
+
+        // Forgotten, then learned again: unknown to the store once more.
+        store.retain_recent(web_time::Duration::from_millis(0));
+        store.update_node_position(a.clone(), Vector3::zero());
+        assert_eq!(*seen.lock().unwrap(), vec![a.clone(), a]);
     }
 
     #[test]

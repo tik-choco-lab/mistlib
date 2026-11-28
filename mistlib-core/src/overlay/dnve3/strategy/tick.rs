@@ -51,4 +51,33 @@ impl DNVE3Strategy {
     ) -> Vec<OverlayAction> {
         self.force_immediate_balancer_tick(config, connected_node_states, density_guidance)
     }
+
+    /// Early balancer run after previously unknown nodes were learned, so a
+    /// node short of its connection target doesn't wait for the periodic
+    /// balancer timer. Runs only while the Connected count is below the
+    /// balancer's `target` (`max_connection_count - reserved_connection_count`),
+    /// i.e. never for capacity pruning (which needs `connected > target`); the
+    /// selection itself is the unchanged periodic one (same limits, skips
+    /// peers already Connecting/Connected). At or above target the periodic
+    /// balancer stays in charge. Like the disconnect path, a run pushes the
+    /// next periodic balancer tick out by one balancer interval.
+    pub(super) fn rebalance_for_learned_nodes(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+        density_guidance: Option<&DensityGuidance>,
+    ) -> Vec<OverlayAction> {
+        let target = config
+            .limits
+            .max_connection_count
+            .saturating_sub(config.limits.reserved_connection_count) as usize;
+        let connected = connected_node_states
+            .iter()
+            .filter(|(_, state)| *state == ConnectionState::Connected)
+            .count();
+        if connected >= target {
+            return Vec::new();
+        }
+        self.force_immediate_balancer_tick(config, connected_node_states, density_guidance)
+    }
 }

@@ -92,7 +92,7 @@ pub(crate) mod session_registry {
         Arc::new(SessionCtx {
             room_id: room_id.to_string(),
             transport: Arc::new(NoopTransport),
-            webrtc_transport: None,
+            link_selector: None,
             ws_signaling_handler: Arc::new(NoopSignalingHandler),
             p2p_signaling_dispatcher: None,
             signaling_dispatch: None,
@@ -225,7 +225,7 @@ pub(crate) mod session_registry {
         ENGINE.remove_all_sessions().await;
     }
 
-    /// A session whose `webrtc_transport` is `wt` instead of `None` --
+    /// A session whose `link_selector` wraps `wt` instead of being `None` --
     /// everything else is the same network-free stub as `fake_session`.
     /// Needed by `handle_action_for`'s `SendMessage` ordering regression
     /// test (`super::action_ordering`), which needs a real, connected
@@ -238,7 +238,7 @@ pub(crate) mod session_registry {
         Arc::new(SessionCtx {
             room_id: room_id.to_string(),
             transport: wt.clone(),
-            webrtc_transport: Some(wt.clone()),
+            link_selector: Some(Arc::new(crate::transports::LinkSelector::new(wt.clone()))),
             ws_signaling_handler: wt,
             p2p_signaling_dispatcher: None,
             signaling_dispatch: None,

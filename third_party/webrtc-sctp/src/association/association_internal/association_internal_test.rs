@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use super::*;
 
@@ -642,4 +643,184 @@ async fn delayed_ack_rearms_after_expiry(unordered: bool) -> Result<()> {
     }
     assert!(!a.lock().await.ack_timer.as_ref().unwrap().is_running());
     Ok(())
+}
+
+// --- MistLib research patch: CongestionControl::Bbr3 (see MISTLIB_PATCHES.md) ---
+
+fn bbr_sender() -> AssociationInternal {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "bbr".to_owned(),
+    });
+    assert!(a.bbr.is_none(), "Reno must remain the default controller");
+    a.set_congestion_control(CongestionControl::Bbr3);
+    a.set_state(AssociationState::Established);
+    a.rwnd = 1024 * 1024;
+    a
+}
+
+async fn queue_data(a: &AssociationInternal, n: u16, len: usize) {
+    for ssn in 0..n {
+        a.pending_queue
+            .push(ChunkPayloadData {
+                stream_identifier: 1,
+                stream_sequence_number: ssn,
+                beginning_fragment: true,
+                ending_fragment: true,
+                payload_type: PayloadProtocolIdentifier::Binary,
+                user_data: Bytes::from(vec![0u8; len]),
+                ..Default::default()
+            })
+            .await;
+    }
+}
+
+fn data_tsns(packets: &[Packet]) -> Vec<u32> {
+    packets
+        .iter()
+        .flat_map(|p| p.chunks.iter())
+        .filter_map(|c| c.as_any().downcast_ref::<ChunkPayloadData>())
+        .map(|d| d.tsn)
+        .collect()
+}
+
+fn sack(cumulative_tsn_ack: u32, gaps: &[(u16, u16)]) -> ChunkSelectiveAck {
+    ChunkSelectiveAck {
+        cumulative_tsn_ack,
+        advertised_receiver_window_credit: 1024 * 1024,
+        gap_ack_blocks: gaps
+            .iter()
+            .map(|&(start, end)| crate::chunk::chunk_selective_ack::GapAckBlock { start, end })
+            .collect(),
+        duplicate_tsn: vec![],
+    }
+}
+
+fn bbr(a: &AssociationInternal) -> &SctpBbr {
+    a.bbr.as_ref().unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_bbr_gap_blocks_miss_indications_and_fast_retransmit() -> Result<()> {
+    let mut a = bbr_sender();
+    queue_data(&a, 4, 1000).await;
+    let (packets, _) = a.gather_outbound().await;
+    let tsns = data_tsns(&packets);
+    assert_eq!(tsns.len(), 4);
+    let t0 = tsns[0];
+    assert_eq!(bbr(&a).inflight(), 4000);
+
+    tokio::time::advance(Duration::from_millis(50)).await;
+    // t0 is missing; the gap block grows over three SACKs.
+    a.handle_sack(&sack(t0 - 1, &[(2, 2)])).await?;
+    assert_eq!((bbr(&a).inflight(), bbr(&a).bbr.delivered()), (3000, 1000));
+    assert_eq!(bbr(&a).bbr.min_rtt(), Some(Duration::from_millis(50)));
+    a.handle_sack(&sack(t0 - 1, &[(2, 3)])).await?;
+    // t0+1 is reported again but counted once.
+    assert_eq!((bbr(&a).inflight(), bbr(&a).bbr.delivered()), (2000, 2000));
+    assert_eq!(bbr(&a).lost_pending(), 0);
+    a.handle_sack(&sack(t0 - 1, &[(2, 4)])).await?;
+    // Third miss indication: lost for BBR, Fast Recovery without a Reno cut.
+    assert_eq!((bbr(&a).inflight(), bbr(&a).lost_pending()), (0, 1000));
+    assert_eq!(bbr(&a).bbr.lost(), 1000);
+    assert!(a.in_fast_recovery);
+    assert_eq!(a.ssthresh, 0, "Reno state is not used in BBR mode");
+    assert_eq!(u64::from(a.cwnd), bbr(&a).cwnd());
+
+    let (packets, _) = a.gather_outbound().await;
+    assert_eq!(data_tsns(&packets), vec![t0], "fast retransmission");
+    assert_eq!(a.stats.get_num_fast_retrans(), 1);
+    assert_eq!((bbr(&a).inflight(), bbr(&a).lost_pending()), (1000, 0));
+    assert_eq!(bbr(&a).retransmissions, 1);
+
+    // The retransmission's SACK delivers its bytes but is not an RTT sample:
+    // 1 ms after the resend would otherwise become the minimum.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    a.handle_sack(&sack(t0 + 3, &[])).await?;
+    assert_eq!((bbr(&a).inflight(), bbr(&a).bbr.delivered()), (0, 4000));
+    assert_eq!(bbr(&a).bbr.min_rtt(), Some(Duration::from_millis(50)));
+    assert!(!a.in_fast_recovery);
+    assert!(a.inflight_queue.is_empty());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_bbr_t3_rtx_uses_rto_recovery_instead_of_one_mtu_slow_start() -> Result<()> {
+    let mut a = bbr_sender();
+    queue_data(&a, 4, 1000).await;
+    let (packets, _) = a.gather_outbound().await;
+    let t0 = data_tsns(&packets)[0];
+    tokio::time::advance(Duration::from_millis(50)).await;
+    a.handle_sack(&sack(t0 - 1, &[(3, 3)])).await?; // only t0+2 arrives
+    let before = bbr(&a).cwnd();
+
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    assert_eq!(a.stats.get_num_t3timeouts(), 1);
+    // t0, t0+1 and t0+3 are lost; cwnd = in-flight (0) + 1 MSS, model kept.
+    assert_eq!((bbr(&a).inflight(), bbr(&a).lost_pending()), (0, 3000));
+    assert_eq!(bbr(&a).cwnd(), u64::from(a.max_payload_size));
+    assert_eq!(a.cwnd, a.max_payload_size);
+    assert!(bbr(&a).bbr.in_recovery());
+    assert_eq!(a.ssthresh, 0);
+
+    let (packets, _) = a.gather_outbound().await;
+    assert_eq!(data_tsns(&packets), vec![t0], "one MSS of retransmission");
+
+    tokio::time::advance(Duration::from_millis(50)).await;
+    a.handle_sack(&sack(t0, &[(2, 2)])).await?;
+    // Only an ambiguous retransmission was acked, but the window still grows.
+    assert!(bbr(&a).bbr.in_recovery());
+    assert!(bbr(&a).cwnd() >= 4 * u64::from(a.max_payload_size));
+
+    let (packets, _) = a.gather_outbound().await;
+    assert_eq!(data_tsns(&packets), vec![t0 + 1, t0 + 3]);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    a.handle_sack(&sack(t0 + 3, &[])).await?;
+    assert!(!bbr(&a).bbr.in_recovery(), "recovery point reached");
+    assert!(bbr(&a).cwnd() >= before, "saved cwnd restored");
+    assert_eq!((bbr(&a).inflight(), bbr(&a).lost_pending()), (0, 0));
+    assert_eq!(bbr(&a).bbr.delivered(), 4000);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_bbr_pacer_bounds_the_burst_and_wakes_the_write_loop() -> Result<()> {
+    let mut a = bbr_sender();
+    let (wake_tx, mut wake_rx) = mpsc::channel(1);
+    a.awake_write_loop_ch = Arc::new(wake_tx);
+    queue_data(&a, 8, 1200).await;
+    let start = tokio::time::Instant::now();
+    let (packets, _) = a.gather_outbound().await;
+    // cwnd (12000 B) would admit 10 chunks; the bucket holds 2 quanta (4800 B).
+    assert_eq!(data_tsns(&packets).len(), 4);
+    assert!(bbr(&a).window_allows(1200));
+
+    tokio::time::timeout(Duration::from_secs(1), wake_rx.recv())
+        .await
+        .expect("the pacer must wake the write loop")
+        .expect("channel open");
+    // One quantum (2400 B) at the initial ~98.8 kB/s Startup rate.
+    let waited = start.elapsed();
+    assert!(
+        waited > Duration::from_millis(20) && waited < Duration::from_millis(30),
+        "{waited:?}"
+    );
+    let (packets, _) = a.gather_outbound().await;
+    assert_eq!(data_tsns(&packets).len(), 2);
+    Ok(())
+}
+
+#[test]
+fn test_reno_default_has_no_bbr_state() {
+    let a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "reno".to_owned(),
+    });
+    assert_eq!(default_congestion_control(), CongestionControl::Reno);
+    assert!(a.bbr.is_none());
+    assert!(a.pacer_wakeup.is_none());
 }

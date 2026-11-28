@@ -529,7 +529,7 @@ impl Signaler for NostrSignaler {
                 sender_id: self.local_node_id.clone(),
                 receiver_id: node.clone(),
                 room_id: room_id.clone(),
-                data: String::new(),
+                data: crate::transports::selector::connect_request_data(),
                 signaling_type: SignalingType::Request,
             };
             if let Err(err) = self.publish_message_to_pubkey(&pubkey, &request).await {

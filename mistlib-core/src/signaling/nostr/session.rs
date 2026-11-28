@@ -304,6 +304,7 @@ mod tests {
             expires_at: u64::MAX,
             topology_rank: codec.topology_rank(room_id, &subject),
             joined_at: None,
+            transports: Vec::new(),
         };
 
         for (local_index, should_request) in [(2usize, true), (1usize, true), (0usize, false)] {

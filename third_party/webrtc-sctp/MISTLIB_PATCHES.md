@@ -95,3 +95,57 @@ This is an independently confirmed receiver defect, not a complete explanation
 of Firefox/native WAN stalls: the timer-only timing cohort still exhibited ICE
 restart and association replacement. See SPEC-20's P4 memo and the dated storage
 evaluation for the separate browser repair investigation and acceptance results.
+
+## SPEC-25 KR3.4 selectable congestion control (research, 2026-11-26)
+
+What: `association::set_default_congestion_control(CongestionControl::{Reno, Bbr3})`
+selects the sender controller for associations created afterwards (same
+process-wide pattern and reason as the receive-buffer default above;
+`default_congestion_control()` reads it). `Reno` is the default and is
+upstream's RFC 4960 §7.2 code path, unchanged: every BBR hook is behind
+`AssociationInternal::bbr == None`. No wire, SACK, receiver or Config change.
+
+Why: SPEC-24 stage B measured QUIC+BBRv3 at 6–11× the goodput of webrtc-rs
+SCTP under loss. To separate protocol from controller, `Bbr3` runs the same
+research BBRv3 model as `tests/quicprobe/src/bbr3` under SCTP's loss recovery.
+
+- `src/congestion/bbr3/`: draft-ietf-ccwg-bbr-06 model and
+  draft-cheng-iccrg-delivery-rate-estimation-02 sampler, ported from the probe
+  without quinn types (same model, gains, filters and loss responses).
+- `src/congestion/sctp.rs`: TSN adapter and pacer. Units are DATA payload bytes
+  (SCTP's own cwnd/rwnd unit); MSS = 1200. Each transmission gets a sample record
+  (delivered, delivered time, first-sent time, app-limited, in-flight at send).
+  Newly acked TSNs come from the cumulative TSN ack and from gap blocks (each TSN
+  once). The third miss indication (HTNA rule, also during Fast Recovery) and
+  T3-rtx declare chunks lost; lost chunks leave BBR in-flight until resent.
+  SCTP resends under the same TSN, so a retransmission's SACK delivers bytes but
+  never yields an RTT or rate sample (Karn); ACKs with only such deliveries still
+  update the window, as BBRUpdateControlParameters runs on every ACK. A late SACK
+  of a chunk already declared lost counts as delivered without undo.
+- Admission: new DATA needs BBR in-flight + chunk ≤ BBR cwnd (and rwnd).
+  T3 retransmissions get the free window (cwnd − in-flight). Fast retransmit
+  keeps RFC 4960 §7.2.4 (one packet per SACK, cwnd ignored) but is charged to
+  the pacer. Fast Recovery still gates miss indications, but the Reno ssthresh
+  and cwnd cut are skipped.
+- Pacer (BBR only): quinn's explicit-rate pacer as patched for the probe —
+  quantum `clamp(rate/500, 2·MSS, 64·MSS)`, bucket 2 quanta (bounded burst),
+  refill at the previous rate; when blocked, one tokio timer wakes the write loop.
+- T3-rtx: BBROnEnterRTO (save cwnd, cwnd = in-flight + 1 MSS, model kept), and
+  BBRRestoreCwnd once the cumulative ack reaches the highest TSN sent at the RTO.
+  The RTO value and backoff remain SCTP's.
+
+Not implemented or deliberately different: Fast Recovery packet conservation
+and cwnd restore (the QUIC probe omits them too), spurious-loss undo, ECN.
+PR-SCTP abandoned chunks get no miss indications, so unreliable channels report
+no losses to BBR and FORWARD-TSN-skipped chunks count as delivered. Wrap-around
+breaks one loss-range adjacency per 2^32 TSNs. RTT samples include the
+receiver's delayed SACK (≤ 200 ms). SCTP cwnd/state are not exported through
+webrtc-rs statistics.
+
+Tests: model, sampler, adapter and pacer unit tests (`congestion::`); internal
+tests driving `handle_sack` with gap blocks, fast retransmit and T3-rtx
+(`test_bbr_`, `test_reno_default_has_no_bbr_state`); a 1 MiB ordered transfer
+under deterministic DATA/SACK loss (`test_assoc_bbr3_transfer_completes_under_loss`).
+Tests switch one association with a `cfg(test)` setter, never the global.
+Removal: delete `src/congestion/`, the `bbr`/`pacer_wakeup` fields and their
+hooks, and the selector in `association/mod.rs`; Reno needs no change.

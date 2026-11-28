@@ -143,4 +143,16 @@ impl TopologyStrategy for DNVE3Strategy {
 
         self.force_immediate_rebalance(config, connected_node_states, density_guidance.as_ref())
     }
+
+    fn on_nodes_learned(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        let mode = config.dnve.connection_mode;
+        self.remember_connection_mode(mode);
+        let density_guidance = self.maybe_density_guidance(config, mode);
+
+        self.rebalance_for_learned_nodes(config, connected_node_states, density_guidance.as_ref())
+    }
 }

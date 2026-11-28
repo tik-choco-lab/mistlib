@@ -2585,3 +2585,176 @@ async fn test_association_handle_packet_before_init() -> Result<()> {
 
     Ok(())
 }
+
+// --- MistLib research patch: CongestionControl::Bbr3 (see MISTLIB_PATCHES.md) ---
+
+/// Forwards to `inner`, dropping every `period`-th datagram once enabled.
+struct LossyConn {
+    inner: Arc<dyn Conn + Send + Sync>,
+    period: usize,
+    enabled: Arc<AtomicBool>,
+    sent: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+#[async_trait]
+impl Conn for LossyConn {
+    async fn connect(&self, addr: SocketAddr) -> UResult<()> {
+        self.inner.connect(addr).await
+    }
+
+    async fn recv(&self, b: &mut [u8]) -> UResult<usize> {
+        self.inner.recv(b).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> UResult<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+
+    async fn send(&self, b: &[u8]) -> UResult<usize> {
+        if self.enabled.load(Ordering::SeqCst)
+            && (self.sent.fetch_add(1, Ordering::SeqCst) + 1).is_multiple_of(self.period)
+        {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            return Ok(b.len());
+        }
+        self.inner.send(b).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> UResult<usize> {
+        self.inner.send_to(buf, target).await
+    }
+
+    fn local_addr(&self) -> UResult<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner.remote_addr()
+    }
+
+    async fn close(&self) -> UResult<()> {
+        self.inner.close().await
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+// A reliable ordered 1 MiB transfer over a link dropping ~2.7% of DATA and
+// ~4.3% of SACK packets completes in Bbr3 mode, through fast retransmit and
+// the BBR window/pacer, with every message intact and in order.
+#[tokio::test]
+async fn test_assoc_bbr3_transfer_completes_under_loss() -> Result<()> {
+    const SI: u16 = 1;
+    const MSG: usize = 4096;
+    const N: u32 = 256;
+
+    let (pa, pb) = pipe();
+    let enabled = Arc::new(AtomicBool::new(false));
+    let lossy = |inner: Arc<dyn Conn + Send + Sync>, period| {
+        Arc::new(LossyConn {
+            inner,
+            period,
+            enabled: Arc::clone(&enabled),
+            sent: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+        })
+    };
+    let (ca, cb) = (lossy(Arc::new(pa), 37), lossy(Arc::new(pb), 23));
+    let client_conn: Arc<dyn Conn + Send + Sync> = Arc::clone(&ca) as _;
+    let server_conn: Arc<dyn Conn + Send + Sync> = Arc::clone(&cb) as _;
+    let server = tokio::spawn(async move {
+        Association::server(Config {
+            net_conn: server_conn,
+            max_receive_buffer_size: 0,
+            max_message_size: 0,
+            name: "server".to_owned(),
+        })
+        .await
+    });
+    let client = Association::client(Config {
+        net_conn: client_conn,
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+    })
+    .await?;
+    let server = server.await.unwrap()?;
+    {
+        let mut ai = client.association_internal.lock().await;
+        assert!(ai.bbr.is_none(), "Reno is the process default");
+        ai.set_congestion_control(CongestionControl::Bbr3);
+    }
+    enabled.store(true, Ordering::SeqCst);
+
+    let s0 = client
+        .open_stream(SI, PayloadProtocolIdentifier::Binary)
+        .await?;
+    let writer = tokio::spawn(async move {
+        let mut buf = vec![0u8; MSG];
+        fill(&mut buf);
+        for i in 0..N {
+            buf[0..4].copy_from_slice(&i.to_be_bytes());
+            s0.write_sctp(&Bytes::from(buf.clone()), PayloadProtocolIdentifier::Binary)
+                .await?;
+        }
+        Result::<Arc<Stream>>::Ok(s0)
+    });
+
+    let received = tokio::time::timeout(Duration::from_secs(60), async {
+        let s1 = server.accept_stream().await.unwrap();
+        let mut expected = vec![0u8; MSG];
+        fill(&mut expected);
+        let mut rbuf = vec![0u8; MSG * 2];
+        for i in 0..N {
+            let (n, ppi) = s1.read_sctp(&mut rbuf).await?;
+            assert_eq!((n, ppi), (MSG, PayloadProtocolIdentifier::Binary));
+            assert_eq!(u32::from_be_bytes(rbuf[0..4].try_into().unwrap()), i);
+            assert_eq!(rbuf[4..n], expected[4..]);
+        }
+        Result::<u32>::Ok(N)
+    })
+    .await
+    .expect("Bbr3 transfer must complete under loss")?;
+    assert_eq!(received, N);
+    let _s0 = writer.await.unwrap()?;
+    // The reader can finish before the final SACK reaches the sender.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while client.association_internal.lock().await.buffered_amount() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sender must see every chunk acknowledged");
+
+    assert!(ca.dropped.load(Ordering::SeqCst) > 10);
+    assert!(cb.dropped.load(Ordering::SeqCst) > 0);
+    {
+        let ai = client.association_internal.lock().await;
+        let bbr = ai.bbr.as_ref().unwrap();
+        assert!(bbr.bbr.lost() > 0, "losses reach the controller");
+        assert!(bbr.retransmissions > 0);
+        assert!(ai.stats.get_num_fast_retrans() > 0);
+        assert!(bbr.bbr.delivered() >= u64::from(N) * MSG as u64);
+        assert!(bbr.bbr.min_rtt().is_some());
+        log::debug!(
+            "bbr3: state={:?} cwnd={} pacing={} lost={} rtx={} t3={} fr={}",
+            bbr.bbr.state,
+            bbr.cwnd(),
+            bbr.bbr.pacing_rate(),
+            bbr.bbr.lost(),
+            bbr.retransmissions,
+            ai.stats.get_num_t3timeouts(),
+            ai.stats.get_num_fast_retrans()
+        );
+    }
+    {
+        let ai = server.association_internal.lock().await;
+        assert!(ai.bbr.is_none(), "the receiver keeps its own default");
+    }
+    client.close().await?;
+    server.close().await?;
+    Ok(())
+}

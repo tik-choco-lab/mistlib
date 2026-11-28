@@ -3304,6 +3304,15 @@ impl SignalingHandler for WasmWebRtcTransport {
                     ),
                 }
             }
+            // ICE+QUIC is native-only; a browser never announces `iq1`, so
+            // well-behaved peers never send these here. Ignore stray ones.
+            SignalingType::IceQuicOffer | SignalingType::IceQuicAnswer => {
+                tracing::debug!(
+                    "Ignoring native-only {:?} from {}",
+                    data.signaling_type,
+                    data.sender_id.0
+                );
+            }
             SignalingType::Request => {
                 tracing::info!("Received Request from: {}", data.sender_id.0);
                 if self.local_node_id != data.sender_id && self.local_node_id.0 < data.sender_id.0 {

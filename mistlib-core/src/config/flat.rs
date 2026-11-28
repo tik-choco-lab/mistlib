@@ -18,6 +18,7 @@ pub(super) struct FlatConfig {
     webrtc_connection_timeout_ms: Option<u32>,
     webrtc_defer_connection_watchdog_until_negotiated: Option<bool>,
     webrtc_buffer_early_ice_candidates: Option<bool>,
+    webrtc_ice_quic: Option<bool>,
     max_connection_count: Option<u32>,
     connection_balancer_interval_seconds: Option<f32>,
     expire_seconds: Option<f32>,
@@ -55,6 +56,7 @@ impl FlatConfig {
                 c.webrtc.defer_connection_watchdog_until_negotiated,
             ),
             webrtc_buffer_early_ice_candidates: Some(c.webrtc.buffer_early_ice_candidates),
+            webrtc_ice_quic: Some(c.webrtc.ice_quic),
             max_connection_count: Some(c.limits.max_connection_count),
             connection_balancer_interval_seconds: Some(c.intervals.connection_balancer),
             expire_seconds: Some(c.limits.expire_node_seconds),
@@ -105,6 +107,9 @@ impl FlatConfig {
         }
         if let Some(v) = self.webrtc_buffer_early_ice_candidates {
             c.webrtc.buffer_early_ice_candidates = v;
+        }
+        if let Some(v) = self.webrtc_ice_quic {
+            c.webrtc.ice_quic = v;
         }
         if let Some(v) = self.max_connection_count {
             c.limits.max_connection_count = v;

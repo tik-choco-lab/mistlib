@@ -5,9 +5,15 @@ use async_trait::async_trait;
 use portable_atomic::AtomicBool;
 
 use super::*;
+use crate::congestion::sctp::SctpBbr;
 use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
 use crate::param::param_type::ParamType;
 use crate::param::param_unrecognized::ParamUnrecognized;
+
+/// Clock of the BBR controller and pacer (follows tokio's paused test clock).
+fn cc_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 pub struct AssociationInternal {
     pub(crate) name: String,
@@ -59,6 +65,11 @@ pub struct AssociationInternal {
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
+    /// MistLib research patch: Some in CongestionControl::Bbr3 mode. The BBR
+    /// window and pacer then govern DATA admission, and the Reno fields above
+    /// are not updated (cwnd mirrors the BBR window for logs and tests).
+    pub(crate) bbr: Option<Box<SctpBbr>>,
+    pacer_wakeup: Option<tokio::time::Instant>,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -123,6 +134,9 @@ impl AssociationInternal {
         //     TODO: Consider whether this should use `clamp`
         #[allow(clippy::manual_clamp)]
         let cwnd = std::cmp::min(4 * mtu, std::cmp::max(2 * mtu, 4380));
+        let max_payload_size = mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE);
+        let bbr = (default_congestion_control() == CongestionControl::Bbr3)
+            .then(|| Box::new(SctpBbr::new(cc_now(), u64::from(max_payload_size))));
 
         let ret = AssociationInternal {
             name: config.name,
@@ -158,7 +172,7 @@ impl AssociationInternal {
             pending_queue: Arc::new(PendingQueue::new()),
             control_queue: ControlQueue::new(),
             mtu,
-            max_payload_size: mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE),
+            max_payload_size,
             cumulative_tsn_ack_point: tsn - 1,
             advanced_peer_tsn_ack_point: tsn - 1,
             use_forward_tsn: false,
@@ -170,6 +184,8 @@ impl AssociationInternal {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+            bbr,
+            pacer_wakeup: None,
 
             rto_mgr: RtoManager::new(),
             t1init: None,
@@ -202,6 +218,37 @@ impl AssociationInternal {
         );
 
         ret
+    }
+
+    /// Switch the controller before any DATA is sent. Tests use this rather
+    /// than the process-wide default, which concurrent tests would observe.
+    #[cfg(test)]
+    pub(crate) fn set_congestion_control(&mut self, cc: CongestionControl) {
+        self.bbr = (cc == CongestionControl::Bbr3)
+            .then(|| Box::new(SctpBbr::new(cc_now(), u64::from(self.max_payload_size))));
+    }
+
+    /// Mirror the BBR window into the upstream field (observability only).
+    fn sync_bbr_cwnd(&mut self) {
+        if let Some(bbr) = &self.bbr {
+            self.cwnd = bbr.cwnd().min(u64::from(u32::MAX)) as u32;
+        }
+    }
+
+    /// Wake the write loop when the pacer admits the next quantum. One
+    /// pending wakeup at a time; an earlier deadline replaces a later one.
+    fn schedule_pacer_wakeup(&mut self, at: std::time::Instant) {
+        let at = tokio::time::Instant::from_std(at);
+        let now = tokio::time::Instant::now();
+        if matches!(self.pacer_wakeup, Some(pending) if pending > now && pending <= at) {
+            return;
+        }
+        self.pacer_wakeup = Some(at);
+        let tx = Arc::clone(&self.awake_write_loop_ch);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(at).await;
+            let _ = tx.try_send(());
+        });
     }
 
     /// caller must hold self.lock
@@ -477,6 +524,11 @@ impl AssociationInternal {
                     fast_retrans_size += data_chunk_size;
                     self.stats.inc_fast_retrans();
                     c.nsent += 1;
+                    if let Some(bbr) = &mut self.bbr {
+                        let now = cc_now();
+                        bbr.charge(now, c.user_data.len() as u64);
+                        bbr.on_retransmit(now, tsn);
+                    }
                 } else {
                     break; // end of pending data
                 }
@@ -1106,6 +1158,7 @@ impl AssociationInternal {
         d: &ChunkSelectiveAck,
     ) -> Result<(HashMap<u16, i64>, u32)> {
         let mut bytes_acked_per_stream = HashMap::new();
+        let now = cc_now();
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -1115,6 +1168,9 @@ impl AssociationInternal {
         while sna32lte(i, d.cumulative_tsn_ack) {
             if let Some(c) = self.inflight_queue.pop(i) {
                 if !c.acked {
+                    if let Some(bbr) = &mut self.bbr {
+                        bbr.on_acked(now, c.tsn);
+                    }
                     // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
                     //   R3)  Whenever a SACK is received that acknowledges the DATA chunk
                     //        with the earliest outstanding TSN for that address, restart the
@@ -1186,6 +1242,9 @@ impl AssociationInternal {
                     (false, false)
                 };
                 let n_bytes_acked = if is_existed && !is_acked {
+                    if let Some(bbr) = &mut self.bbr {
+                        bbr.on_acked(now, tsn);
+                    }
                     self.inflight_queue.mark_as_acked(tsn) as i64
                 } else {
                     0
@@ -1249,6 +1308,10 @@ impl AssociationInternal {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start(self.rto_mgr.get_rto()).await;
             }
+        }
+
+        if self.bbr.is_some() {
+            return; // BBR updates its window at the end of the SACK
         }
 
         // Update congestion control parameters
@@ -1342,15 +1405,26 @@ impl AssociationInternal {
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
                     if !c.acked && !c.abandoned() && c.miss_indicator < 3 {
                         c.miss_indicator += 1;
+                        if c.miss_indicator == 3 {
+                            // BBR: the third miss indication declares the chunk lost,
+                            // whether or not this SACK starts Fast Recovery.
+                            if let Some(bbr) = &mut self.bbr {
+                                bbr.on_lost(cc_now(), tsn);
+                            }
+                        }
                         if c.miss_indicator == 3 && !self.in_fast_recovery {
                             // 2)  If not in Fast Recovery, adjust the ssthresh and cwnd of the
                             //     destination address(es) to which the missing DATA chunks were
                             //     last sent, according to the formula described in Section 7.2.3.
+                            // BBR keeps the Fast Recovery state (loss detection and the
+                            // single-packet fast retransmit) but not the Reno window cut.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
-                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
-                            self.cwnd = self.ssthresh;
-                            self.partial_bytes_acked = 0;
+                            if self.bbr.is_none() {
+                                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                                self.cwnd = self.ssthresh;
+                                self.partial_bytes_acked = 0;
+                            }
                             self.will_retransmit_fast = true;
 
                             log::trace!(
@@ -1460,6 +1534,12 @@ impl AssociationInternal {
 
         self.process_fast_retransmission(d.cumulative_tsn_ack, htna, cum_tsn_ack_point_advanced)?;
 
+        // BBR: one ACK event after its acks and the losses it revealed.
+        if let Some(bbr) = &mut self.bbr {
+            bbr.on_sack_end(cc_now(), self.cumulative_tsn_ack_point);
+        }
+        self.sync_bbr_cwnd();
+
         if self.use_forward_tsn {
             // RFC 3758 Sec 3.5 C1
             if sna32lt(
@@ -1496,8 +1576,9 @@ impl AssociationInternal {
             self.awake_write_loop();
         }
 
-        self.postprocess_sack(state, cum_tsn_ack_point_advanced)
-            .await;
+        // BBR also frees window on gap acks and losses, so always wake the writer.
+        let should_awake_write_loop = cum_tsn_ack_point_advanced || self.bbr.is_some();
+        self.postprocess_sack(state, should_awake_write_loop).await;
 
         Ok(vec![])
     }
@@ -1891,6 +1972,10 @@ impl AssociationInternal {
             );
 
             self.inflight_queue.push_no_check(c.clone());
+            if let Some(bbr) = &mut self.bbr {
+                let more_pending = !self.pending_queue.is_empty();
+                bbr.on_sent(cc_now(), c.tsn, c.user_data.len() as u64, more_pending);
+            }
 
             Some(c)
         } else {
@@ -1904,6 +1989,7 @@ impl AssociationInternal {
     async fn pop_pending_data_chunks_to_send(&mut self) -> (Vec<ChunkPayloadData>, Vec<u16>) {
         let mut chunks = vec![];
         let mut sis_to_reset = vec![]; // stream identifiers to reset
+        let mut paced_until = None;
 
         if self.pending_queue.is_empty() {
             return (chunks, sis_to_reset);
@@ -1936,12 +2022,23 @@ impl AssociationInternal {
                 continue;
             }
 
-            if self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize {
+            if let Some(bbr) = &self.bbr {
+                if !bbr.window_allows(data_len as u64) {
+                    break; // would exceed the BBR cwnd
+                }
+            } else if self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize {
                 break; // would exceed cwnd
             }
 
             if data_len > self.rwnd as usize {
                 break; // no more rwnd
+            }
+
+            if let Some(bbr) = &mut self.bbr {
+                if let Err(at) = bbr.pace(cc_now(), data_len as u64) {
+                    paced_until = Some(at);
+                    break;
+                }
             }
 
             self.rwnd -= data_len as u32;
@@ -1955,7 +2052,8 @@ impl AssociationInternal {
         }
 
         // the data sender can always have one DATA chunk in flight to the receiver
-        if chunks.is_empty() && self.inflight_queue.is_empty() {
+        // (BBR: unless the pacer, not the receive window, stopped the loop).
+        if chunks.is_empty() && self.inflight_queue.is_empty() && paced_until.is_none() {
             // Send zero window probe
             if let Some(c) = self.pending_queue.peek() {
                 let (beginning_fragment, unordered) = (c.beginning_fragment, c.unordered);
@@ -1964,9 +2062,16 @@ impl AssociationInternal {
                     .move_pending_data_chunk_to_inflight_queue(beginning_fragment, unordered)
                     .await
                 {
+                    if let Some(bbr) = &mut self.bbr {
+                        bbr.charge(cc_now(), chunk.user_data.len() as u64);
+                    }
                     chunks.push(chunk);
                 }
             }
+        }
+
+        if let Some(at) = paced_until {
+            self.schedule_pacer_wakeup(at);
         }
 
         (chunks, sis_to_reset)
@@ -2056,7 +2161,16 @@ impl AssociationInternal {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
     /// that are not acked or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self) -> Vec<Packet> {
-        let awnd = std::cmp::min(self.cwnd, self.rwnd);
+        // BBR: retransmissions re-enter flight, so only the free window counts.
+        let awnd = match &self.bbr {
+            Some(bbr) => bbr
+                .cwnd()
+                .saturating_sub(bbr.inflight())
+                .min(u64::from(self.rwnd)) as u32,
+            None => std::cmp::min(self.cwnd, self.rwnd),
+        };
+        let now = cc_now();
+        let mut paced_until = None;
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
         let mut done = false;
@@ -2072,8 +2186,19 @@ impl AssociationInternal {
                 if i == 0 && self.rwnd < c.user_data.len() as u32 {
                     // Send it as a zero window probe
                     done = true;
+                    if let Some(bbr) = &mut self.bbr {
+                        bbr.charge(now, c.user_data.len() as u64);
+                    }
                 } else if bytes_to_send + c.user_data.len() > awnd as usize {
                     break;
+                } else if let Some(bbr) = &mut self.bbr {
+                    if let Err(at) = bbr.pace(now, c.user_data.len() as u64) {
+                        paced_until = Some(at);
+                        break;
+                    }
+                }
+                if let Some(bbr) = &mut self.bbr {
+                    bbr.on_retransmit(now, tsn);
                 }
 
                 // reset the retransmit flag not to retransmit again before the next
@@ -2100,6 +2225,10 @@ impl AssociationInternal {
                 chunks.push(c.clone());
             }
             i += 1;
+        }
+
+        if let Some(at) = paced_until {
+            self.schedule_pacer_wakeup(at);
         }
 
         self.bundle_data_chunks_into_packets(chunks)
@@ -2351,8 +2480,25 @@ impl RtxTimerObserver for AssociationInternal {
                 //      ssthresh = max(cwnd/2, 4*MTU)
                 //      cwnd = 1*MTU
 
-                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
-                self.cwnd = self.mtu;
+                if let Some(bbr) = &mut self.bbr {
+                    // BBR (draft-ietf-ccwg-bbr-06 BBROnEnterRTO): the chunks that
+                    // mark_all_to_retrasmit() selects below are lost; keep the model,
+                    // save the cwnd for restoration at the recovery point, and allow
+                    // in-flight + 1 MSS. ssthresh is not used.
+                    let now = cc_now();
+                    let mut tsn = self.cumulative_tsn_ack_point.wrapping_add(1);
+                    while let Some(c) = self.inflight_queue.get(tsn) {
+                        if !c.acked && !c.abandoned() {
+                            bbr.on_lost(now, tsn);
+                        }
+                        tsn = tsn.wrapping_add(1);
+                    }
+                    bbr.on_rto(self.my_next_tsn.wrapping_sub(1));
+                } else {
+                    self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                    self.cwnd = self.mtu;
+                }
+                self.sync_bbr_cwnd();
                 log::trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.name,

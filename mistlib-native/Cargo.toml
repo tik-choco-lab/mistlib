@@ -1,6 +1,6 @@
 [package]
 name = "mistlib-native"
-version = "0.7.3"
+version = "0.8.0-beta.1"
 edition = "2021"
 license = "MPL-2.0"
 
@@ -35,6 +35,14 @@ rand = "0.8"
 web-time = "1.1.0"
 mimalloc = "0.1"
 base64 = "0.22"
+# ICE+QUIC link (src/transports/ice_quic, SPEC-25). ring only, no aws-lc;
+# rcgen/rustls/sha2 versions are already in the tree via webrtc-dtls.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Patched in the root workspace (third_party/quinn-proto) for BBRv3.
+quinn-proto = { version = "0.11", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rcgen = "0.13"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

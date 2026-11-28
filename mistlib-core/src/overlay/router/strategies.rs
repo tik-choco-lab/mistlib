@@ -59,4 +59,19 @@ impl OverlayRouter {
             .flat_map(|s| s.on_peer_disconnected(config, connected_node_states))
             .collect()
     }
+
+    /// Notifies strategies that nodes previously unknown to the node store
+    /// were learned, so a strategy such as DNVE3 can evaluate connections
+    /// early instead of waiting for its periodic balancer timer. Callers
+    /// coalesce bursts (see native `engine/background.rs`).
+    pub fn notify_nodes_learned(
+        &self,
+        config: &Config,
+        connected_node_states: &[(NodeId, ConnectionState)],
+    ) -> Vec<OverlayAction> {
+        self.strategies
+            .iter()
+            .flat_map(|s| s.on_nodes_learned(config, connected_node_states))
+            .collect()
+    }
 }

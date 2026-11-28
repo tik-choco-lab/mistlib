@@ -924,7 +924,10 @@ async fn renegotiation_offer_on_existing_peer_is_applied_in_place() {
 async fn concurrent_offers_on_same_peer_are_serialized_not_interleaved() {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::sync::{Barrier, Notify};
     use webrtc::api::media_engine::MIME_TYPE_OPUS;
+    use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::signaling_state::RTCSignalingState;
     use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -966,26 +969,28 @@ async fn concurrent_offers_on_same_peer_are_serialized_not_interleaved() {
         recorder.clone() as Arc<dyn mistlib_core::signaling::Signaler>,
         id_b.clone(),
     ));
+    tb.set_ice_servers(Vec::new());
 
-    // Give B a live, Stable peer for A directly -- what matters here is two
-    // offers racing on an already-established peer, not how it got
-    // established (a real two-way handshake reaching this same state is
-    // exercised elsewhere, e.g.
-    // `renegotiation_offer_on_existing_peer_is_applied_in_place`).
     let peer_b = tb
         .create_pc(id_a.clone())
         .await
         .expect("create_pc should succeed");
     tb.peers.write().await.insert(id_a.clone(), peer_b.clone());
 
-    // Build two distinct, valid offers "from A" using B's own API/media-engine
-    // config (`tb.api`) so B's `create_answer` can actually match codecs --
-    // mirrors the browser sending offer B (adds a track) immediately followed
-    // by offer C (adds another) without waiting for B's first answer.
-    // `create_offer` never mutates signaling state (only
-    // `set_local_description` does), so calling it twice on the same
-    // throwaway PC with a track added in between is safe and needs no real
-    // two-way handshake.
+    // webrtc-rs installs the first offer's ICE credentials on its ops queue.
+    // Wait for Checking before renegotiating, so both offers use an ICE
+    // generation B has already initialized.
+    let ice_checks_started = Arc::new(Notify::new());
+    let notify = ice_checks_started.clone();
+    peer_b
+        .pc
+        .on_ice_connection_state_change(Box::new(move |state| {
+            if state == RTCIceConnectionState::Checking {
+                notify.notify_one();
+            }
+            Box::pin(async {})
+        }));
+
     let fake_a = tb
         .api
         .new_peer_connection(RTCConfiguration::default())
@@ -995,6 +1000,30 @@ async fn concurrent_offers_on_same_peer_are_serialized_not_interleaved() {
         .create_data_channel("reliable", None)
         .await
         .expect("data channel should be created");
+    let initial_offer = fake_a.create_offer(None).await.unwrap();
+    fake_a
+        .set_local_description(initial_offer.clone())
+        .await
+        .unwrap();
+    peer_b
+        .pc
+        .set_remote_description(initial_offer)
+        .await
+        .unwrap();
+    let initial_answer = peer_b.pc.create_answer(None).await.unwrap();
+    peer_b
+        .pc
+        .set_local_description(initial_answer.clone())
+        .await
+        .unwrap();
+    fake_a.set_remote_description(initial_answer).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ice_checks_started.notified())
+        .await
+        .expect("B must start ICE checks for the initial offer");
+
+    // Generate both offers on A's negotiated connection. create_offer leaves
+    // signaling Stable, so we can add a track and generate the next offer
+    // without first applying an answer.
     let offer_1 = fake_a
         .create_offer(None)
         .await
@@ -1028,18 +1057,21 @@ async fn concurrent_offers_on_same_peer_are_serialized_not_interleaved() {
         "sanity: second offer adds one more m-line"
     );
 
-    // Fire both offers at B concurrently, with nothing serializing them from
-    // the caller's side -- exactly the unserialized-dispatch shape described
-    // above.
+    // Let both dispatch tasks start before either submits its offer to B.
+    let start = Arc::new(Barrier::new(2));
+    let start1 = start.clone();
     let tb1 = tb.clone();
     let id_a1 = id_a.clone();
-    let sdp_1 = offer_1.sdp.clone();
-    let h1 = tokio::spawn(async move { tb1.handle_offer(id_a1, sdp_1).await });
+    let h1 = tokio::spawn(async move {
+        start1.wait().await;
+        tb1.handle_offer(id_a1, offer_1.sdp).await
+    });
 
     let tb2 = tb.clone();
-    let id_a2 = id_a.clone();
-    let sdp_2 = offer_2.sdp.clone();
-    let h2 = tokio::spawn(async move { tb2.handle_offer(id_a2, sdp_2).await });
+    let h2 = tokio::spawn(async move {
+        start.wait().await;
+        tb2.handle_offer(id_a, offer_2.sdp).await
+    });
 
     let (r1, r2) = tokio::join!(h1, h2);
     r1.expect("task must not panic")

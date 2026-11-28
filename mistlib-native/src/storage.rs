@@ -255,7 +255,7 @@ pub async fn handle_want(ctx: Arc<SessionCtx>, from: mistlib_core::types::NodeId
     };
     if let Some(data) = block {
         let limit = ctx
-            .webrtc_transport
+            .link_selector
             .as_ref()
             .and_then(|transport| transport.message_size_limit(&from));
         let chunk_size = chunk_size_for_limit(&cid, limit);

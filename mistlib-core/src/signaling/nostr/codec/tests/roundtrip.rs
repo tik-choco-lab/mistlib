@@ -26,6 +26,83 @@ fn discovery_event_round_trips_without_node_id() {
         decoded.topology_rank,
         codec.topology_rank("secret-room", &identity.public_key)
     );
+    assert!(decoded.transports.is_empty());
+}
+
+#[test]
+fn discovery_without_transports_keeps_the_legacy_tag_set() {
+    let (_raw, codec, crypto) = config();
+    let identity = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([1u8; 32]),
+    );
+    let event =
+        build_discovery_event_with_transports(&codec, &crypto, &identity, "room", Some(7), &[])
+            .unwrap();
+    let names: Vec<&str> = event.tags.iter().map(|tag| tag[0].as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            TAG_INVITE_SCOPE,
+            TAG_NONCE,
+            TAG_EXPIRATION,
+            TAG_DISCOVERY_PROOF,
+            TAG_JOINED_AT
+        ]
+    );
+    assert!(event.content.is_empty());
+    let decoded = decode_discovery_event(&codec, &crypto, &event, "room").unwrap();
+    assert!(decoded.transports.is_empty());
+}
+
+#[test]
+fn discovery_transports_round_trip_and_old_readers_still_decode() {
+    use crate::signaling::capabilities::{TRANSPORT_ICE_QUIC_V1, TRANSPORT_WEBRTC};
+    let (_raw, codec, crypto) = config();
+    let identity = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([1u8; 32]),
+    );
+    let event = build_discovery_event_with_transports(
+        &codec,
+        &crypto,
+        &identity,
+        "room",
+        Some(7),
+        &[TRANSPORT_WEBRTC, TRANSPORT_ICE_QUIC_V1],
+    )
+    .unwrap();
+    assert!(event.tags.contains(&vec![
+        TAG_TRANSPORTS.to_string(),
+        "webrtc".to_string(),
+        "iq1".to_string()
+    ]));
+
+    let decoded = decode_discovery_event(&codec, &crypto, &event, "room").unwrap();
+    assert_eq!(decoded.transports, ["webrtc", "iq1"]);
+
+    // An old reader is this decoder without the transports lookup: shape,
+    // signature, scope and proof checks only read the tags they know, so the
+    // extra tag must leave every legacy field exactly as without it.
+    let plain =
+        build_discovery_event_with_joined_at(&codec, &crypto, &identity, "room", Some(7)).unwrap();
+    let legacy = decode_discovery_event(&codec, &crypto, &plain, "room").unwrap();
+    assert_eq!(decoded.signaling_pubkey, legacy.signaling_pubkey);
+    assert_eq!(decoded.topology_rank, legacy.topology_rank);
+    assert_eq!(decoded.joined_at, legacy.joined_at);
+    assert_eq!(
+        DecodedDiscovery {
+            transports: Vec::new(),
+            expires_at: legacy.expires_at,
+            ..decoded
+        },
+        legacy
+    );
+
+    // The tag survives the relay frame JSON (the form an old relay or peer
+    // parses) and is ignored by a reader that does not know it.
+    let frame = event_frame_json(&event).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let wire_event: NostrEvent = serde_json::from_value(value[1].clone()).unwrap();
+    assert!(decode_discovery_event(&codec, &crypto, &wire_event, "room").is_ok());
 }
 
 #[test]

@@ -323,6 +323,71 @@ async fn publish_local_track_delivers_media_to_an_already_connected_peer() {
     keep_sending.abort();
 }
 
+// A media track handler registered after the peer is already connected must
+// still receive that peer's tracks: peers read the handler when a track
+// arrives instead of capturing it when their PeerConnection was created.
+#[ignore = "needs real UDP ICE connectivity; unreliable on restricted networks, see comment"]
+#[tokio::test]
+async fn media_track_handler_registered_after_connect_receives_tracks() {
+    let node_a = NodeId("publisher3".to_string());
+    let node_b = NodeId("viewer3".to_string());
+
+    let sig_a = DirectSignaler::new();
+    let sig_b = DirectSignaler::new();
+    let transport_a = Arc::new(WebRtcTransport::new(sig_a.clone(), node_a.clone()));
+    let transport_b = Arc::new(WebRtcTransport::new(sig_b.clone(), node_b.clone()));
+    sig_a.set_peer(transport_b.clone());
+    sig_b.set_peer(transport_a.clone());
+
+    transport_a.start(Arc::new(NoopEventHandler)).await.unwrap();
+    transport_b.start(Arc::new(NoopEventHandler)).await.unwrap();
+
+    transport_a
+        .connect(&node_b)
+        .await
+        .expect("connect should succeed");
+    wait_until(
+        || transport_a.get_connection_state(&node_b) == ConnectionState::Connected,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Registered only now, after B's PeerConnection for A exists.
+    let (media_tx, mut media_rx) = tokio::sync::mpsc::unbounded_channel();
+    transport_b.set_media_track_handler(media_tx);
+
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90_000,
+            ..Default::default()
+        },
+        "video".to_string(),
+        "mistlink".to_string(),
+    ));
+    transport_a
+        .publish_local_track(video_track.clone())
+        .await
+        .expect("publish_local_track should succeed against an already-connected peer");
+
+    let sender_track = video_track.clone();
+    let keep_sending = tokio::spawn(async move {
+        let mut seq = 0u32;
+        loop {
+            send_frame(&sender_track, 0x65, seq * 3000).await;
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+    });
+
+    let event = tokio::time::timeout(Duration::from_secs(15), media_rx.recv())
+        .await
+        .expect("timed out waiting for MediaTrackEvent")
+        .expect("media channel closed unexpectedly");
+    assert_eq!(event.remote_id, node_a);
+    keep_sending.abort();
+}
+
 // Per-track audience over a live connection, observed on the wire: the offers
 // the publisher sends carry the video m-section only while the peer is in the
 // track's audience. Excluded -> no offer mentions the track; widened -> an

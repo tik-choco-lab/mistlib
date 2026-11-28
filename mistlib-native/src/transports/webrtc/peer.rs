@@ -1606,7 +1606,7 @@ impl Peer {
         room_id: String,
         event_tx: Option<mpsc::Sender<NetworkEvent>>,
         handles: PeerSharedHandles,
-        media_tx: Option<mpsc::UnboundedSender<MediaTrackEvent>>,
+        media_tx: super::MediaTrackSink,
     ) -> crate::error::Result<()> {
         self.setup_ice_state_observers(remote_id.clone());
         self.setup_ice_candidate_handler(remote_id.clone(), signaler, local_id, room_id);
@@ -1616,14 +1616,7 @@ impl Peer {
         Ok(())
     }
 
-    fn setup_track_handler(
-        self: &Arc<Self>,
-        remote_id: NodeId,
-        media_tx: Option<mpsc::UnboundedSender<MediaTrackEvent>>,
-    ) {
-        let Some(media_tx) = media_tx else {
-            return;
-        };
+    fn setup_track_handler(self: &Arc<Self>, remote_id: NodeId, media_tx: super::MediaTrackSink) {
         let cancel_token = self.cancel_token.clone();
         let pc = self.pc.clone();
         self.pc
@@ -1636,6 +1629,11 @@ impl Peer {
                     if cancel_token.is_cancelled() {
                         return;
                     }
+                    // Read the current sink: the handler may have been
+                    // registered after this peer connected.
+                    let Some(media_tx) = media_tx.lock().unwrap().clone() else {
+                        return;
+                    };
                     let _ = media_tx.send(MediaTrackEvent {
                         remote_id,
                         track,

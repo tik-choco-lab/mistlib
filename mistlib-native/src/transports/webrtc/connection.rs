@@ -82,7 +82,7 @@ impl WebRtcTransport {
         peer.unordered_capability.set_local(true);
         let event_tx = self.spawn_event_forwarder(cancel_token.clone());
 
-        let media_tx = self.media_tx.lock().unwrap().clone();
+        let media_tx = self.media_tx.clone();
         peer.setup_handlers(
             remote_id.clone(),
             self.signaler.clone(),

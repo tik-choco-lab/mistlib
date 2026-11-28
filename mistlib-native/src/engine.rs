@@ -11,7 +11,7 @@ use crate::config::Config;
 pub use crate::events::*;
 pub use crate::logging::*;
 use crate::signaling::BootstrapSignaler;
-use crate::transports::WebRtcTransport;
+use crate::transports::LinkSelector;
 pub use mistlib_core::layers::L1Transport;
 use mistlib_core::overlay::node_store::NodeStore;
 use mistlib_core::overlay::OverlayRouter;
@@ -34,7 +34,9 @@ mod stats;
 pub struct SessionCtx {
     pub(crate) room_id: String,
     pub(crate) transport: Arc<dyn Transport>,
-    pub(crate) webrtc_transport: Option<Arc<WebRtcTransport>>,
+    /// Per-peer link selection over the room's P2P links (SPEC-25 O2). The
+    /// engine calls this, never a concrete link; WebRTC is the only link.
+    pub(crate) link_selector: Option<Arc<LinkSelector>>,
     /// WebSocket経由で届いたシグナリング（SDP/ICE）の処理先
     pub(crate) ws_signaling_handler: Arc<dyn SignalingHandler>,
     /// WebRTC P2P中継で届いたシグナリングの順序付き処理先（中継不使用時はNone）

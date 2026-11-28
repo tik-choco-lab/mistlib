@@ -1,4 +1,4 @@
-// The same public-API contract is run against every pair of consumers.
+// The public-API contract is run against every pair and a mixed room of consumers.
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
@@ -86,6 +86,48 @@ async function hostPackage() {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
+async function makeClient(kind, url, name, node, config) {
+  const client = kind === 'native' ? await nativeClient(resolve(args.native), logs, name)
+    : await browserClient(browser, url, logs, name);
+  resources.add(client);
+  if (client.browserVersion) report.browserVersion = client.browserVersion;
+  const info = await client.info();
+  report.buildInfo.push(info);
+  assert.equal(info.version, args.version, `${name} loaded version`);
+  assert.equal(info.commit, args.commit, `${name} loaded commit`);
+  assert.equal(info.profile, 'release', `${name} must consume a release build`);
+  if (!args['allow-dirty']) assert.equal(info.dirty, false, `${name} candidate must be clean`);
+  await client.command({ op: 'init', node, config });
+  return client;
+}
+
+const checkpoint = async clients => Promise.all(clients.map(client => client.events().then(events => events.length)));
+
+async function validateLedger(client, ledgers, perSender = false) {
+  const actual = (await client.drain()).filter(event => event.kind === 'raw' &&
+    Buffer.from(event.data).toString().startsWith(`qa:${nonce}:`));
+  const expected = ledgers.get(client);
+  // Independent links may interleave, but each sender must preserve its order.
+  const ordered = events => perSender ? [...events].sort((a, b) => a.sender.localeCompare(b.sender)) : events;
+  assert.deepEqual(ordered(actual), ordered(expected), `${client.name}: exact data/order/sender/room, no late duplicates`);
+  // Completed batches are retired. A late duplicate in a later batch is now
+  // unexpected, without repeatedly copying the entire soak's history.
+  ledgers.set(client, []);
+  return actual.length;
+}
+
+async function runPhase(pair, name, action) {
+  const result = { id: `${pair}/${name}`, passed: false, metrics: {} };
+  report.cases.push(result);
+  const started = performance.now();
+  try { result.metrics = await action(); result.passed = true; }
+  catch (error) { result.error = String(error.stack || error); throw error; }
+  finally {
+    result.durationMs = performance.now() - started;
+    console.log(`${result.id}: ${result.passed ? 'PASS' : 'FAIL'} (${Math.round(result.durationMs)} ms)`);
+  }
+}
+
 async function runPair(kinds, url) {
   const pair = kinds.join('-');
   const relay = await startRelay();
@@ -99,21 +141,12 @@ async function runPair(kinds, url) {
   let generation = 0;
   const make = async (kind, index) => {
     const name = `${pair}-${index}-${generation++}`;
-    const client = kind === 'native' ? await nativeClient(resolve(args.native), logs, name)
-      : await browserClient(browser, url, logs, name);
-    resources.add(client);
-    if (client.browserVersion) report.browserVersion = client.browserVersion;
-    const info = await client.info();
-    report.buildInfo.push(info);
-    assert.equal(info.version, args.version, `${name} loaded version`);
-    assert.equal(info.commit, args.commit, `${name} loaded commit`);
-    assert.equal(info.profile, 'release', `${name} must consume a release build`);
-    if (!args['allow-dirty']) assert.equal(info.dirty, false, `${name} candidate must be clean`);
+    const client = await makeClient(kind, url, name, ids[index], config);
     ledgers.set(client, []);
-    await client.command({ op: 'init', node: ids[index], config });
     return client;
   };
-  const checkpoint = async () => Promise.all(clients.map(client => client.events().then(events => events.length)));
+  const validate = client => validateLedger(client, ledgers);
+  const phase = (name, action) => runPhase(pair, name, action);
   const connect = async (joinedRoom, marks) => {
     const started = performance.now();
     await Promise.all(clients.map((client, index) => until(() => client.events(),
@@ -121,14 +154,6 @@ async function runPair(kinds, url) {
         event.sender === ids[1 - index] && event.room === joinedRoom),
       policy.connectionDeadlineMs, `${pair} connected in ${joinedRoom}`)));
     return performance.now() - started;
-  };
-  const validateLedger = async client => {
-    const actual = (await client.drain()).filter(event => event.kind === 'raw' &&
-      Buffer.from(event.data).toString().startsWith(`qa:${nonce}:`));
-    assert.deepEqual(actual, ledgers.get(client), `${client.name}: exact data/order/sender/room, no late duplicates`);
-    // Completed batches are retired. A late duplicate in a later batch is now
-    // unexpected, without repeatedly copying the entire soak's history.
-    ledgers.set(client, []);
   };
   const deliver = async (joinedRoom, label, count = policy.messagesPerDirection) => {
     const expected = [[], []], started = performance.now();
@@ -146,24 +171,13 @@ async function runPair(kinds, url) {
       expected[index].every(want => events.some(event => event.kind === 'raw' &&
         JSON.stringify(event.data) === JSON.stringify(want.data))),
       policy.deliveryDeadlineMs, `${pair} ${label} received every message`)));
-    await Promise.all(clients.map(validateLedger));
+    await Promise.all(clients.map(validate));
     return { sent: count * 2, received: count * 2, deliveryMs: performance.now() - started };
-  };
-  const phase = async (name, action) => {
-    const result = { id: `${pair}/${name}`, passed: false, metrics: {} };
-    report.cases.push(result);
-    const started = performance.now();
-    try { result.metrics = await action(); result.passed = true; }
-    catch (error) { result.error = String(error.stack || error); throw error; }
-    finally {
-      result.durationMs = performance.now() - started;
-      console.log(`${result.id}: ${result.passed ? 'PASS' : 'FAIL'} (${Math.round(result.durationMs)} ms)`);
-    }
   };
   try {
     for (let index = 0; index < 2; index++) clients[index] = await make(kinds[index], index);
     await phase('delivery', async () => {
-      const marks = await checkpoint();
+      const marks = await checkpoint(clients);
       await Promise.all(clients.map(client => client.command({ op: 'join', room })));
       const connectionMs = await connect(room, marks);
       await Promise.all(clients.map((client, i) => client.command({ op: 'position', room, position: [i, 0, 0] })));
@@ -172,7 +186,7 @@ async function runPair(kinds, url) {
     await phase('aoi', async () => {
       let convergenceMs = 0, samples = 0;
       for (const x of [1, 250, 1]) {
-        const marks = await checkpoint(), started = performance.now();
+        const marks = await checkpoint(clients), started = performance.now();
         await clients[1].command({ op: 'position', room, position: [x, 0, 0] });
         await Promise.all(clients.map((client, index) => until(() => client.events(), events => {
           const event = events.slice(marks[index]).filter(e => e.kind === 'aoi' && e.room === room).at(-1);
@@ -187,12 +201,12 @@ async function runPair(kinds, url) {
       return { samples, missing: 0, false: 0, convergenceMs };
     });
     await phase('multi-room', async () => {
-      const marks = await checkpoint();
+      const marks = await checkpoint(clients);
       await Promise.all(clients.map(client => client.command({ op: 'join', room: otherRoom })));
       const connectionMs = await connect(otherRoom, marks);
       const first = await deliver(room, 'room-a'), second = await deliver(otherRoom, 'room-b');
       await delay(policy.negativeObservationMs);
-      await Promise.all(clients.map(validateLedger));
+      await Promise.all(clients.map(validate));
       return { connectionMs, sent: first.sent + second.sent, received: first.received + second.received,
         deliveryMs: Math.max(first.deliveryMs, second.deliveryMs), roomLeaks: 0,
         observationMs: policy.negativeObservationMs };
@@ -200,13 +214,13 @@ async function runPair(kinds, url) {
     await phase('leave-rejoin', async () => {
       let total = 0, maxConnectionMs = 0, maxDeliveryMs = 0;
       for (let cycle = 0; cycle < policy.rejoinCycles; cycle++) {
-        const marks = await checkpoint();
+        const marks = await checkpoint(clients);
         await clients[1].command({ op: 'leave', room }); // per-room leave; preserves the other room
         await until(() => clients[0].events(), events => events.slice(marks[0]).some(event =>
           event.kind === 'disconnected' && event.sender === ids[1] && event.room === room),
         policy.connectionDeadlineMs, 'leave observed by the other peer');
         const retained = await deliver(otherRoom, `retained-${cycle}`);
-        const rejoinMarks = await checkpoint();
+        const rejoinMarks = await checkpoint(clients);
         await clients[1].command({ op: 'join', room });
         maxConnectionMs = Math.max(maxConnectionMs, await connect(room, rejoinMarks));
         const rejoined = await deliver(room, `rejoin-${cycle}`);
@@ -225,8 +239,8 @@ async function runPair(kinds, url) {
       return { ...measurement, disconnectedSockets: relay.counts.disconnected };
     });
     await phase('peer-restart', async () => {
-      const marks = await checkpoint();
-      await validateLedger(clients[1]);
+      const marks = await checkpoint(clients);
+      await validate(clients[1]);
       await clients[1].close(); resources.delete(clients[1]);
       await until(() => clients[0].events(), events => events.slice(marks[0]).some(event =>
         event.kind === 'disconnected' && event.sender === ids[1] && event.room === room),
@@ -299,9 +313,101 @@ async function runPair(kinds, url) {
         await delay(250);
       } while (performance.now() - started < soakSeconds * 1000);
       await delay(policy.negativeObservationMs);
-      await Promise.all(clients.map(validateLedger));
+      await Promise.all(clients.map(validate));
       return { sent, received: sent, deliveryMs, observedMs: performance.now() - started,
         samples: samples.length, stats: [samples[0], samples.at(-1)] };
+    });
+  } finally {
+    for (const client of clients) {
+      if (client && resources.delete(client)) await client.close();
+    }
+    resources.delete(relay); await relay.close();
+  }
+}
+
+async function runRoom(kinds, url) {
+  const pair = kinds.join('-');
+  const relay = await startRelay();
+  resources.add(relay);
+  const config = { iceServers: [], aoiRange: 100, signaling: { mode: 'nostr', nostr: {
+    relays: [relay.url], inviteSalt: 'release-qa', inviteCode: nonce,
+  } } };
+  const room = `qa-${nonce}-${pair}`;
+  // The browser sorts between the natives, exercising both initiator roles.
+  const ids = [`a-${nonce}-mixed`, `z-${nonce}-mixed`, `m-${nonce}-mixed`];
+  const clients = [], ledgers = new Map();
+  const validate = client => validateLedger(client, ledgers, true);
+  try {
+    await runPhase(pair, 'mixed-room', async () => {
+      for (let index = 0; index < kinds.length; index++) {
+        const client = await makeClient(kinds[index], url, `${pair}-${index}`, ids[index], config);
+        clients.push(client); ledgers.set(client, []);
+      }
+      const marks = await checkpoint(clients);
+      const connectionStarted = performance.now();
+      await Promise.all(clients.map(client => client.command({ op: 'join', room })));
+      await Promise.all(clients.map((client, i) => client.command({ op: 'position', room, position: [i, 0, 0] })));
+      await Promise.all(clients.map((client, index) => until(() => client.events(), events =>
+        ids.filter((_, peer) => peer !== index).every(id => events.slice(marks[index]).some(event =>
+          event.kind === 'connected' && event.sender === id && event.room === room)),
+      policy.connectionDeadlineMs, `${client.name} connected to both other peers in ${room}`)));
+      const connectionMs = performance.now() - connectionStarted;
+
+      // Native stats are cached; poll both views until all four entries agree.
+      const expectedLinks = [['iceQuic', 'webrtc'], ['iceQuic', 'webrtc']];
+      let observedLinks;
+      await until(async () => {
+        observedLinks = await Promise.all(clients.slice(0, 2).map(async (client, index) => {
+          const stats = await client.command({ op: 'stats' });
+          return [ids[1 - index], ids[2]].map(id => stats.nodes?.find(node => node.id === id)?.link);
+        }));
+        return observedLinks;
+      }, observed => observed.every((links, index) => links.every((link, peer) => link === expectedLinks[index][peer])),
+      policy.connectionDeadlineMs, `${pair} native link selection`).catch(error => {
+        if (error.message.startsWith('deadline exceeded:') && observedLinks) {
+          assert.deepEqual(observedLinks, expectedLinks, `${pair}: each native must see iceQuic to the other native and webrtc to the browser`);
+        }
+        throw error;
+      });
+      const links = { 'native0-native1': observedLinks[0][0], 'native0-browser': observedLinks[0][1],
+        'native1-browser': observedLinks[1][1] };
+
+      const started = performance.now();
+      let sent = 0;
+      for (let index = 0; index < policy.messagesPerDirection; index++) {
+        for (let sender = 0; sender < clients.length; sender++) {
+          for (let target = 0; target < clients.length; target++) {
+            if (target === sender) continue;
+            const data = Array.from(Buffer.concat([Buffer.from(`qa:${nonce}:mixed-room:${sender}:${target}:${index}:`),
+              Buffer.from([0, 128, 255, index % 256])]));
+            ledgers.get(clients[target]).push({ kind: 'raw', sender: ids[sender], room, data });
+            await clients[sender].command({ op: 'send', room, target: ids[target], data });
+            sent++;
+          }
+        }
+      }
+      await Promise.all(clients.map(client => until(() => client.events(), events =>
+        ledgers.get(client).every(want => events.some(event => event.kind === 'raw' &&
+          JSON.stringify(event.data) === JSON.stringify(want.data))),
+      policy.deliveryDeadlineMs, `${client.name} received every mixed-room message`)));
+      const received = (await Promise.all(clients.map(validate))).reduce((sum, count) => sum + count, 0);
+      const deliveryMs = performance.now() - started;
+
+      let transfers = 0;
+      for (let sender = 0; sender < clients.length; sender++) {
+        const data = Array.from(Buffer.concat([Buffer.from(`storage-${nonce}-mixed-room-${sender}`), Buffer.from([0, 128, 255])]));
+        const cid = await clients[sender].command({ op: 'store', data });
+        assert.equal(typeof cid, 'string'); assert(cid.length > 0);
+        for (let target = 0; target < clients.length; target++) {
+          if (target === sender) continue;
+          assert.deepEqual(await clients[target].command({ op: 'get', cid }), data,
+            `${clients[sender].name} to ${clients[target].name}: cross-peer content hash and bytes`);
+          transfers++;
+        }
+      }
+      await delay(policy.negativeObservationMs);
+      await Promise.all(clients.map(validate));
+      return { connectionMs, links, sent, received, deliveryMs, transfers, corruptions: 0 };
     });
   } finally {
     for (const client of clients) {
@@ -318,6 +424,7 @@ try {
   for (const kinds of args.browser ? [['browser', 'browser'], ['browser', 'native'], ['native', 'browser']] : [['native', 'native']]) {
     await runPair(kinds, url);
   }
+  if (args.browser) await runRoom(['native', 'native', 'browser'], url);
   report.passed = harnessErrors.length === 0;
 } catch (error) {
   report.error = String(error.stack || error);

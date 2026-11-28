@@ -1,7 +1,7 @@
 use super::{signaling_label, NostrSignaler};
 use mistlib_core::signaling::nostr::DiscoveryPriority;
 use mistlib_core::signaling::nostr::{
-    build_discovery_event_with_joined_at, build_message_event_with_sequence_and_joined_at,
+    build_discovery_event_with_transports, build_message_event_with_sequence_and_joined_at,
     event_frame_json, next_outgoing_sequence,
 };
 use mistlib_core::signaling::{SignalingData, SignalingType};
@@ -154,12 +154,13 @@ impl NostrSignaler {
     pub(super) async fn publish_discovery(&self, room_id: &str) -> mistlib_core::error::Result<()> {
         let identity = self.current_identity().await;
         let joined_at = *self.local_joined_at.lock().await;
-        let event = build_discovery_event_with_joined_at(
+        let event = build_discovery_event_with_transports(
             &self.codec_config,
             &self.crypto,
             &identity,
             room_id,
             joined_at,
+            crate::transports::selector::announced_transports(),
         )?;
         tracing::debug!(
             "[NostrIdentity] node={} pubkey={} joined_at={}",
@@ -397,7 +398,7 @@ impl NostrSignaler {
             sender_id: self.local_node_id.clone(),
             receiver_id: NodeId::broadcast(),
             room_id: room_id.to_string(),
-            data: String::new(),
+            data: crate::transports::selector::connect_request_data(),
             signaling_type: SignalingType::Request,
         };
         self.publish_message_in_session(

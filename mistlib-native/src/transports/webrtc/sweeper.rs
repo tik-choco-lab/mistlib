@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 
@@ -57,6 +58,98 @@ pub(crate) fn reservation_reap_allowed(reserved_at: Option<Instant>, gate_ms: u6
 }
 
 use super::{DisconnectGrace, GraceOrigin, Peer, WebRtcTransport, DATA_CHANNEL_OPEN_TIMEOUT_MS};
+
+/// Whether the ICE transport of a still-`Connecting` attempt has connected,
+/// i.e. whether the only work left is DTLS + SCTP + DCEP (the stage-2
+/// extension condition of the connect watchdog).
+///
+/// Rule: `ice` is `Connected` or `Completed`, and `pc` is neither `Failed`
+/// nor `Closed`. Rationale from webrtc-rs 0.13 semantics:
+/// - `RTCIceConnectionState::Connected` is emitted once a candidate pair is
+///   selected and passes connectivity checks. The webrtc-rs ICE agent never
+///   emits `Completed` (it has no end-of-candidates/ICE-lite completion
+///   step), but it is the W3C "even further along" state, so it is accepted
+///   for robustness.
+/// - `Checking`/`New` mean no working path exists yet -- the measured
+///   never-succeeds case, torn down at stage 1 exactly as before.
+///   `Disconnected`/`Failed`/`Closed` mean the path was lost; those are left
+///   to teardown and the normal reconnect machinery, not extended.
+/// - `RTCPeerConnectionState` aggregates ICE and DTLS: with ICE connected it
+///   stays `Connecting` while DTLS is still handshaking, but becomes
+///   `Failed` once the DTLS transport failed (or `Closed` on close). Either
+///   means the DataChannel can never open on this PC, so no extension.
+pub(crate) fn ice_transport_connected(
+    ice: RTCIceConnectionState,
+    pc: RTCPeerConnectionState,
+) -> bool {
+    let ice_up = matches!(
+        ice,
+        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+    );
+    let pc_alive = !matches!(
+        pc,
+        RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+    );
+    ice_up && pc_alive
+}
+
+/// Which stage of the two-stage connect watchdog is evaluating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogStage {
+    /// Fired after `connection_timeout_ms`; may still grant the extension.
+    Initial,
+    /// Fired after the one-shot `connection_extension_ms`; never extends again.
+    Extended,
+}
+
+/// Outcome of one connect-watchdog check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogDecision {
+    /// Nothing to do: the attempt was superseded, resolved (no longer
+    /// `Connecting`), or its ReliableOrdered DataChannel is already open.
+    Resolved,
+    /// ICE already connected; wait `connection_extension_ms` and re-check.
+    Extend,
+    /// Tear the attempt down (`watchdog_connect_timeout`).
+    Teardown,
+}
+
+/// Pure extend-or-teardown decision backing `spawn_connection_watchdog`.
+/// `transport` is `(ice_connection_state, connection_state)` of the peer's
+/// `RTCPeerConnection`, or `None` when no peer is registered for the node.
+/// Pure so every combination is unit-testable without a live handshake --
+/// see `webrtc/tests/sweeper.rs`.
+pub(crate) fn decide_connect_watchdog(
+    stage: WatchdogStage,
+    is_current_attempt: bool,
+    still_connecting: bool,
+    has_required_data_channel: bool,
+    transport: Option<(RTCIceConnectionState, RTCPeerConnectionState)>,
+) -> WatchdogDecision {
+    if !is_current_attempt || !still_connecting || has_required_data_channel {
+        return WatchdogDecision::Resolved;
+    }
+    let extendable = stage == WatchdogStage::Initial
+        && transport.is_some_and(|(ice, pc)| ice_transport_connected(ice, pc));
+    if extendable {
+        WatchdogDecision::Extend
+    } else {
+        WatchdogDecision::Teardown
+    }
+}
+
+/// Longest an attempt can stay in flight under the two-stage connect
+/// watchdog: stage-1 timeout plus the one-shot extension. This is the
+/// young-in-flight-attempt window `takeover_allowed` must honor so a remote
+/// takeover cannot destroy an attempt the watchdog chose to keep.
+pub(crate) fn in_flight_attempt_window_ms(timeout_ms: u64, extension_ms: u64) -> u64 {
+    timeout_ms.saturating_add(extension_ms)
+}
+
+/// [`in_flight_attempt_window_ms`] for the default (env-unset) timeouts.
+#[cfg(test)]
+pub(crate) const DEFAULT_IN_FLIGHT_ATTEMPT_WINDOW_MS: u64 =
+    super::CONNECTION_TIMEOUT_MS + super::CONNECTION_EXTENSION_MS;
 
 /// Pure disconnect-grace decision. Terminal states override traffic; otherwise
 /// grace expires only after a full window of inbound silence. A healthy peer
@@ -119,107 +212,149 @@ impl WebRtcTransport {
             .is_some_and(|dc| dc.ready_state() == RTCDataChannelState::Open)
     }
 
+    /// This instance's young-in-flight-attempt window for `takeover_allowed`
+    /// (see the free [`in_flight_attempt_window_ms`]).
+    pub(crate) fn in_flight_attempt_window_ms(&self) -> u64 {
+        in_flight_attempt_window_ms(self.connection_timeout_ms, self.connection_extension_ms)
+    }
+
+    /// Two-stage per-attempt connect watchdog. Stage 1 fires after
+    /// `connection_timeout_ms`; stage 2 (at most once) after a further
+    /// `connection_extension_ms`. Each stage re-checks that `attempt_id` is
+    /// still current, the node is still `Connecting` and the ReliableOrdered
+    /// DataChannel is not open; if so, [`decide_connect_watchdog`] either
+    /// extends (stage 1 only, ICE already connected -- see
+    /// [`ice_transport_connected`]) or tears the attempt down with
+    /// `watchdog_connect_timeout`. Attempts whose ICE never connected are
+    /// torn down at stage 1, exactly as the former one-stage watchdog did.
     pub(crate) fn spawn_connection_watchdog(&self, node: NodeId, attempt_id: u32) {
         let handles = self.peer_handles();
-        // Captured before the spawn so a per-instance
-        // `MIST_WEBRTC_CONNECTION_TIMEOUT_MS` override (read once at
-        // construction, see `WebRtcTransport::connection_timeout_ms`)
-        // applies here without needing `&self` inside the spawned task.
+        // Captured before the spawn so per-instance
+        // `MIST_WEBRTC_CONNECTION_TIMEOUT_MS` / `MIST_WEBRTC_CONNECTION_EXTENSION_MS`
+        // overrides (read once at construction, see
+        // `WebRtcTransport::connection_timeout_ms`/`connection_extension_ms`)
+        // apply here without needing `&self` inside the spawned task.
         let connection_timeout_ms = self.connection_timeout_ms;
+        let connection_extension_ms = self.connection_extension_ms;
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(connection_timeout_ms)).await;
+            let mut stage = WatchdogStage::Initial;
+            let mut wait_ms = connection_timeout_ms;
+            let peer_opt = loop {
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
 
-            let is_current_attempt = {
-                let lock = handles.connection_attempt_ids.read().unwrap();
-                matches!(lock.get(&node), Some(id) if *id == attempt_id)
+                let is_current_attempt = {
+                    let lock = handles.connection_attempt_ids.read().unwrap();
+                    matches!(lock.get(&node), Some(id) if *id == attempt_id)
+                };
+                if !is_current_attempt {
+                    return;
+                }
+
+                let still_connecting = {
+                    let lock = handles.connection_states.read().unwrap();
+                    matches!(lock.get(&node), Some(ConnectionState::Connecting))
+                };
+
+                let peer_opt = {
+                    let lock = handles.peers.read().await;
+                    lock.get(&node).cloned()
+                };
+                let has_required_data_channel = match &peer_opt {
+                    Some(peer) => WebRtcTransport::has_required_data_channel(peer).await,
+                    None => false,
+                };
+                let transport = peer_opt
+                    .as_ref()
+                    .map(|peer| (peer.pc.ice_connection_state(), peer.pc.connection_state()));
+
+                match decide_connect_watchdog(
+                    stage,
+                    is_current_attempt,
+                    still_connecting,
+                    has_required_data_channel,
+                    transport,
+                ) {
+                    WatchdogDecision::Resolved => return,
+                    WatchdogDecision::Extend => {
+                        let (ice, connection) = transport.expect("Extend requires a live peer");
+                        tracing::info!(
+                            "[IceWatchdog] action=extend peer={} attempt={} extension_ms={} ice={:?} connection={:?}",
+                            node.0,
+                            attempt_id,
+                            connection_extension_ms,
+                            ice,
+                            connection
+                        );
+                        stage = WatchdogStage::Extended;
+                        wait_ms = connection_extension_ms;
+                    }
+                    WatchdogDecision::Teardown => break peer_opt,
+                }
             };
 
-            if !is_current_attempt {
-                return;
-            }
-
-            let still_connecting = {
-                let lock = handles.connection_states.read().unwrap();
-                matches!(lock.get(&node), Some(ConnectionState::Connecting))
-            };
-
-            let peer_opt = {
-                let lock = handles.peers.read().await;
-                lock.get(&node).cloned()
-            };
-            let has_required_data_channel = if let Some(peer) = &peer_opt {
-                let channels = peer.channels.read().await;
-                channels
-                    .get(&DeliveryMethod::ReliableOrdered)
-                    .is_some_and(|dc| dc.ready_state() == RTCDataChannelState::Open)
+            if let Some(peer) = &peer_opt {
+                let local = peer.pc.local_description().await.is_some();
+                let remote = peer.pc.remote_description().await.is_some();
+                let buffered = handles
+                    .pending_candidates
+                    .read()
+                    .await
+                    .get(&node)
+                    .map_or(0, Vec::len);
+                let metrics = &peer.ice_measurements;
+                tracing::info!("[IceWatchdog] peer={} attempt={} pc_id={} connection={:?} ice={:?} gathering={:?} signaling={:?} local_description={} remote_description={} generated={} received={} buffered_total={} applied={} apply_failed={} buffered={}", node.0, attempt_id, metrics.id, peer.pc.connection_state(), peer.pc.ice_connection_state(), peer.pc.ice_gathering_state(), peer.pc.signaling_state(), local, remote, metrics.generated.load(Ordering::Relaxed), metrics.received.load(Ordering::Relaxed), metrics.buffered.load(Ordering::Relaxed), metrics.applied.load(Ordering::Relaxed), metrics.apply_failed.load(Ordering::Relaxed), buffered);
             } else {
-                false
-            };
-
-            if still_connecting && !has_required_data_channel {
-                if let Some(peer) = &peer_opt {
-                    let local = peer.pc.local_description().await.is_some();
-                    let remote = peer.pc.remote_description().await.is_some();
-                    let buffered = handles
-                        .pending_candidates
-                        .read()
-                        .await
-                        .get(&node)
-                        .map_or(0, Vec::len);
-                    let metrics = &peer.ice_measurements;
-                    tracing::info!("[IceWatchdog] peer={} attempt={} pc_id={} connection={:?} ice={:?} gathering={:?} signaling={:?} local_description={} remote_description={} generated={} received={} buffered_total={} applied={} apply_failed={} buffered={}", node.0, attempt_id, metrics.id, peer.pc.connection_state(), peer.pc.ice_connection_state(), peer.pc.ice_gathering_state(), peer.pc.signaling_state(), local, remote, metrics.generated.load(Ordering::Relaxed), metrics.received.load(Ordering::Relaxed), metrics.buffered.load(Ordering::Relaxed), metrics.applied.load(Ordering::Relaxed), metrics.apply_failed.load(Ordering::Relaxed), buffered);
-                } else {
-                    tracing::info!(
-                        "[IceWatchdog] peer={} attempt={} connection=missing",
-                        node.0,
-                        attempt_id
-                    );
-                }
-                // `[ConnTiming]` instrumentation: this is the one-shot
-                // connection watchdog force-cleaning a still-`Connecting`
-                // session -- report the elapsed time as a timeout and remove
-                // the attempt-start entry so it can't leak (nothing else will
-                // ever consume it for this attempt now).
-                let started_at = handles.connect_started_at.write().unwrap().remove(&node);
-                if let Some(started_at) = started_at {
-                    let attempt_ms = started_at.elapsed().as_millis() as u64;
-                    super::conn_timing::log_timeout(&node, attempt_ms);
-                }
-                // Guard on the exact `Peer` snapshot read above (not just
-                // `node`): a fresh reconnect can already have replaced it
-                // with a new, healthy peer by the time this fires, and an
-                // unconditional-by-NodeId cleanup here would silently delete
-                // that live registration while `connection_states` (marked
-                // `Connected` by the new peer's own DC-open handler) is
-                // never touched -- a permanent "Node not found" with no
-                // close/state-change log to explain it.
-                match peer_opt {
-                    Some(peer) => {
-                        let expected = Arc::downgrade(&peer);
-                        handles
-                            .cleanup_session_if_current(
-                                &node,
-                                &expected,
-                                true,
-                                "watchdog_connect_timeout",
-                            )
-                            .await;
-                    }
-                    // No live peer to protect -- safe to clear whatever
-                    // stale bookkeeping remains for `node` unconditionally.
-                    None => {
-                        handles
-                            .cleanup_session_with_reason(&node, true, "watchdog_connect_timeout")
-                            .await;
-                    }
-                }
-                tracing::warn!(
-                    "[WebRTC DC Zombie] detected: connection timeout before ReliableOrdered data channel opened for {} (attempt={})",
-                    node,
+                tracing::info!(
+                    "[IceWatchdog] peer={} attempt={} connection=missing",
+                    node.0,
                     attempt_id
                 );
             }
+            // `[ConnTiming]` instrumentation: the connect watchdog
+            // (after stage 1, or after the stage-2 extension) is
+            // force-cleaning a still-`Connecting` session -- report the
+            // elapsed time as a timeout and remove the attempt-start entry so
+            // it can't leak (nothing else will ever consume it for this
+            // attempt now).
+            let started_at = handles.connect_started_at.write().unwrap().remove(&node);
+            if let Some(started_at) = started_at {
+                let attempt_ms = started_at.elapsed().as_millis() as u64;
+                super::conn_timing::log_timeout(&node, attempt_ms);
+            }
+            // Guard on the exact `Peer` snapshot read above (not just
+            // `node`): a fresh reconnect can already have replaced it
+            // with a new, healthy peer by the time this fires, and an
+            // unconditional-by-NodeId cleanup here would silently delete
+            // that live registration while `connection_states` (marked
+            // `Connected` by the new peer's own DC-open handler) is
+            // never touched -- a permanent "Node not found" with no
+            // close/state-change log to explain it.
+            match peer_opt {
+                Some(peer) => {
+                    let expected = Arc::downgrade(&peer);
+                    handles
+                        .cleanup_session_if_current(
+                            &node,
+                            &expected,
+                            true,
+                            "watchdog_connect_timeout",
+                        )
+                        .await;
+                }
+                // No live peer to protect -- safe to clear whatever
+                // stale bookkeeping remains for `node` unconditionally.
+                None => {
+                    handles
+                        .cleanup_session_with_reason(&node, true, "watchdog_connect_timeout")
+                        .await;
+                }
+            }
+            tracing::warn!(
+                "[WebRTC DC Zombie] detected: connection timeout before ReliableOrdered data channel opened for {} (attempt={})",
+                node,
+                attempt_id
+            );
         });
     }
 
@@ -253,7 +388,7 @@ impl WebRtcTransport {
     /// (`signaling::duplicate_offer_decision`) can recognize it as a
     /// byte-identical re-delivery rather than a fresh renegotiation attempt.
     /// A send failure here is logged and otherwise ignored -- the remaining
-    /// schedule (and, ultimately, the unchanged 6s connect watchdog) is the
+    /// schedule (and, ultimately, the two-stage connect watchdog) is the
     /// recovery path, not this task tearing anything down itself.
     pub(crate) fn spawn_offer_resend(&self, node: NodeId, attempt_id: u32, peer: Arc<Peer>) {
         let handles = self.peer_handles();
@@ -443,7 +578,8 @@ impl WebRtcTransport {
                                             sender_id: handles.local_node_id.clone(),
                                             receiver_id: node.clone(),
                                             room_id: handles.room_id.clone(),
-                                            data: String::new(),
+                                            data: crate::transports::selector::connect_request_data(
+                                            ),
                                             signaling_type: SignalingType::Request,
                                         }),
                                     )

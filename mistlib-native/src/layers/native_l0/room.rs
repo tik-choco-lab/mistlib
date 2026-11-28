@@ -110,7 +110,7 @@ async fn complete_join(
 }
 
 async fn reannounce(ctx: &SessionCtx) {
-    if let Some(wt) = ctx.webrtc_transport.as_ref() {
+    if let Some(wt) = ctx.link_selector.as_ref() {
         if let Err(err) = wt.announce_to_room().await {
             tracing::warn!(
                 "join_room: re-announce failed for {}: {:?}",
@@ -173,7 +173,7 @@ async fn teardown(ctx: &SessionCtx) {
     // cancel token is untouched.
     ctx.cancel.cancel();
 
-    if let Some(wt) = ctx.webrtc_transport.as_ref() {
+    if let Some(wt) = ctx.link_selector.as_ref() {
         wt.close_all_peer_connections().await;
         wt.stop_session_sweeper();
     } else {
